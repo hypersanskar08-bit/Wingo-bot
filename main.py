@@ -173,7 +173,7 @@ def format_history_logs(history_records):
         elif item["status"] == "WIN_SIZE":
             status_str = "✅"  
         else:
-            status_str = "🔴"   
+            status_str = ""   
             
         logs_text += f"`{short_period}` *{size_str}* {status_str}\n"
     return logs_text
