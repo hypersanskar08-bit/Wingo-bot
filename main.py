@@ -202,5 +202,10 @@ def start_hyper_bot():
         time.sleep(8)
 
 if __name__ == "__main__":
-    start_hyper_bot()
+    # Health server ko background thread me chalane ke liye
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # Bot ka main function run karne ke liye
+    main()
+    
   
