@@ -11,9 +11,9 @@ import os
 import traceback
 
 # ==================== CONFIGURATION ====================
-API_URL = "https://sky-predictor-1012593186481.asia-east1.run.app/api/wingo?game=wingo30s"
+API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500"
 
-BOT_TOKEN = "8611789455:AAFcnSZ7nlrCIPsQUKLQ..." # Aapka Bot Token
+BOT_TOKEN = "8611789455:AAFcnSZ7nlrCIPsQUKLQwdmTf2aw2szmLFk" # Aapka Bot Token
 CHAT_ID = "1264164655"                             # Aapki Personal Telegram User ID
 WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8..."
 # =======================================================
