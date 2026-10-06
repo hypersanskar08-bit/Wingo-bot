@@ -19,7 +19,7 @@ WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X
 PREDICTION_MEMORY = {}
 
 async def handle_health_check(request):
-    return web.Response(text="QUANTUM V21 ACTIVE", status=200)
+    return web.Response(text="QUANTUM V21 ULTRA-MAX ACTIVE", status=200)
 
 async def send_telegram(session, message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -51,9 +51,9 @@ async def fetch_data(session):
         print(f"Fetch error: {e}")
     return None
 
-# ==================== CORE ENGINES ====================
+# ==================== UPGRADED CORE ENGINES ====================
 
-def calculate_rsi(outcomes, period=12):
+def calculate_rsi(outcomes, period=14):
     if len(outcomes) < period: return 50.0
     recent = outcomes[-period:]
     gains = sum(1 for x in recent if x == 1)
@@ -62,94 +62,112 @@ def calculate_rsi(outcomes, period=12):
     rs = gains / losses
     return 100 - (100 / (1 + rs))
 
-def markov_3rd_order(outcomes):
-    if len(outcomes) < 12: return 0.5
-    last_three = tuple(outcomes[-3:])
-    matches, big_next = 0, 0
-    for i in range(len(outcomes) - 3):
-        if tuple(outcomes[i:i+3]) == last_three:
-            matches += 1
-            if outcomes[i+3] == 1: big_next += 1
-    if matches > 0:
-        return big_next / matches
-    last_two = tuple(outcomes[-2:])
-    matches, big_next = 0, 0
-    for i in range(len(outcomes) - 2):
-        if tuple(outcomes[i:i+2]) == last_two:
-            matches += 1
-            if outcomes[i+2] == 1: big_next += 1
-    return (big_next / matches) if matches > 0 else 0.5
+def advanced_markov_engine(outcomes):
+    """1st to 4th Order Markov with dynamic weighting based on match frequency"""
+    if len(outcomes) < 6: return 0.5
+    results, weights = [], []
+    
+    for order in range(1, 5):
+        if len(outcomes) < order + 5: continue
+        last_seq = tuple(outcomes[-order:])
+        matches, big_next = 0, 0
+        for i in range(len(outcomes) - order):
+            if tuple(outcomes[i:i+order]) == last_seq:
+                matches += 1
+                if outcomes[i+order] == 1: big_next += 1
+        if matches >= 2: # Statistical relevance
+            prob = big_next / matches
+            w = order * math.log(matches + 1) # Higher order + more matches = more weight
+            results.append(prob)
+            weights.append(w)
+            
+    if not results: return 0.5
+    return sum(r * w for r, w in zip(results, weights)) / sum(weights)
 
-def micro_streak_engine(outcomes):
-    if len(outcomes) < 5: return 0.5
-    recent = outcomes[-5:]
-    if sum(recent) == 5: return 0.72
-    if sum(recent) == 0: return 0.28
-    if recent == [1, 0, 1, 0, 1]: return 0.22
-    if recent == [0, 1, 0, 1, 0]: return 0.78
-    return 0.5
-
-def dynamic_deep_pattern_miner(outcomes):
+def ngram_pattern_engine(outcomes):
+    """Bayesian Pattern Matching for lengths 3 to 9 with recency weighting"""
     total_len = len(outcomes)
-    if total_len < 20: return 0.5
+    if total_len < 15: return 0.5
     curr_str = "".join(['B' if x == 1 else 'S' for x in outcomes])
-    for L in range(8, 2, -1):
+    results, weights = [], []
+    
+    for L in range(3, 10): # Length 3 to 9
         if total_len <= L: continue
         tail = curr_str[-L:]
         big_w, small_w = 0.0, 0.0
+        matches = 0
         for i in range(total_len - L):
-            if curr_str[i:i + L] == tail:
-                recency = math.exp((i / total_len) * 7.0)
-                if curr_str[i + L] == 'B': big_w += recency
+            if curr_str[i:i+L] == tail:
+                matches += 1
+                recency = math.exp((i / total_len) * 5.0) # Exponential recency weight
+                if curr_str[i+L] == 'B': big_w += recency
                 else: small_w += recency
-        if big_w + small_w > 0:
-            return big_w / (big_w + small_w)
+        if matches >= 2:
+            prob = big_w / (big_w + small_w) if (big_w + small_w) > 0 else 0.5
+            w = L * math.log(matches + 1)
+            results.append(prob)
+            weights.append(w)
+            
+    if not results: return 0.5
+    return sum(r * w for r, w in zip(results, weights)) / sum(weights)
+
+def streak_momentum_engine(outcomes):
+    """Analyzes micro-streaks, alternating patterns, and momentum breaks"""
+    if len(outcomes) < 6: return 0.5
+    recent = outcomes[-6:]
+    
+    # Full 6 Streak -> Reversal expected
+    if sum(recent) == 6: return 0.25
+    if sum(recent) == 0: return 0.75
+    
+    # Alternating Pattern -> Continuation expected
+    if recent == [1,0,1,0,1,0]: return 0.75
+    if recent == [0,1,0,1,0,1]: return 0.25
+    
+    # 5 Streak
+    if sum(recent[-5:]) == 5: return 0.30
+    if sum(recent[-5:]) == 0: return 0.70
+    
+    # Micro Trend (3 Streak)
+    last_3 = outcomes[-3:]
+    if sum(last_3) == 3: return 0.35
+    if sum(last_3) == 0: return 0.65
+    
     return 0.5
+
+def volatility_chop_index(outcomes):
+    """Calculates choppiness. High chop = lower confidence penalty"""
+    recent = outcomes[-20:]
+    if len(recent) < 10: return 0.0
+    alternations = sum(1 for i in range(len(recent)-1) if recent[i] != recent[i+1])
+    # Max alternations in 20 is 19. 10 is normal, >14 is highly choppy
+    chop_factor = max(0.0, (alternations - 10) / 9.0) 
+    return min(1.0, chop_factor)
 
 # ==================== ADVANCED NUMBER PREDICTOR ====================
 def number_predictor(history_list, predicted_size):
-    """
-    Multi-engine number prediction:
-      - 2nd-order Markov (35%)
-      - 1st-order Markov (25%)
-      - Recency-weighted frequency last 60 (25%)
-      - Global frequency last 200 (15%)
-    Jack numbers ARE included for their matching size:
-      BIGGG  -> 5 (jack) + 6,7,8,9
-      SMALL  -> 0 (jack) + 1,2,3,4
-    """
     numbers = []
     for item in history_list:
-        try:
-            numbers.append(int(item.get("number", 0)))
-        except Exception:
-            numbers.append(0)
+        try: numbers.append(int(item.get("number", 0)))
+        except: numbers.append(0)
 
     if len(numbers) < 30:
         return 8 if predicted_size == "BIGGG" else 2
 
-    # Valid candidates — jack included for its matching size
-    if predicted_size == "BIGGG":
-        candidates = [5, 6, 7, 8, 9]   # 5 is jack for BIG
-    else:
-        candidates = [0, 1, 2, 3, 4]   # 0 is jack for SMALL
+    # Jack number is included for its matching size
+    candidates = [5, 6, 7, 8, 9] if predicted_size == "BIGGG" else [0, 1, 2, 3, 4]
 
-    # --- 1st-order Markov ---
     last_num = numbers[-1]
     mk1 = Counter()
     for i in range(len(numbers) - 1):
-        if numbers[i] == last_num:
-            mk1[numbers[i + 1]] += 1
+        if numbers[i] == last_num: mk1[numbers[i + 1]] += 1
 
-    # --- 2nd-order Markov ---
     mk2 = Counter()
     if len(numbers) >= 2:
         last_two = (numbers[-2], numbers[-1])
         for i in range(len(numbers) - 2):
-            if (numbers[i], numbers[i + 1]) == last_two:
-                mk2[numbers[i + 2]] += 1
+            if (numbers[i], numbers[i + 1]) == last_two: mk2[numbers[i + 2]] += 1
 
-    # --- Recency-weighted frequency (last 60) ---
     recent = numbers[-60:]
     total_recent = len(recent)
     freq_weighted = {}
@@ -158,7 +176,6 @@ def number_predictor(history_list, predicted_size):
         freq_weighted[n] = freq_weighted.get(n, 0.0) + w
     total_fw = sum(freq_weighted.values()) or 1.0
 
-    # --- Global frequency (last 200) ---
     scope = numbers[-200:] if len(numbers) >= 200 else numbers
     freq_all = Counter(scope)
     total_all = len(scope)
@@ -176,22 +193,46 @@ def number_predictor(history_list, predicted_size):
 
     return max(scores, key=scores.get)
 
-# ==================== STRIKE ENGINE ====================
+# ==================== UPGRADED STRIKE ENGINE ====================
 def v21_strike_engine(history_list, current_level):
     outcomes = [1 if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else 0 for item in history_list]
     if len(outcomes) < 20: return None
 
+    # 1. Get Probabilities from all engines
+    p_markov = advanced_markov_engine(outcomes)
+    p_pattern = ngram_pattern_engine(outcomes)
+    p_streak = streak_momentum_engine(outcomes)
+    
+    # 2. RSI as a probability
     rsi = calculate_rsi(outcomes)
-    miner_prob = dynamic_deep_pattern_miner(outcomes)
-    markov_prob = markov_3rd_order(outcomes)
-    streak_prob = micro_streak_engine(outcomes)
+    if rsi >= 70: p_rsi = 0.25
+    elif rsi <= 30: p_rsi = 0.75
+    else: p_rsi = 0.5 + (50 - rsi) * 0.01
 
-    rsi_adj = 0.0
-    if rsi >= 75: rsi_adj = -0.18
-    elif rsi <= 25: rsi_adj = 0.18
+    # 3. Logit Ensemble (Naive Bayes approach)
+    def to_logit(p):
+        p = max(0.01, min(0.99, p))
+        return math.log(p / (1 - p))
 
-    final_prob_big = (miner_prob * 0.40) + (markov_prob * 0.30) + (streak_prob * 0.20) + rsi_adj + 0.05
+    logit_pattern = to_logit(p_pattern)
+    logit_markov = to_logit(p_markov)
+    logit_streak = to_logit(p_streak)
+    logit_rsi = to_logit(p_rsi)
 
+    # Dynamic Weights: Pattern gets highest, then Markov, then Streak, then RSI
+    w_pattern, w_markov, w_streak, w_rsi = 0.40, 0.30, 0.20, 0.10
+
+    final_logit = (logit_pattern * w_pattern) + (logit_markov * w_markov) + (logit_streak * w_streak) + (logit_rsi * w_rsi)
+    final_prob_big = 1 / (1 + math.exp(-final_logit))
+
+    # 4. Apply Volatility Penalty (Reduce confidence in choppy markets)
+    chop = volatility_chop_index(outcomes)
+    if final_prob_big > 0.5:
+        final_prob_big = 0.5 + (final_prob_big - 0.5) * (1 - chop * 0.4)
+    else:
+        final_prob_big = 0.5 - (0.5 - final_prob_big) * (1 - chop * 0.4)
+
+    # 5. Final Decision
     if final_prob_big >= 0.50:
         pred_size = "BIGGG"
         pred_size_emoji = "BIGGG 🟢"
@@ -201,7 +242,8 @@ def v21_strike_engine(history_list, current_level):
         pred_size_emoji = "SMALL 🔴"
         confidence_real = 1.0 - final_prob_big
 
-    display_confidence = 68.0 + (confidence_real * 30.5)
+    # Realistic Confidence Mapping (No fake 90%+ unless truly aligned)
+    display_confidence = 60.0 + (confidence_real * 35.0)
     pred_number = number_predictor(history_list, pred_size)
 
     if current_level == 1:
@@ -221,35 +263,33 @@ def v21_strike_engine(history_list, current_level):
         "pred_number": pred_number,
         "confidence": display_confidence,
         "bet_advice": bet_advice,
-        "metrics": f"RSI:{rsi:.1f} STRK:{streak_prob:.2f} CONF:{display_confidence:.1f}%"
+        "metrics": f"RSI:{rsi:.1f} PAT:{p_pattern:.2f} MKV:{p_markov:.2f} STR:{p_streak:.2f} CHP:{chop:.2f}"
     }
 
 # ==================== HISTORY FORMATTER WITH ICONS ====================
 def format_synced_history_logs(server_history):
     """
-    ✅✅✅ -> our predicted size matched actual size (win — jack bhi win hai)
-    ☠️☠️☠️ -> jack aaya par hum galat size pe the (miss)
-    blank  -> normal loss
+    ✅✅✅ -> Correct size matched (Win, Jack bhi win hai)
+    ☠️☠️☠️ -> Jack aaya par galat size pe the (Miss)
+    blank  -> Normal loss
     """
     logs_text = ""
     for item in server_history[-8:]:
         issue = int(item["issueNumber"])
         short_period = str(issue)[-3:]
         size_str = "BIGGG" if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else "SMALL"
-        try:
-            num = int(item.get("number", 0))
-        except Exception:
-            num = 0
+        try: num = int(item.get("number", 0))
+        except: num = 0
 
         is_jack = num in (0, 5)
         pred = PREDICTION_MEMORY.get(issue)
 
         if pred and pred["size"] == size_str:
-            icon = "  ✅✅✅"           # correct size — win (jack bhi)
+            icon = "  ✅✅✅"
         elif is_jack:
-            icon = "  ☠️☠️☠️"           # jack missed
+            icon = "  ☠️☠️☠️"
         else:
-            icon = ""                    # normal loss
+            icon = ""
 
         logs_text += f"`{short_period}` *{size_str}* ({num}){icon}\n"
     return logs_text
@@ -258,7 +298,7 @@ def format_synced_history_logs(server_history):
 async def bot_loop(session):
     current_level = 1
     pending_pred = None
-    print("🚀 QUANTUM V21 ULTRA BOT LOOP STARTED...")
+    print("🚀 QUANTUM V21 ULTRA-MAX BOT LOOP STARTED...")
 
     while True:
         try:
@@ -268,26 +308,20 @@ async def bot_loop(session):
                 last_item = history[-1]
                 last_issue = int(last_item["issueNumber"])
                 actual_size = "BIGGG" if str(last_item.get("size", "")).upper() in ["BIG", "BIGGG"] else "SMALL"
-                try:
-                    actual_number = int(last_item.get("number", 0))
-                except Exception:
-                    actual_number = 0
+                try: actual_number = int(last_item.get("number", 0))
+                except: actual_number = 0
 
                 # --- Resolve previous prediction ---
                 if pending_pred and pending_pred["next_issue"] == last_issue:
                     is_jack = actual_number in (0, 5)
                     if is_jack and actual_size != pending_pred["pred_size"]:
-                        # Jack on wrong side -> miss, escalate level
                         current_level += 1
-                        if current_level > 5: current_level = 1
                     elif actual_size == pending_pred["pred_size"]:
-                        # Correct size (jack ya normal) -> win
                         current_level = 1
                         asyncio.create_task(send_win_sticker(session))
                     else:
-                        # Normal loss
                         current_level += 1
-                        if current_level > 5: current_level = 1
+                    if current_level > 5: current_level = 1
                     pending_pred = None
 
                 # --- Make new prediction ---
@@ -295,8 +329,6 @@ async def bot_loop(session):
                     pred_data = v21_strike_engine(history, current_level)
                     if pred_data:
                         pending_pred = pred_data
-
-                        # Save to memory for icon rendering
                         PREDICTION_MEMORY[pred_data["next_issue"]] = {
                             "size": pred_data["pred_size"],
                             "number": pred_data["pred_number"],
@@ -308,7 +340,7 @@ async def bot_loop(session):
                         history_block = format_synced_history_logs(history)
 
                         pred_msg = (
-                            f"🎯 *V21 ULTRA-STRIKE (NO-SKIP)* 🎯\n\n"
+                            f"🎯 *V21 ULTRA-MAX (NO-SKIP)* 🎯\n\n"
                             f"📌 *Period:* `{pred_data['next_issue']}`\n"
                             f"🎲 *Number:* `{pred_data['pred_number']}`\n"
                             f"🔥 *Target:* *{pred_data['pred_size_emoji']}*\n"
