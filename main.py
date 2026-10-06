@@ -15,6 +15,9 @@ CHAT_ID = "1264164655"
 WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ"
 # =======================================================
 
+# Memory: issue_number -> {"size": ..., "number": ...}
+PREDICTION_MEMORY = {}
+
 async def handle_health_check(request):
     return web.Response(text="QUANTUM V21 ACTIVE", status=200)
 
@@ -48,7 +51,7 @@ async def fetch_data(session):
         print(f"Fetch error: {e}")
     return None
 
-# ==================== ADVANCED NO-SKIP AI ENGINES ====================
+# ==================== CORE ENGINES ====================
 
 def calculate_rsi(outcomes, period=12):
     if len(outcomes) < period: return 50.0
@@ -69,7 +72,6 @@ def markov_3rd_order(outcomes):
             if outcomes[i+3] == 1: big_next += 1
     if matches > 0:
         return big_next / matches
-    
     last_two = tuple(outcomes[-2:])
     matches, big_next = 0, 0
     for i in range(len(outcomes) - 2):
@@ -83,10 +85,8 @@ def micro_streak_engine(outcomes):
     recent = outcomes[-5:]
     if sum(recent) == 5: return 0.72
     if sum(recent) == 0: return 0.28
-    
-    if recent == [1,0,1,0,1]: return 0.22
-    if recent == [0,1,0,1,0]: return 0.78
-    
+    if recent == [1, 0, 1, 0, 1]: return 0.22
+    if recent == [0, 1, 0, 1, 0]: return 0.78
     return 0.5
 
 def dynamic_deep_pattern_miner(outcomes):
@@ -98,7 +98,7 @@ def dynamic_deep_pattern_miner(outcomes):
         tail = curr_str[-L:]
         big_w, small_w = 0.0, 0.0
         for i in range(total_len - L):
-            if curr_str[i : i + L] == tail:
+            if curr_str[i:i + L] == tail:
                 recency = math.exp((i / total_len) * 7.0)
                 if curr_str[i + L] == 'B': big_w += recency
                 else: small_w += recency
@@ -106,6 +106,77 @@ def dynamic_deep_pattern_miner(outcomes):
             return big_w / (big_w + small_w)
     return 0.5
 
+# ==================== ADVANCED NUMBER PREDICTOR ====================
+def number_predictor(history_list, predicted_size):
+    """
+    Multi-engine number prediction:
+      - 2nd-order Markov (35%)
+      - 1st-order Markov (25%)
+      - Recency-weighted frequency last 60 (25%)
+      - Global frequency last 200 (15%)
+    Jack numbers ARE included for their matching size:
+      BIGGG  -> 5 (jack) + 6,7,8,9
+      SMALL  -> 0 (jack) + 1,2,3,4
+    """
+    numbers = []
+    for item in history_list:
+        try:
+            numbers.append(int(item.get("number", 0)))
+        except Exception:
+            numbers.append(0)
+
+    if len(numbers) < 30:
+        return 8 if predicted_size == "BIGGG" else 2
+
+    # Valid candidates — jack included for its matching size
+    if predicted_size == "BIGGG":
+        candidates = [5, 6, 7, 8, 9]   # 5 is jack for BIG
+    else:
+        candidates = [0, 1, 2, 3, 4]   # 0 is jack for SMALL
+
+    # --- 1st-order Markov ---
+    last_num = numbers[-1]
+    mk1 = Counter()
+    for i in range(len(numbers) - 1):
+        if numbers[i] == last_num:
+            mk1[numbers[i + 1]] += 1
+
+    # --- 2nd-order Markov ---
+    mk2 = Counter()
+    if len(numbers) >= 2:
+        last_two = (numbers[-2], numbers[-1])
+        for i in range(len(numbers) - 2):
+            if (numbers[i], numbers[i + 1]) == last_two:
+                mk2[numbers[i + 2]] += 1
+
+    # --- Recency-weighted frequency (last 60) ---
+    recent = numbers[-60:]
+    total_recent = len(recent)
+    freq_weighted = {}
+    for idx, n in enumerate(recent):
+        w = math.exp((idx / total_recent) * 3.0)
+        freq_weighted[n] = freq_weighted.get(n, 0.0) + w
+    total_fw = sum(freq_weighted.values()) or 1.0
+
+    # --- Global frequency (last 200) ---
+    scope = numbers[-200:] if len(numbers) >= 200 else numbers
+    freq_all = Counter(scope)
+    total_all = len(scope)
+
+    total_mk1 = sum(mk1.values()) or 1
+    total_mk2 = sum(mk2.values()) or 1
+
+    scores = {}
+    for n in candidates:
+        s_mk2 = mk2.get(n, 0) / total_mk2
+        s_mk1 = mk1.get(n, 0) / total_mk1
+        s_fw  = freq_weighted.get(n, 0.0) / total_fw
+        s_fa  = freq_all.get(n, 0) / total_all
+        scores[n] = (s_mk2 * 0.35) + (s_mk1 * 0.25) + (s_fw * 0.25) + (s_fa * 0.15)
+
+    return max(scores, key=scores.get)
+
+# ==================== STRIKE ENGINE ====================
 def v21_strike_engine(history_list, current_level):
     outcomes = [1 if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else 0 for item in history_list]
     if len(outcomes) < 20: return None
@@ -114,13 +185,13 @@ def v21_strike_engine(history_list, current_level):
     miner_prob = dynamic_deep_pattern_miner(outcomes)
     markov_prob = markov_3rd_order(outcomes)
     streak_prob = micro_streak_engine(outcomes)
-    
+
     rsi_adj = 0.0
     if rsi >= 75: rsi_adj = -0.18
     elif rsi <= 25: rsi_adj = 0.18
 
     final_prob_big = (miner_prob * 0.40) + (markov_prob * 0.30) + (streak_prob * 0.20) + rsi_adj + 0.05
-    
+
     if final_prob_big >= 0.50:
         pred_size = "BIGGG"
         pred_size_emoji = "BIGGG 🟢"
@@ -131,6 +202,7 @@ def v21_strike_engine(history_list, current_level):
         confidence_real = 1.0 - final_prob_big
 
     display_confidence = 68.0 + (confidence_real * 30.5)
+    pred_number = number_predictor(history_list, pred_size)
 
     if current_level == 1:
         bet_advice = "1.0X 🎯 LEVEL 1 STRIKE"
@@ -146,23 +218,47 @@ def v21_strike_engine(history_list, current_level):
         "next_issue": int(history_list[-1]["issueNumber"]) + 1,
         "pred_size": pred_size,
         "pred_size_emoji": pred_size_emoji,
+        "pred_number": pred_number,
         "confidence": display_confidence,
         "bet_advice": bet_advice,
-        "metrics": f"RSI: {rsi:.1f} | STRK: {streak_prob:.2f} | CONF: {display_confidence:.1f}%"
+        "metrics": f"RSI:{rsi:.1f} STRK:{streak_prob:.2f} CONF:{display_confidence:.1f}%"
     }
 
+# ==================== HISTORY FORMATTER WITH ICONS ====================
 def format_synced_history_logs(server_history):
+    """
+    ✅✅✅ -> our predicted size matched actual size (win — jack bhi win hai)
+    ☠️☠️☠️ -> jack aaya par hum galat size pe the (miss)
+    blank  -> normal loss
+    """
     logs_text = ""
     for item in server_history[-8:]:
-        short_period = str(item["issueNumber"])[-3:]
+        issue = int(item["issueNumber"])
+        short_period = str(issue)[-3:]
         size_str = "BIGGG" if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else "SMALL"
-        logs_text += f"`{short_period}` *{size_str}*\n"
+        try:
+            num = int(item.get("number", 0))
+        except Exception:
+            num = 0
+
+        is_jack = num in (0, 5)
+        pred = PREDICTION_MEMORY.get(issue)
+
+        if pred and pred["size"] == size_str:
+            icon = "  ✅✅✅"           # correct size — win (jack bhi)
+        elif is_jack:
+            icon = "  ☠️☠️☠️"           # jack missed
+        else:
+            icon = ""                    # normal loss
+
+        logs_text += f"`{short_period}` *{size_str}* ({num}){icon}\n"
     return logs_text
 
+# ==================== MAIN BOT LOOP ====================
 async def bot_loop(session):
     current_level = 1
     pending_pred = None
-    print("🚀 QUANTUM V21 BOT LOOP STARTED...")
+    print("🚀 QUANTUM V21 ULTRA BOT LOOP STARTED...")
 
     while True:
         try:
@@ -172,26 +268,49 @@ async def bot_loop(session):
                 last_item = history[-1]
                 last_issue = int(last_item["issueNumber"])
                 actual_size = "BIGGG" if str(last_item.get("size", "")).upper() in ["BIG", "BIGGG"] else "SMALL"
+                try:
+                    actual_number = int(last_item.get("number", 0))
+                except Exception:
+                    actual_number = 0
 
+                # --- Resolve previous prediction ---
                 if pending_pred and pending_pred["next_issue"] == last_issue:
-                    is_win = (actual_size == pending_pred["pred_size"])
-                    if is_win:
+                    is_jack = actual_number in (0, 5)
+                    if is_jack and actual_size != pending_pred["pred_size"]:
+                        # Jack on wrong side -> miss, escalate level
+                        current_level += 1
+                        if current_level > 5: current_level = 1
+                    elif actual_size == pending_pred["pred_size"]:
+                        # Correct size (jack ya normal) -> win
                         current_level = 1
                         asyncio.create_task(send_win_sticker(session))
                     else:
+                        # Normal loss
                         current_level += 1
                         if current_level > 5: current_level = 1
                     pending_pred = None
 
+                # --- Make new prediction ---
                 if not pending_pred or pending_pred["last_issue"] != last_issue:
                     pred_data = v21_strike_engine(history, current_level)
                     if pred_data:
                         pending_pred = pred_data
+
+                        # Save to memory for icon rendering
+                        PREDICTION_MEMORY[pred_data["next_issue"]] = {
+                            "size": pred_data["pred_size"],
+                            "number": pred_data["pred_number"],
+                        }
+                        if len(PREDICTION_MEMORY) > 300:
+                            oldest = min(PREDICTION_MEMORY.keys())
+                            del PREDICTION_MEMORY[oldest]
+
                         history_block = format_synced_history_logs(history)
 
                         pred_msg = (
                             f"🎯 *V21 ULTRA-STRIKE (NO-SKIP)* 🎯\n\n"
                             f"📌 *Period:* `{pred_data['next_issue']}`\n"
+                            f"🎲 *Number:* `{pred_data['pred_number']}`\n"
                             f"🔥 *Target:* *{pred_data['pred_size_emoji']}*\n"
                             f"📊 *Win Prob:* `{pred_data['confidence']:.1f}%`\n"
                             f"💰 *Fund Advice:* `{pred_data['bet_advice']}`\n\n"
@@ -202,18 +321,20 @@ async def bot_loop(session):
                             f"{history_block}"
                         )
                         asyncio.create_task(send_telegram(session, pred_msg))
+
         except Exception as e:
             print(f"Error in bot loop: {e}")
+            traceback.print_exc()
+
         await asyncio.sleep(5)
 
 async def main():
     app = web.Application()
-    # add_get handles GET & HEAD automatically
     app.router.add_get('/', handle_health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    
+
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
