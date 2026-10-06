@@ -16,7 +16,7 @@ WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X
 # =======================================================
 
 async def handle_health_check(request):
-    return web.Response(text="QUANTUM V21 NO-SKIP AI ACTIVE", status=200)
+    return web.Response(text="QUANTUM V21 ACTIVE", status=200)
 
 async def send_telegram(session, message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -48,7 +48,7 @@ async def fetch_data(session):
         print(f"Fetch error: {e}")
     return None
 
-# ==================== NO-SKIP AI ENGINES ====================
+# ==================== ADVANCED NO-SKIP AI ENGINES ====================
 
 def calculate_rsi(outcomes, period=12):
     if len(outcomes) < period: return 50.0
@@ -60,7 +60,6 @@ def calculate_rsi(outcomes, period=12):
     return 100 - (100 / (1 + rs))
 
 def markov_3rd_order(outcomes):
-    """Tracks 3-period outcome chains for high precision"""
     if len(outcomes) < 12: return 0.5
     last_three = tuple(outcomes[-3:])
     matches, big_next = 0, 0
@@ -71,7 +70,6 @@ def markov_3rd_order(outcomes):
     if matches > 0:
         return big_next / matches
     
-    # Fallback to 2nd order if no 3rd order match exists
     last_two = tuple(outcomes[-2:])
     matches, big_next = 0, 0
     for i in range(len(outcomes) - 2):
@@ -81,15 +79,13 @@ def markov_3rd_order(outcomes):
     return (big_next / matches) if matches > 0 else 0.5
 
 def micro_streak_engine(outcomes):
-    """Detects dragons, alternations & immediate pattern momentum"""
     if len(outcomes) < 5: return 0.5
     recent = outcomes[-5:]
-    if sum(recent) == 5: return 0.72  # Strong Big Dragon
-    if sum(recent) == 0: return 0.28  # Strong Small Dragon
+    if sum(recent) == 5: return 0.72
+    if sum(recent) == 0: return 0.28
     
-    # Check 1-by-1 alternating patterns (1,0,1,0,1)
-    if recent == [1,0,1,0,1]: return 0.22  # Expect SMALL next
-    if recent == [0,1,0,1,0]: return 0.78  # Expect BIG next
+    if recent == [1,0,1,0,1]: return 0.22
+    if recent == [0,1,0,1,0]: return 0.78
     
     return 0.5
 
@@ -110,8 +106,6 @@ def dynamic_deep_pattern_miner(outcomes):
             return big_w / (big_w + small_w)
     return 0.5
 
-# ==================== V21 STRIKE ENGINE (100% HARD ACTION) ====================
-
 def v21_strike_engine(history_list, current_level):
     outcomes = [1 if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else 0 for item in history_list]
     if len(outcomes) < 20: return None
@@ -121,15 +115,12 @@ def v21_strike_engine(history_list, current_level):
     markov_prob = markov_3rd_order(outcomes)
     streak_prob = micro_streak_engine(outcomes)
     
-    # RSI Adjustment
     rsi_adj = 0.0
     if rsi >= 75: rsi_adj = -0.18
     elif rsi <= 25: rsi_adj = 0.18
 
-    # Ensemble Weighted Decision Matrix
     final_prob_big = (miner_prob * 0.40) + (markov_prob * 0.30) + (streak_prob * 0.20) + rsi_adj + 0.05
     
-    # Strictly Binary (NO SKIP ALLOWED)
     if final_prob_big >= 0.50:
         pred_size = "BIGGG"
         pred_size_emoji = "BIGGG 🟢"
@@ -141,7 +132,6 @@ def v21_strike_engine(history_list, current_level):
 
     display_confidence = 68.0 + (confidence_real * 30.5)
 
-    # Fund Management optimized for Level 1-2 Focus
     if current_level == 1:
         bet_advice = "1.0X 🎯 LEVEL 1 STRIKE"
     elif current_level == 2:
@@ -169,73 +159,69 @@ def format_synced_history_logs(server_history):
         logs_text += f"`{short_period}` *{size_str}*\n"
     return logs_text
 
-async def bot_background_loop(app):
-    print("🚀 QUANTUM V21 NO-SKIP ENGINE ACTIVE...")
-    async with aiohttp.ClientSession() as session:
-        current_level = 1
-        pending_pred = None
-        
-        while True:
-            try:
-                raw_list = await fetch_data(session)
-                if raw_list:
-                    history = list(reversed(raw_list))
-                    last_item = history[-1]
-                    last_issue = int(last_item["issueNumber"])
-                    actual_size = "BIGGG" if str(last_item.get("size", "")).upper() in ["BIG", "BIGGG"] else "SMALL"
+async def bot_loop(session):
+    current_level = 1
+    pending_pred = None
+    print("🚀 QUANTUM V21 BOT LOOP STARTED...")
 
-                    if pending_pred and pending_pred["next_issue"] == last_issue:
-                        is_win = (actual_size == pending_pred["pred_size"])
-                        if is_win:
-                            current_level = 1
-                            asyncio.create_task(send_win_sticker(session))
-                        else:
-                            current_level += 1
-                            if current_level > 5: current_level = 1
-                        pending_pred = None
+    while True:
+        try:
+            raw_list = await fetch_data(session)
+            if raw_list:
+                history = list(reversed(raw_list))
+                last_item = history[-1]
+                last_issue = int(last_item["issueNumber"])
+                actual_size = "BIGGG" if str(last_item.get("size", "")).upper() in ["BIG", "BIGGG"] else "SMALL"
 
-                    if not pending_pred or pending_pred["last_issue"] != last_issue:
-                        pred_data = v21_strike_engine(history, current_level)
-                        if pred_data:
-                            pending_pred = pred_data
-                            history_block = format_synced_history_logs(history)
+                if pending_pred and pending_pred["next_issue"] == last_issue:
+                    is_win = (actual_size == pending_pred["pred_size"])
+                    if is_win:
+                        current_level = 1
+                        asyncio.create_task(send_win_sticker(session))
+                    else:
+                        current_level += 1
+                        if current_level > 5: current_level = 1
+                    pending_pred = None
 
-                            pred_msg = (
-                                f"🎯 *V21 ULTRA-STRIKE (NO-SKIP)* 🎯\n\n"
-                                f"📌 *Period:* `{pred_data['next_issue']}`\n"
-                                f"🔥 *Target:* *{pred_data['pred_size_emoji']}*\n"
-                                f"📊 *Win Prob:* `{pred_data['confidence']:.1f}%`\n"
-                                f"💰 *Fund Advice:* `{pred_data['bet_advice']}`\n\n"
-                                f"🚩 *Current Status:* `LEVEL {current_level}`\n"
-                                f"⚙️ *Quant Data:* `{pred_data['metrics']}`\n"
-                                f"-----------------------------------\n"
-                                f"📜 *MARKET TREND (8)*:\n"
-                                f"{history_block}"
-                            )
-                            asyncio.create_task(send_telegram(session, pred_msg))
-            except Exception as e:
-                print(f"Error in bot loop: {e}")
-            await asyncio.sleep(5)
+                if not pending_pred or pending_pred["last_issue"] != last_issue:
+                    pred_data = v21_strike_engine(history, current_level)
+                    if pred_data:
+                        pending_pred = pred_data
+                        history_block = format_synced_history_logs(history)
 
-async def start_background_tasks(app):
-    app['bot_task'] = asyncio.create_task(bot_background_loop(app))
+                        pred_msg = (
+                            f"🎯 *V21 ULTRA-STRIKE (NO-SKIP)* 🎯\n\n"
+                            f"📌 *Period:* `{pred_data['next_issue']}`\n"
+                            f"🔥 *Target:* *{pred_data['pred_size_emoji']}*\n"
+                            f"📊 *Win Prob:* `{pred_data['confidence']:.1f}%`\n"
+                            f"💰 *Fund Advice:* `{pred_data['bet_advice']}`\n\n"
+                            f"🚩 *Current Status:* `LEVEL {current_level}`\n"
+                            f"⚙️ *Quant Data:* `{pred_data['metrics']}`\n"
+                            f"-----------------------------------\n"
+                            f"📜 *MARKET TREND (8)*:\n"
+                            f"{history_block}"
+                        )
+                        asyncio.create_task(send_telegram(session, pred_msg))
+        except Exception as e:
+            print(f"Error in bot loop: {e}")
+        await asyncio.sleep(5)
 
-async def cleanup_background_tasks(app):
-    app['bot_task'].cancel()
-    await app['bot_task']
-
-def main():
+async def main():
     app = web.Application()
     app.router.add_get('/', handle_health_check)
     app.router.add_head('/', handle_health_check)
-    
-    app.on_startup.append(start_background_tasks)
-    app.on_cleanup.append(cleanup_background_tasks)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
     
     port = int(os.environ.get("PORT", 10000))
-    web.run_app(app, host='0.0.0.0', port=port)
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"✅ Web Server Live on Port {port}")
+
+    async with aiohttp.ClientSession() as session:
+        await bot_loop(session)
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())
 
