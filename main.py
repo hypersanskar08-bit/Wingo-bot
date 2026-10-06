@@ -20,11 +20,12 @@ WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g
 # ================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("QuantumV26")
+logger = logging.getLogger("QuantumV26_2")
 handler = RotatingFileHandler('bot.log', maxBytes=5*1024*1024, backupCount=2)
 logger.addHandler(handler)
 
-STATE_FILE = "engine_state_v26.json"
+# 🔥 New state file to avoid conflict
+STATE_FILE = "engine_state_v26_2.json"
 
 # ==================== PERSISTENT STATE ====================
 def default_engine_state():
@@ -34,13 +35,13 @@ def default_engine_state():
         "recent_hits": 0, "recent_total": 0,
         "brier_sum": 0.0,
         "tp": 0, "fp": 0, "fn": 0, "tn": 0,
-        "gradient_weight": 1.0,  # For online gradient descent
+        "gradient_weight": 1.0,
         "regime_stats": {}
     }
 
 ENGINES = ["markov", "ngram", "runlen", "regime", "streak",
            "autocorr", "alternation", "repeat", "knn", "number_feat",
-           "attention", "fft", "hmm", "lyapunov", "kalman"]  # 15 engines
+           "attention", "fft", "hmm", "lyapunov", "kalman", "trend_shift"]
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -50,6 +51,11 @@ def load_state():
             for eng in ENGINES:
                 if eng not in s.get("engine_stats", {}):
                     s.setdefault("engine_stats", {})[eng] = default_engine_state()
+            # 🔥 Migrate old state to include stats
+            s.setdefault("total_wins", 0)
+            s.setdefault("total_losses", 0)
+            s.setdefault("current_loss_streak", 0)
+            s.setdefault("max_b2b_loss", 0)
             return s
         except Exception as e:
             logger.error(f"State load error: {e}")
@@ -60,9 +66,14 @@ def load_state():
         "calibration_offset": 0.0,
         "hourly_profiles": {},
         "error_history": [],
-        "gradient_lr": 0.01,       # Learning rate
-        "hmm_transition": None,    # Learned transition matrix
-        "hmm_emission": None,      # Learned emission
+        "gradient_lr": 0.01,
+        "hmm_transition": None,
+        "hmm_emission": None,
+        # 🔥 NEW STATS
+        "total_wins": 0,
+        "total_losses": 0,
+        "current_loss_streak": 0,
+        "max_b2b_loss": 0,
     }
 
 def save_state(state):
@@ -125,7 +136,7 @@ def hour_bucket(issue_num):
     except Exception: pass
     return datetime.now(timezone.utc).hour
 
-# ==================== 10 CORE ENGINES ====================
+# ==================== CORE ENGINES ====================
 def engine_markov(outcomes):
     n = len(outcomes)
     if n < 15: return 0.5
@@ -285,147 +296,86 @@ def engine_number_feat(history_list, _):
     t = bw+sw
     return (bw+0.5)/(t+1.0) if t>0 else 0.5
 
-# ==================== 🔥 ENGINE 11: ATTENTION MECHANISM ====================
+# ==================== ADVANCED ENGINES ====================
 def engine_attention(outcomes, num_heads=4):
-    """
-    Multi-head attention over historical windows.
-    Query = last K outcomes, Key = historical windows, Value = next outcome.
-    """
     n = len(outcomes)
     if n < 30: return 0.5
     query_len = 6
     query = outcomes[-query_len:]
-    
-    # Build (key, value) pairs
     keys, values, positions = [], [], []
     for i in range(n - query_len - 1):
         keys.append(outcomes[i:i+query_len])
         values.append(outcomes[i + query_len])
         positions.append(i)
-    
     if not keys: return 0.5
-    
-    # Multi-head with different temperature (sharpness)
     head_results = []
     for temp in [1.0, 2.0, 4.0, 8.0]:
         scores = []
         for k_idx, key in enumerate(keys):
-            # Similarity = negative Hamming
             sim = sum(1 for a,b in zip(key, query) if a==b)
             sim_norm = sim / query_len
-            # Recency bonus
             rec = (positions[k_idx] / n)
             scores.append(math.exp(sim_norm * temp) * math.exp(rec * 1.0))
-        
         total_w = sum(scores) or 1.0
         weighted_big = sum(scores[i] * values[i] for i in range(len(values)))
-        p_big = weighted_big / total_w
-        head_results.append(p_big)
-    
+        head_results.append(weighted_big / total_w)
     return sum(head_results) / len(head_results)
 
-# ==================== 🔥 ENGINE 12: FFT PERIODICITY ====================
 def engine_fft(outcomes):
-    """
-    Fast Fourier Transform based periodicity detection.
-    Find dominant frequency and predict next value from phase.
-    """
     n = len(outcomes)
     if n < 32: return 0.5
-    # Use last power-of-2 window
     N = 1
     while N * 2 <= min(n, 128): N *= 2
     if N < 16: return 0.5
-    
-    # Center the signal (subtract mean)
     signal = outcomes[-N:]
     mean = sum(signal) / N
     centered = [x - mean for x in signal]
-    
-    # DFT (small N so O(N^2) is fine)
     freqs = []
     for k in range(N // 2):
         real = sum(centered[t] * math.cos(2*math.pi*k*t/N) for t in range(N))
         imag = -sum(centered[t] * math.sin(2*math.pi*k*t/N) for t in range(N))
         mag = math.sqrt(real*real + imag*imag)
         freqs.append((k, mag, real, imag))
-    
     if not freqs: return 0.5
-    # Dominant frequency (skip DC = k=0)
     freqs_nonzero = [f for f in freqs if f[0] > 0]
     if not freqs_nonzero: return 0.5
     dom = max(freqs_nonzero, key=lambda x: x[1])
     k_dom, mag_dom, real_dom, imag_dom = dom
-    
-    # Signal strength
     total_mag = sum(f[1] for f in freqs_nonzero) or 1.0
     strength = mag_dom / total_mag
-    
     if strength < 0.15: return 0.5
-    
-    # Predict next via inverse (phase shift)
     t_next = N
     phase_val = real_dom * math.cos(2*math.pi*k_dom*t_next/N) - imag_dom * math.sin(2*math.pi*k_dom*t_next/N)
-    # Normalize to probability
     p_big = 0.5 + 0.4 * math.tanh(phase_val / (mag_dom + 1e-6))
     return max(0.05, min(0.95, p_big * strength + 0.5 * (1 - strength)))
 
-# ==================== 🔥 ENGINE 13: HIDDEN MARKOV MODEL ====================
 def engine_hmm(outcomes):
-    """
-    3-state HMM: TRENDING_BIG, TRENDING_SMALL, CHOPPY
-    Viterbi-style inference with learned transitions.
-    """
     n = len(outcomes)
     if n < 30: return 0.5
-    
-    # Initialize/learn transition matrix
     if STATE.get("hmm_transition") is None or len(STATE.get("hmm_transition", [])) != 3:
         STATE["hmm_transition"] = [[0.3,0.3,0.4],[0.3,0.3,0.4],[0.4,0.3,0.3]]
-    
     trans = STATE["hmm_transition"]
-    # Emission: P(outcome=1 | state)
-    emissions = [0.85, 0.15, 0.50]  # state 0: Big, state 1: Small, state 2: Choppy
-    
-    # Forward algorithm
+    emissions = [0.85, 0.15, 0.50]
     alpha = [1/3, 1/3, 1/3]
     for t in range(n):
         x = outcomes[t]
         em = [emissions[s] if x == 1 else (1 - emissions[s]) for s in range(3)]
-        new_alpha = [
-            em[s] * sum(alpha[prev] * trans[prev][s] for prev in range(3))
-            for s in range(3)
-        ]
+        new_alpha = [em[s] * sum(alpha[prev] * trans[prev][s] for prev in range(3)) for s in range(3)]
         total = sum(new_alpha) or 1.0
         alpha = [a / total for a in new_alpha]
-    
-    # Predict next
     next_prob = [sum(alpha[prev] * trans[prev][s] for prev in range(3)) for s in range(3)]
-    p_big = sum(next_prob[s] * emissions[s] for s in range(3))
-    return p_big
+    return sum(next_prob[s] * emissions[s] for s in range(3))
 
-# ==================== 🔥 ENGINE 14: LYAPUNOV EXPONENT (CHAOS DETECTION) ====================
 def engine_lyapunov(outcomes):
-    """
-    Estimate largest Lyapunov exponent.
-    If positive → chaotic → unpredictable → return 0.5 (neutral).
-    If negative/zero → predictable → return trend continuation.
-    """
     n = len(outcomes)
     if n < 30: return 0.5
-    
-    # Compute divergence of nearby trajectories
-    m = 5  # embedding dimension
-    # Build embedded vectors
+    m = 5
     vectors = []
     for i in range(n - m):
         vectors.append(outcomes[i:i+m])
     if len(vectors) < 10: return 0.5
-    
-    # For each vector, find nearest neighbor
     divergences = []
     for i in range(len(vectors) - 1):
-        # Find nearest neighbor (not itself, not too close in time)
         best_j, best_d = None, float('inf')
         for j in range(len(vectors)):
             if abs(i - j) < 5: continue
@@ -433,59 +383,54 @@ def engine_lyapunov(outcomes):
             if d < best_d and d > 0:
                 best_d = d; best_j = j
         if best_j is not None:
-            # Track divergence over next few steps
             for step in range(1, min(5, len(vectors) - i, len(vectors) - best_j)):
                 d_future = sum(1 for a,b in zip(vectors[i+step], vectors[best_j+step]) if a!=b)
                 if d_future > 0 and best_d > 0:
                     divergences.append(math.log(d_future / best_d) / step)
-    
     if not divergences: return 0.5
     lyap = sum(divergences) / len(divergences)
-    
-    # If lyap > 0 → chaotic (bad for prediction)
-    # If lyap <= 0 → stable → trust recent trend
-    if lyap > 0.3:
-        return 0.5  # Chaotic, no signal
+    if lyap > 0.3: return 0.5
     else:
-        # Use recent trend
         recent = outcomes[-5:]
         trend = sum(recent) / len(recent)
         return 0.5 + (trend - 0.5) * (1 - max(0, lyap))
 
-# ==================== 🔥 ENGINE 15: KALMAN FILTER ====================
 def engine_kalman(outcomes):
-    """
-    1D Kalman filter to estimate hidden "true state" of market bias.
-    Model: state = true_prob_big, observation = outcome (noisy).
-    """
     n = len(outcomes)
     if n < 10: return 0.5
-    
-    # Process noise Q, observation noise R
     Q = 0.02
     R = 0.25
-    
-    x = 0.5  # Initial state estimate
-    P = 1.0  # Initial uncertainty
-    
+    x = 0.5
+    P = 1.0
     for obs in outcomes:
-        # Predict
         P_pred = P + Q
-        # Update
         K = P_pred / (P_pred + R)
         x = x + K * (obs - x)
         P = (1 - K) * P_pred
-    
     return max(0.05, min(0.95, x))
+
+def engine_trend_shift(outcomes):
+    n = len(outcomes)
+    if n < 20: return 0.5
+    alpha_f = 2 / (3 + 1)
+    alpha_s = 2 / (15 + 1)
+    ema_f = outcomes[0]
+    ema_s = outcomes[0]
+    for x in outcomes[1:]:
+        ema_f = alpha_f * x + (1 - alpha_f) * ema_f
+        ema_s = alpha_s * x + (1 - alpha_s) * ema_s
+    diff = ema_f - ema_s
+    p_big = 0.5 + 0.5 * math.tanh(diff * 5.0)
+    return max(0.10, min(0.90, p_big))
 
 # ==================== MIXTURE OF EXPERTS ====================
 REGIME_EXPERT_WEIGHTS = {
-    "ALTERNATING":   {"alternation":0.15,"attention":0.15,"knn":0.12,"ngram":0.10,"hmm":0.10,"fft":0.08,"streak":0.08,"markov":0.08,"kalman":0.06,"number_feat":0.02,"autocorr":0.03,"lyapunov":0.01,"runlen":0.01,"regime":0.005,"repeat":0.005},
-    "BIG_HEAVY":     {"runlen":0.14,"regime":0.12,"attention":0.12,"hmm":0.11,"markov":0.10,"knn":0.10,"ngram":0.09,"kalman":0.08,"fft":0.06,"streak":0.05,"autocorr":0.02,"alternation":0.005,"repeat":0.003,"lyapunov":0.001,"number_feat":0.0},
-    "SMALL_HEAVY":   {"runlen":0.14,"regime":0.12,"attention":0.12,"hmm":0.11,"markov":0.10,"knn":0.10,"ngram":0.09,"kalman":0.08,"fft":0.06,"streak":0.05,"autocorr":0.02,"alternation":0.005,"repeat":0.003,"lyapunov":0.001,"number_feat":0.0},
-    "CHOPPY":        {"attention":0.15,"knn":0.13,"hmm":0.11,"fft":0.10,"autocorr":0.10,"alternation":0.10,"markov":0.08,"ngram":0.08,"kalman":0.07,"lyapunov":0.05,"streak":0.02,"runlen":0.005,"regime":0.003,"repeat":0.002,"number_feat":0.0},
-    "LONG_STREAK":   {"runlen":0.18,"streak":0.14,"regime":0.12,"attention":0.11,"hmm":0.10,"knn":0.10,"markov":0.08,"ngram":0.07,"kalman":0.05,"autocorr":0.03,"fft":0.015,"alternation":0.003,"repeat":0.002,"lyapunov":0.0,"number_feat":0.0},
-    "BALANCED":      {"markov":0.10,"ngram":0.10,"knn":0.10,"attention":0.10,"hmm":0.09,"fft":0.08,"kalman":0.08,"runlen":0.08,"regime":0.07,"autocorr":0.06,"streak":0.05,"alternation":0.05,"lyapunov":0.02,"repeat":0.01,"number_feat":0.01},
+    "ALTERNATING":   {"alternation":0.13,"attention":0.13,"knn":0.11,"trend_shift":0.10,"ngram":0.09,"hmm":0.09,"fft":0.07,"streak":0.07,"markov":0.07,"kalman":0.06,"autocorr":0.03,"number_feat":0.02,"lyapunov":0.02,"runlen":0.005,"regime":0.004,"repeat":0.001},
+    "BIG_HEAVY":     {"runlen":0.13,"regime":0.11,"attention":0.11,"hmm":0.10,"markov":0.09,"knn":0.09,"ngram":0.08,"kalman":0.08,"trend_shift":0.08,"fft":0.06,"streak":0.05,"autocorr":0.02,"alternation":0.003,"repeat":0.002,"lyapunov":0.001,"number_feat":0.0},
+    "SMALL_HEAVY":   {"runlen":0.13,"regime":0.11,"attention":0.11,"hmm":0.10,"markov":0.09,"knn":0.09,"ngram":0.08,"kalman":0.08,"trend_shift":0.08,"fft":0.06,"streak":0.05,"autocorr":0.02,"alternation":0.003,"repeat":0.002,"lyapunov":0.001,"number_feat":0.0},
+    "CHOPPY":        {"attention":0.14,"knn":0.12,"hmm":0.10,"fft":0.09,"autocorr":0.09,"alternation":0.09,"trend_shift":0.09,"markov":0.07,"ngram":0.07,"kalman":0.06,"lyapunov":0.05,"streak":0.02,"runlen":0.005,"regime":0.003,"repeat":0.002,"number_feat":0.0},
+    "LONG_STREAK":   {"runlen":0.17,"streak":0.13,"regime":0.11,"attention":0.10,"hmm":0.09,"knn":0.09,"markov":0.08,"ngram":0.07,"kalman":0.05,"trend_shift":0.05,"autocorr":0.03,"fft":0.02,"alternation":0.003,"repeat":0.002,"lyapunov":0.0,"number_feat":0.0},
+    "BALANCED":      {"trend_shift":0.12,"markov":0.09,"ngram":0.09,"knn":0.09,"attention":0.09,"hmm":0.08,"fft":0.07,"kalman":0.07,"runlen":0.07,"regime":0.06,"autocorr":0.05,"streak":0.04,"alternation":0.04,"lyapunov":0.02,"repeat":0.01,"number_feat":0.01},
 }
 
 def get_moe_weights(regime):
@@ -506,7 +451,6 @@ def get_moe_weights(regime):
     total = sum(boosted.values()) or 1.0
     return {k: v/total for k,v in boosted.items()}
 
-# ==================== BAYESIAN COMBINE ====================
 def bayesian_posterior(engine_probs, weights):
     def to_logit(p):
         p = max(0.01, min(0.99, p))
@@ -518,26 +462,16 @@ def bayesian_posterior(engine_probs, weights):
     var = sum((p - mean_p)**2 for p in preds) / len(preds)
     return p_big, var
 
-# ==================== ONLINE GRADIENT DESCENT ====================
 def gradient_update(engine_probs, actual_big, lr=0.01):
-    """
-    Update each engine's gradient_weight based on prediction loss.
-    Loss = (predicted_prob - actual)^2 (Brier)
-    dL/dw ≈ (predicted - actual) * feature_contribution
-    """
     actual = 1.0 if actual_big else 0.0
     for eng, prob in engine_probs.items():
         stats = STATE["engine_stats"].setdefault(eng, default_engine_state())
-        # Gradient of squared loss w.r.t. weight, simplified
         grad = (prob - actual) * (prob - 0.5) * 2.0
-        # Update weight with momentum
         old_w = stats.get("gradient_weight", 1.0)
         new_w = old_w - lr * grad
-        # Clip to prevent runaway
         new_w = max(0.3, min(3.0, new_w))
         stats["gradient_weight"] = new_w
 
-# ==================== ANOMALY DETECTION ====================
 def detect_anomaly(outcomes):
     if len(outcomes) < 60: return 0.0
     r = sum(outcomes[-20:]) / 20
@@ -545,7 +479,6 @@ def detect_anomaly(outcomes):
     drift = abs(r - o)
     return min(1.0, drift / 0.35)
 
-# ==================== TIME-OF-DAY ====================
 def hourly_bias(outcomes, issue_num):
     hour = hour_bucket(issue_num)
     prof = STATE["hourly_profiles"].get(str(hour))
@@ -561,32 +494,32 @@ def update_hourly_profile(issue_num, actual_big):
     p["total"] += 1
     if actual_big: p["big"] += 1
 
-# ==================== MAIN META-ENGINE ====================
+# ==================== META-ENGINE ====================
 def meta_engine_predict(history, regime):
     outcomes = [h["size"] for h in history]
     
     engine_probs = {
-        "markov": engine_markov(outcomes),
-        "ngram": engine_ngram(outcomes),
-        "runlen": engine_runlen(outcomes),
-        "regime": engine_regime(outcomes),
-        "streak": engine_streak(outcomes),
-        "autocorr": engine_autocorr(outcomes),
-        "alternation": engine_alternation(outcomes),
-        "repeat": engine_repeat(outcomes),
-        "knn": engine_knn(outcomes),
-        "number_feat": engine_number_feat(history, None),
-        "attention": engine_attention(outcomes),
-        "fft": engine_fft(outcomes),
-        "hmm": engine_hmm(outcomes),
-        "lyapunov": engine_lyapunov(outcomes),
-        "kalman": engine_kalman(outcomes),
+        "markov": engine_markov(outcomes), "ngram": engine_ngram(outcomes),
+        "runlen": engine_runlen(outcomes), "regime": engine_regime(outcomes),
+        "streak": engine_streak(outcomes), "autocorr": engine_autocorr(outcomes),
+        "alternation": engine_alternation(outcomes), "repeat": engine_repeat(outcomes),
+        "knn": engine_knn(outcomes), "number_feat": engine_number_feat(history, None),
+        "attention": engine_attention(outcomes), "fft": engine_fft(outcomes),
+        "hmm": engine_hmm(outcomes), "lyapunov": engine_lyapunov(outcomes),
+        "kalman": engine_kalman(outcomes), "trend_shift": engine_trend_shift(outcomes)
     }
     
     weights = get_moe_weights(regime)
     p_big, var = bayesian_posterior(engine_probs, weights)
     
-    # Dampening layers
+    last_3 = outcomes[-3:] if len(outcomes) >= 3 else outcomes
+    if len(last_3) == 3 and sum(last_3) in (0, 3):
+        shift_prob = engine_probs["trend_shift"]
+        if sum(last_3) == 3 and shift_prob > 0.6:
+            p_big = p_big * 0.4 + shift_prob * 0.6
+        elif sum(last_3) == 0 and shift_prob < 0.4:
+            p_big = p_big * 0.4 + shift_prob * 0.6
+    
     predict_ent = calculate_entropy(outcomes)
     if p_big > 0.5:
         p_big = 0.5 + (p_big-0.5) * (0.4 + predict_ent*0.6)
@@ -598,7 +531,6 @@ def meta_engine_predict(history, regime):
     anomaly = detect_anomaly(outcomes)
     if anomaly > 0.5: p_big = 0.5 + (p_big-0.5)*(1 - anomaly*0.5)
     
-    # Time-of-day small bias
     hb = hourly_bias(outcomes, history[-1]["issue"])
     p_big = p_big*0.97 + hb*0.03
     
@@ -609,7 +541,7 @@ def meta_engine_predict(history, regime):
     pred_size = 1 if p_big >= 0.5 else 0
     return pred_size, conf, engine_probs, p_big, var, anomaly
 
-# ==================== ADVANCED NUMBER PREDICTOR ====================
+# ==================== NUMBER PREDICTOR ====================
 def advanced_number_predictor(history_list, predicted_size):
     numbers = [h["number"] for h in history_list]
     sizes = [h["size"] for h in history_list]
@@ -642,7 +574,7 @@ def advanced_number_predictor(history_list, predicted_size):
         scores[n] = s1*0.10 + s2*0.12 + mk[0][n]*0.13 + mk[1][n]*0.13 + mk[2][n]*0.13 + s6*0.39
     return max(scores, key=scores.get)
 
-# ==================== ENGINE STATS UPDATE ====================
+# ==================== STATS UPDATE ====================
 def update_engine_stats(engine_probs, actual_big, regime):
     for eng, prob in engine_probs.items():
         stats = STATE["engine_stats"].setdefault(eng, default_engine_state())
@@ -668,6 +600,17 @@ def update_engine_stats(engine_probs, actual_big, regime):
             stats["recent_hits"] = int(stats["recent_hits"]*0.8)
             stats["recent_total"] = int(stats["recent_total"]*0.8)
 
+# 🔥 NEW: Global Win/Loss Stats Update
+def update_global_stats(win):
+    if win:
+        STATE["total_wins"] = STATE.get("total_wins", 0) + 1
+        STATE["current_loss_streak"] = 0
+    else:
+        STATE["total_losses"] = STATE.get("total_losses", 0) + 1
+        STATE["current_loss_streak"] = STATE.get("current_loss_streak", 0) + 1
+        if STATE["current_loss_streak"] > STATE.get("max_b2b_loss", 0):
+            STATE["max_b2b_loss"] = STATE["current_loss_streak"]
+
 # ==================== HISTORY FORMATTER ====================
 def format_synced_history_logs(history):
     out = ""
@@ -686,6 +629,24 @@ def format_synced_history_logs(history):
             icon = ""
         out += f"`{sp}` *{ss}* ({nd}){icon}\n"
     return out
+
+# 🔥 NEW: Stats Footer Builder
+def build_stats_footer():
+    wins = STATE.get("total_wins", 0)
+    losses = STATE.get("total_losses", 0)
+    max_b2b = STATE.get("max_b2b_loss", 0)
+    cur_streak = STATE.get("current_loss_streak", 0)
+    total = wins + losses
+    wr = (wins / total * 100) if total > 0 else 0.0
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *LIFETIME STATS*\n"
+        f"✅ *Total Win:* `{wins}`\n"
+        f"❌ *Total Loss:* `{losses}`\n"
+        f"📉 *Max B2B Loss:* `{max_b2b}`\n"
+        f"🔥 *Current Streak:* `{cur_streak}`\n"
+        f"🎯 *Win Rate:* `{wr:.1f}%`"
+    )
 
 # ==================== TELEGRAM ====================
 async def send_telegram(session, message):
@@ -743,7 +704,7 @@ class BotStateMachine:
         outcomes = [h["size"] for h in history]
         regime = detect_regime(outcomes)
         
-        # EVALUATE
+        # ---- EVALUATE PREVIOUS PREDICTION ----
         if self.pending and self.pending["next_issue"] == li:
             ab = last["size"] == 1
             update_engine_stats(self.pending["engine_probs"], ab, regime)
@@ -752,11 +713,16 @@ class BotStateMachine:
             brier = (self.pending["prob_big"] - (1 if ab else 0))**2
             STATE["calibration_offset"] = STATE.get("calibration_offset", 0.0)*0.95 + brier*0.05
             STATE.setdefault("error_history", []).append(brier)
-            if last["size"] == self.pending["pred_size"]:
+            
+            # 🔥 Win/Loss tracking
+            win = (last["size"] == self.pending["pred_size"])
+            update_global_stats(win)
+            if win:
                 await send_win_sticker(session)
+            
             self.pending = None
         
-        # PREDICT
+        # ---- NEW PREDICTION ----
         if not self.pending or self.pending["last_issue"] != li:
             ps, conf, eng_probs, p_big, var, anomaly = meta_engine_predict(history, regime)
             pn = advanced_number_predictor(history, ps)
@@ -773,12 +739,14 @@ class BotStateMachine:
             hb = format_synced_history_logs(history)
             cons = " ".join([f"{k[:3].upper()}:{v:.2f}" for k,v in eng_probs.items()])
             
-            # Top 3 by posterior mean
             rank = sorted(ENGINES, key=lambda e: STATE["engine_stats"][e]["alpha"]/(STATE["engine_stats"][e]["alpha"]+STATE["engine_stats"][e]["beta"]), reverse=True)
             top3 = " ".join([e[:5].upper() for e in rank[:3]])
             
+            # 🔥 Stats footer
+            stats_footer = build_stats_footer()
+            
             msg = (
-                f"🎯 *QUANTUM V26 SINGULARITY* 🎯\n"
+                f"🎯 *QUANTUM V26.2 TREND-FOCUS* 🎯\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 *Period:* `{ni}`\n"
                 f"🎲 *Number:* `{pn}`\n"
@@ -787,10 +755,11 @@ class BotStateMachine:
                 f"📈 *Regime:* `{regime}` | *Entropy:* `{calculate_entropy(outcomes):.2f}`\n"
                 f"⚖️ *Var:* `{var:.3f}` | *Anomaly:* `{anomaly:.2f}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧠 *15-Engine Consensus:*\n`{cons}`\n"
+                f"🧠 *16-Engine Consensus:*\n`{cons}`\n"
                 f"🏆 *Top 3:* `{top3}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📜 *TREND (8)*:\n{hb}"
+                f"{stats_footer}"
             )
             asyncio.create_task(send_telegram(session, msg))
         
@@ -818,7 +787,7 @@ async def warmup(session):
     logger.info("Warmup complete.")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V26 SINGULARITY ACTIVE", status=200)
+async def health(r): return web.Response(text="V26.2 TREND-FOCUS ACTIVE", status=200)
 
 async def main():
     app = web.Application()
