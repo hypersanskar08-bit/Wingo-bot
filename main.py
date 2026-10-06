@@ -4,7 +4,7 @@ import math
 import os
 import asyncio
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import aiohttp
@@ -20,11 +20,15 @@ WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"SUPER ADVANCED QUANTUM AI ENGINE ACTIVE")
+    
+    def log_message(self, format, *args):
+        pass
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.serve_forever()
 
@@ -55,135 +59,149 @@ async def fetch_data(session):
                 if data.get("code") == 0 and "data" in data and "list" in data["data"]:
                     return data["data"]["list"]
     except Exception as e:
-        print(f"⚠️ API Fetch Error: {e}")
+        pass
     return None
 
-def calculate_ema(numbers, period=7):
-    """Calculates Exponential Moving Average for Number Momentum"""
-    if len(numbers) < period:
-        return sum(numbers) / len(numbers) if numbers else 4.5
-    
-    multiplier = 2 / (period + 1)
-    ema = sum(numbers[:period]) / period
-    for num in numbers[period:]:
-        ema = (num - ema) * multiplier + ema
-    return ema
+def analyze_trend_shift(outcomes, window=10):
+    """Detects if the market is trending (streaks) or volatile (zig-zag)."""
+    if len(outcomes) < window: return "NEUTRAL"
+    recent = outcomes[-window:]
+    changes = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
+    if changes >= window * 0.7: return "VOLATILE"
+    if changes <= window * 0.3: return "TRENDING"
+    return "NEUTRAL"
 
-def analyze_super_advanced_engine(history_list):
+def calculate_transition_matrix(sequence, order=2):
+    """Builds a probability matrix based on past N sequences."""
+    matrix = defaultdict(list)
+    for i in range(len(sequence) - order):
+        state = tuple(sequence[i:i+order])
+        next_val = sequence[i+order]
+        matrix[state].append(next_val)
+    return matrix
+
+def super_advanced_pattern_learner(history_list):
     """
-    DEEP LEARNING ENGINE (NOISE-FREE):
-    1. Deep N-Gram Longest Suffix Matching (Sizes & Numbers)
-    2. Time-Series Momentum (Number EMA)
-    3. Conditional Number Frequency Extraction
+    QUANTUM V6 HYPER ENGINE:
+    1. Trend Shift Detector (Volatility vs Streak)
+    2. Deep Number Learner (Order-2 & Order-3 Transition Matrices)
+    3. Weighted Recency Decay
     """
     outcomes_size = [1 if str(item.get("size", "")).lower() in ["big", "biggg"] else 0 for item in history_list]
     outcomes_num = [int(item.get("number", 0)) for item in history_list]
     
     total_len = len(outcomes_size)
-    if total_len < 50: 
-        return None
+    if total_len < 50: return None
 
-    # --- 1. Deep Pattern Suffix Matching (Window up to 15) ---
-    max_search_depth = 15
-    matched_size_counts = {1: 0.0, 0: 0.0}
-    matched_numbers = []
-    found_pattern_len = 0
+    # --- 1. Market Condition Analysis ---
+    market_state = analyze_trend_shift(outcomes_size, window=12)
 
-    # Search for the longest exact historical sequence that matches the current sequence
-    for p_len in range(max_search_depth, 1, -1):
-        target_seq = outcomes_size[-p_len:]
-        
-        for i in range(total_len - p_len - 1): # -1 to ensure we have a 'next' outcome
-            if outcomes_size[i : i + p_len] == target_seq:
-                next_size = outcomes_size[i + p_len]
-                next_num = outcomes_num[i + p_len]
+    # --- 2. Deep Size Pattern Matching (L-15) with Recency Decay ---
+    matched_size_weight = {1: 0.0, 0: 0.0}
+    found_depth = 0
+    matched_historical_nums = []
+
+    for depth in range(15, 2, -1):
+        target_seq = outcomes_size[-depth:]
+        for i in range(total_len - depth - 1):
+            if outcomes_size[i : i + depth] == target_seq:
+                next_size = outcomes_size[i + depth]
+                next_num = outcomes_num[i + depth]
                 
-                # Exponential weight: Recent historical matches matter more
-                weight = math.exp((i / total_len) * 3.0)
-                matched_size_counts[next_size] += weight
-                matched_numbers.append(next_num)
-                found_pattern_len = p_len
-        
-        # If we found at least one match at this depth, stop searching shallower depths
-        if found_pattern_len > 0:
-            break
+                # Exponential decay: recent matches are heavily favored
+                time_weight = math.exp((i / total_len) * 4.0)
+                matched_size_weight[next_size] += time_weight
+                matched_historical_nums.append((next_num, time_weight))
+                found_depth = depth
+        if found_depth > 0: break
 
-    # Calculate Pattern Probability
-    total_weight = matched_size_counts[1] + matched_size_counts[0]
-    if total_weight > 0:
-        pattern_prob_big = matched_size_counts[1] / total_weight
-    else:
-        # Baseline fallback if completely unprecedented
-        pattern_prob_big = sum(outcomes_size[-15:]) / 15.0
+    total_weight = matched_size_weight[1] + matched_size_weight[0]
+    deep_prob_big = matched_size_weight[1] / total_weight if total_weight > 0 else 0.5
 
-    # --- 2. Number Momentum (EMA Calculation) ---
-    # Treats the outcomes like a stock chart to find upward/downward momentum
-    ema_value = calculate_ema(outcomes_num[-20:], period=7)
-    momentum_prob_big = max(0.1, min(0.9, ema_value / 9.0)) # Normalize 0-9 to probability
+    # --- 3. Deep Number Transition Analysis (Order-2 & Order-3) ---
+    num_matrix_3 = calculate_transition_matrix(outcomes_num, order=3)
+    num_matrix_2 = calculate_transition_matrix(outcomes_num, order=2)
+    
+    current_state_3 = tuple(outcomes_num[-3:])
+    current_state_2 = tuple(outcomes_num[-2:])
+    
+    predicted_nums_from_matrix = []
+    if current_state_3 in num_matrix_3:
+        predicted_nums_from_matrix = num_matrix_3[current_state_3]
+    elif current_state_2 in num_matrix_2:
+        predicted_nums_from_matrix = num_matrix_2[current_state_2]
 
-    # --- 3. Final Weighted Probability ---
-    # 75% weight to Deep Pattern Match, 25% to Market Momentum
-    final_prob = (pattern_prob_big * 0.75) + (momentum_prob_big * 0.25)
+    # --- 4. Logic Fusion & Trend Shift Adjustments ---
+    final_prob_big = deep_prob_big
+    
+    # Adjust prediction based on market volatility
+    if market_state == "VOLATILE":
+        # In volatile markets, expect a flip from the very last outcome
+        last_outcome = outcomes_size[-1]
+        final_prob_big = (final_prob_big * 0.4) + ((0.8 if last_outcome == 0 else 0.2) * 0.6)
+    elif market_state == "TRENDING":
+        # In trending markets, expect continuation
+        last_outcome = outcomes_size[-1]
+        final_prob_big = (final_prob_big * 0.4) + ((0.8 if last_outcome == 1 else 0.2) * 0.6)
 
-    # --- 4. Deep Number Prediction ---
-    if final_prob >= 0.50:
+    # --- 5. Determine Final Outputs ---
+    if final_prob_big >= 0.50:
         pred_size = "BIGGG"
         pred_size_emoji = "BIGGG 🟢"
-        real_confidence = min(99.2, final_prob * 100)
-        
-        # Try to pick numbers that actually followed this exact pattern historically
-        valid_nums = [n for n in matched_numbers if n >= 5]
-        # Fallback to recent hot big numbers
-        if not valid_nums: 
-            valid_nums = [n for n in outcomes_num[-50:] if n >= 5]
+        confidence = min(99.6, final_prob_big * 100)
+        target_group = [5, 6, 7, 8, 9]
     else:
         pred_size = "SMALL"
         pred_size_emoji = "SMALL 🔴"
-        real_confidence = min(99.2, (1 - final_prob) * 100)
-        
-        valid_nums = [n for n in matched_numbers if n <= 4]
-        if not valid_nums: 
-            valid_nums = [n for n in outcomes_num[-50:] if n <= 4]
+        confidence = min(99.6, (1 - final_prob_big) * 100)
+        target_group = [0, 1, 2, 3, 4]
 
-    # Select the most statistically frequent valid number
-    top_num = Counter(valid_nums).most_common(1)[0][0] if valid_nums else (7 if pred_size == "BIGGG" else 2)
+    # Number Selection Logic: Blend Matrix Prediction with Historical Match
+    valid_matrix_nums = [n for n in predicted_nums_from_matrix if n in target_group]
+    valid_historical_nums = [n for n, w in matched_historical_nums if n in target_group]
     
+    combined_nums = valid_matrix_nums * 2 + valid_historical_nums # Give matrix slightly more weight
+    
+    if combined_nums:
+        pred_num = Counter(combined_nums).most_common(1)[0][0]
+    else:
+        # Fallback to general frequency in recent history
+        recent_valid = [n for n in outcomes_num[-50:] if n in target_group]
+        pred_num = Counter(recent_valid).most_common(1)[0][0] if recent_valid else (7 if pred_size == "BIGGG" else 2)
+
     last_issue = int(history_list[-1]["issueNumber"])
-    pattern_desc = f"🧠 DEEP N-GRAM (L-{found_pattern_len}) + EMA" if found_pattern_len > 0 else "📊 MOMENTUM TREND"
+    
+    # Generate Advanced Description
+    desc_parts = []
+    if market_state != "NEUTRAL": desc_parts.append(f"{market_state} MKT")
+    if found_depth > 0: desc_parts.append(f"L-{found_depth} MATCH")
+    if valid_matrix_nums: desc_parts.append("MATRIX TRN")
+    
+    pattern_desc = " + ".join(desc_parts) if desc_parts else "QUANTUM BASELINE"
 
     return {
         "last_issue": last_issue,
         "next_issue": last_issue + 1,
         "pred_size": pred_size,
         "pred_size_emoji": pred_size_emoji,
-        "pred_num": top_num,
-        "confidence": real_confidence,
+        "pred_num": pred_num,
+        "confidence": confidence,
         "pattern_desc": pattern_desc
     }
 
 def format_history_logs(history_records):
     logs_text = ""
-    recent_8 = history_records[-8:]
-    for item in recent_8:
+    for item in history_records[-8:]:
         short_period = str(item["period"])[-3:]
         size_str = "BIGGG" if item["size"].upper() in ["BIG", "BIGGG"] else "SMALL"
-        
-        if item["status"] == "WIN_NUMBER":
-            status_str = "☠️" 
-        elif item["status"] == "WIN_SIZE":
-            status_str = "✅"  
-        else:
-            status_str = ""   
-            
+        status_str = "☠️" if item["status"] == "WIN_NUMBER" else "✅" if item["status"] == "WIN_SIZE" else ""
         logs_text += f"`{short_period}` *{size_str}* {status_str}\n"
     return logs_text
 
 async def start_hyper_bot():
-    print("🚀 DEEP LEARNING QUANTUM ENGINE RUNNING!")
-    
+    print("🚀 QUANTUM V6 ENGINE RUNNING!")
     async with aiohttp.ClientSession() as session:
-        asyncio.create_task(send_telegram(session, "🚀 *DEEP LEARNING ENGINE ONLINE!* (Noise-Free AI)"))
-        
+        asyncio.create_task(send_telegram(session, "🚀 *QUANTUM V6 (Trend Shift & Matrix) ENGINE ONLINE!*"))
         current_level = 1
         pending_pred = None
         history_records = []
@@ -191,7 +209,6 @@ async def start_hyper_bot():
         while True:
             try:
                 raw_list = await fetch_data(session)
-                
                 if raw_list:
                     history = list(reversed(raw_list))
                     last_item = history[-1]
@@ -203,12 +220,7 @@ async def start_hyper_bot():
                         is_size_win = (actual_size == pending_pred["pred_size"])
                         is_num_win = (actual_num == pending_pred["pred_num"])
                         
-                        if is_size_win and is_num_win:
-                            win_status = "WIN_NUMBER"
-                        elif is_size_win:
-                            win_status = "WIN_SIZE"
-                        else:
-                            win_status = "LOSS"
+                        win_status = "WIN_NUMBER" if (is_size_win and is_num_win) else "WIN_SIZE" if is_size_win else "LOSS"
                         
                         history_records.append({
                             "period": last_issue,
@@ -221,42 +233,37 @@ async def start_hyper_bot():
                             asyncio.create_task(send_win_sticker(session))
                             current_level = 1
                         else:
-                            current_level += 1
-                            if current_level > 3: 
-                                current_level = 1
+                            current_level = 1 if current_level >= 4 else current_level + 1
 
                         pending_pred = None
 
                     if not pending_pred or pending_pred["last_issue"] != last_issue:
-                        pred_data = analyze_super_advanced_engine(history)
+                        pred_data = super_advanced_pattern_learner(history)
                         if pred_data:
                             pending_pred = pred_data
-                            
-                            history_block = format_history_logs(history_records) if history_records else "Waiting for history logs...\n"
+                            history_block = format_history_logs(history_records) if history_records else "Waiting for logs...\n"
 
                             pred_msg = (
-                                f"🔥 *DEEP AI PREDICTION* 🔥\n\n"
+                                f"🔥 *QUANTUM V6 PREDICTION* 🔥\n\n"
                                 f"📌 *Period:* `{pred_data['next_issue']}`\n"
                                 f"🎯 *Size:* *{pred_data['pred_size_emoji']}*\n"
                                 f"🔢 *No:* `{pred_data['pred_num']}`\n"
                                 f"📊 *Confidence:* `{pred_data['confidence']:.2f}%`\n\n"
                                 f"🚩 *Level:* `LEVEL {current_level}`\n"
-                                f"🔍 *AI Logic:* `{pred_data['pattern_desc']}`\n"
+                                f"🔍 *Logic:* `{pred_data['pattern_desc']}`\n"
                                 f"-----------------------------------\n"
-                                f"📜 *RECENT HISTORY LOGS:*\n"
+                                f"📜 *HISTORY:*\n"
                                 f"{history_block}"
                                 f"-----------------------------------"
                             )
                             asyncio.create_task(send_telegram(session, pred_msg))
-                            print(f"[{last_issue}] Period {pred_data['next_issue']} -> {pred_data['pred_size']} No:{pred_data['pred_num']} ({pred_data['confidence']:.2f}%) | Logic: {pred_data['pattern_desc']}")
-
             except Exception as e:
-                print(f"❌ Main Loop Exception: {e}")
                 traceback.print_exc()
-
             await asyncio.sleep(6)
 
 if __name__ == "__main__":
     threading.Thread(target=run_health_server, daemon=True).start()
+    time.sleep(1)
     asyncio.run(start_hyper_bot())
+
 
