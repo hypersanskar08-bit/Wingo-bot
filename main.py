@@ -5,9 +5,8 @@ import os
 import asyncio
 import traceback
 from collections import Counter, defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 import aiohttp
+from aiohttp import web
 
 # ==================== CONFIGURATION ====================
 API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500"
@@ -16,19 +15,22 @@ CHAT_ID = "1264164655"
 WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ"
 # =======================================================
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"QUANTUM V18 DYNAMIC DEEP PATTERN MINER ACTIVE")
-    def log_message(self, format, *args):
-        pass
+# ⚡ ULTRA-FAST ASYNC HEALTH SERVER FOR UPTIMEROBOT & RENDER
+async def handle_health_check(request):
+    return web.Response(text="QUANTUM V18 DYNAMIC DEEP PATTERN MINER ACTIVE", status=200)
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+async def start_async_health_server():
+    app = web.Application()
+    # Handles both GET and HEAD requests perfectly
+    app.router.add_get('/', handle_health_check)
+    app.router.add_head('/', handle_health_check)
+    
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Ultra-Fast Health Server Running on Port {port}")
 
 async def send_telegram(session, message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -71,16 +73,11 @@ def calculate_shannon_entropy(sequence, window=20):
     return - (p_big * math.log2(p_big) + p_small * math.log2(p_small))
 
 def dynamic_deep_pattern_miner(outcomes_size):
-    """
-    Mines real-time patterns dynamically across the full 500-round history.
-    Evaluates tail lengths L=8 down to L=2.
-    """
     total_len = len(outcomes_size)
     if total_len < 30: return 0.5, "INSUFFICIENT-DATA"
     
     curr_str = "".join(['B' if x == 1 else 'S' for x in outcomes_size])
     
-    # Scan tail lengths from L=8 down to L=2
     for L in range(8, 1, -1):
         if total_len <= L: continue
         tail = curr_str[-L:]
@@ -93,7 +90,6 @@ def dynamic_deep_pattern_miner(outcomes_size):
             sub = curr_str[i : i + L]
             if sub == tail:
                 next_char = curr_str[i + L]
-                # Recency weighting: recent occurrences carry exponentially higher weight
                 recency = math.exp((i / total_len) * 6.0)
                 if next_char == 'B':
                     big_weight += recency
@@ -157,11 +153,7 @@ def v18_master_engine(history_list, current_level):
     if len(outcomes_size) < 30: return None
 
     entropy = calculate_shannon_entropy(outcomes_size, window=20)
-    
-    # 1. Real-Time Deep Dynamic Pattern Mining
     prob_big, miner_tag = dynamic_deep_pattern_miner(outcomes_size)
-    
-    # 2. Exact Number N-Gram Lookup
     raw_num, ngram_tag = exact_number_ngram_engine(outcomes_num)
 
     if miner_tag != "NO-HISTORICAL-MATCH":
@@ -172,7 +164,6 @@ def v18_master_engine(history_list, current_level):
         combined_prob_big = sum(recent_20) / len(recent_20)
         logic_desc = f"RATIO-FLOW + {ngram_tag}"
 
-    # 1. SIZE DECISION
     if combined_prob_big >= 0.50:
         pred_size = "BIGGG"
         pred_size_emoji = "BIGGG 🟢"
@@ -182,9 +173,7 @@ def v18_master_engine(history_list, current_level):
         pred_size_emoji = "SMALL 🔴"
         confidence = min(99.9, (1.0 - combined_prob_big) * 100)
 
-    # 2. STRICT PARITY LOCK FOR NUMBER
     final_pred_num = strict_parity_hot_number_sync(pred_size, outcomes_num, raw_num)
-
     last_issue = int(history_list[-1]["issueNumber"])
 
     return {
@@ -218,6 +207,10 @@ def format_synced_history_logs(server_history, bot_records):
 
 async def start_hyper_bot():
     print("🚀 QUANTUM V18 DYNAMIC DEEP PATTERN MINER ACTIVE!")
+    
+    # 1. Health Server Ko Main Async Loop Me Start Karein
+    await start_async_health_server()
+
     async with aiohttp.ClientSession() as session:
         current_level = 1
         pending_pred = None
@@ -298,9 +291,8 @@ async def start_hyper_bot():
             await asyncio.sleep(6)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_health_server, daemon=True).start()
-    time.sleep(1)
     asyncio.run(start_hyper_bot())
+
 
 
 
