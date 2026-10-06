@@ -208,8 +208,8 @@ async def bot_loop(session):
 
 async def main():
     app = web.Application()
+    # add_get handles GET & HEAD automatically
     app.router.add_get('/', handle_health_check)
-    app.router.add_head('/', handle_health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -224,4 +224,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
