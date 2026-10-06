@@ -1,3 +1,4 @@
+
 import json
 import time
 import math
@@ -15,20 +16,22 @@ CHAT_ID = "1264164655"
 WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ"
 # =======================================================
 
-# ⚡ ULTRA-FAST ASYNC HEALTH SERVER FOR UPTIMEROBOT
 async def handle_health_check(request):
     return web.Response(text="QUANTUM V20 ENSEMBLE AI ACTIVE", status=200)
 
 async def start_async_health_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    app.router.add_head('/', handle_health_check)
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Ultra-Fast Health Server Running on Port {port}")
+    try:
+        app = web.Application()
+        app.router.add_get('/', handle_health_check)
+        app.router.add_head('/', handle_health_check)
+        port = int(os.environ.get("PORT", 10000))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        print(f"🌐 Ultra-Fast Health Server Running on Port {port}")
+    except Exception as e:
+        print(f"⚠️ Web Server Warning: {e}")
 
 async def send_telegram(session, message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -36,8 +39,8 @@ async def send_telegram(session, message):
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
             await response.text()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Telegram send error: {e}")
 
 async def send_win_sticker(session):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendSticker"
@@ -45,8 +48,8 @@ async def send_win_sticker(session):
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as response:
             await response.text()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Sticker error: {e}")
 
 async def fetch_data(session):
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -56,8 +59,8 @@ async def fetch_data(session):
                 data = await response.json()
                 if data.get("code") == 0 and "data" in data and "list" in data["data"]:
                     return data["data"]["list"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Fetch error: {e}")
     return None
 
 # ==================== ADVANCED AI ENGINES ====================
@@ -71,7 +74,6 @@ def calculate_shannon_entropy(sequence, window=24):
     return - (p_big * math.log2(p_big) + p_small * math.log2(p_small))
 
 def calculate_rsi(outcomes, period=14):
-    """Trading RSI Oscillator applied to Binary Outcomes"""
     if len(outcomes) < period: return 50.0
     recent = outcomes[-period:]
     gains = sum(1 for x in recent if x == 1)
@@ -81,7 +83,6 @@ def calculate_rsi(outcomes, period=14):
     return 100 - (100 / (1 + rs))
 
 def markov_2nd_order(outcomes):
-    """2nd Order Markov Chain (Predicts next state based on last 2 states)"""
     if len(outcomes) < 10: return 0.5
     last_two = tuple(outcomes[-2:])
     matches, big_next = 0, 0
@@ -92,7 +93,6 @@ def markov_2nd_order(outcomes):
     return (big_next / matches) if matches > 0 else 0.5
 
 def dynamic_deep_pattern_miner(outcomes):
-    """L-Depth Historical Substring Scanner"""
     total_len = len(outcomes)
     if total_len < 30: return 0.5
     curr_str = "".join(['B' if x == 1 else 'S' for x in outcomes])
@@ -109,34 +109,22 @@ def dynamic_deep_pattern_miner(outcomes):
             return big_w / (big_w + small_w)
     return 0.5
 
-# ==================== MASTER V20 ENSEMBLE ENGINE ====================
-
 def v20_ensemble_engine(history_list, current_level):
     outcomes = [1 if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else 0 for item in history_list]
     if len(outcomes) < 30: return None
 
-    # 1. Market Variables
     entropy = calculate_shannon_entropy(outcomes)
     rsi = calculate_rsi(outcomes)
-    
-    # 2. Ensemble AI Voting System
     miner_prob = dynamic_deep_pattern_miner(outcomes)
     markov_prob = markov_2nd_order(outcomes)
     
-    # RSI Reversal Adjustment: If RSI > 75 (Overbought BIG), decrease BIG prob. If < 25 (Oversold), increase BIG prob.
     rsi_adjustment = 0.0
     if rsi >= 75: rsi_adjustment = -0.15
     elif rsi <= 25: rsi_adjustment = 0.15
 
-    # 3. Weighted Final Probability Array
-    # Miner (50%), Markov (35%), RSI Trend/Reversal (15%)
-    final_prob_big = (miner_prob * 0.50) + (markov_prob * 0.35) + rsi_adjustment + 0.075 # Normalized
-
-    # Limit boundaries
+    final_prob_big = (miner_prob * 0.50) + (markov_prob * 0.35) + rsi_adjustment + 0.075
     final_prob_big = max(0.01, min(0.99, final_prob_big))
 
-    # 4. Conflict / Skip Logic
-    # If entropy is extremely high AND models are hovering around 50/50 (42% to 58%)
     if entropy > 0.98 and (0.42 <= final_prob_big <= 0.58):
         return {
             "last_issue": int(history_list[-1]["issueNumber"]),
@@ -148,7 +136,6 @@ def v20_ensemble_engine(history_list, current_level):
             "metrics": f"RSI: {rsi:.1f} | ENT: {entropy:.2f}"
         }
 
-    # 5. Determine Size & Confidence
     if final_prob_big >= 0.50:
         pred_size = "BIGGG"
         pred_size_emoji = "BIGGG 🟢"
@@ -160,7 +147,6 @@ def v20_ensemble_engine(history_list, current_level):
 
     display_confidence = min(99.9, confidence_real * 100)
 
-    # 6. Kelly Criterion for Bet Sizing Formula: f* = 2p - 1
     kelly_fraction = (2 * confidence_real) - 1.0
     if kelly_fraction > 0.60: bet_advice = "3.0X 🔥 MAX STRIKE"
     elif kelly_fraction > 0.40: bet_advice = "2.0X 💰 HIGH RISK"
@@ -186,7 +172,7 @@ def format_synced_history_logs(server_history):
     return logs_text
 
 async def start_hyper_bot():
-    print("🚀 QUANTUM V20 ENSEMBLE AI ACTIVE!")
+    print("🚀 QUANTUM V20 ENSEMBLE AI INITIALIZING...")
     await start_async_health_server()
 
     async with aiohttp.ClientSession() as session:
@@ -194,6 +180,7 @@ async def start_hyper_bot():
         pending_pred = None
         total_wins, total_losses = 0, 0
         
+        print("✅ BOT LOOP ACTIVE & MONITORING MARKET...")
         while True:
             try:
                 raw_list = await fetch_data(session)
@@ -235,8 +222,8 @@ async def start_hyper_bot():
                                 f"{history_block}"
                             )
                             asyncio.create_task(send_telegram(session, pred_msg))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error in loop: {e}")
             await asyncio.sleep(6)
 
 if __name__ == "__main__":
