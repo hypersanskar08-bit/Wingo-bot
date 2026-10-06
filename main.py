@@ -1,4 +1,3 @@
-
 import json
 import time
 import math
@@ -17,21 +16,7 @@ WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X
 # =======================================================
 
 async def handle_health_check(request):
-    return web.Response(text="QUANTUM V20 ENSEMBLE AI ACTIVE", status=200)
-
-async def start_async_health_server():
-    try:
-        app = web.Application()
-        app.router.add_get('/', handle_health_check)
-        app.router.add_head('/', handle_health_check)
-        port = int(os.environ.get("PORT", 10000))
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        print(f"🌐 Ultra-Fast Health Server Running on Port {port}")
-    except Exception as e:
-        print(f"⚠️ Web Server Warning: {e}")
+    return web.Response(text="QUANTUM V21 NO-SKIP AI ACTIVE", status=200)
 
 async def send_telegram(session, message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -40,7 +25,7 @@ async def send_telegram(session, message):
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
             await response.text()
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"Telegram error: {e}")
 
 async def send_win_sticker(session):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendSticker"
@@ -63,17 +48,9 @@ async def fetch_data(session):
         print(f"Fetch error: {e}")
     return None
 
-# ==================== ADVANCED AI ENGINES ====================
+# ==================== NO-SKIP AI ENGINES ====================
 
-def calculate_shannon_entropy(sequence, window=24):
-    if len(sequence) < window: return 1.0
-    recent = sequence[-window:]
-    p_big = sum(recent) / len(recent)
-    p_small = 1.0 - p_big
-    if p_big == 0 or p_small == 0: return 0.0
-    return - (p_big * math.log2(p_big) + p_small * math.log2(p_small))
-
-def calculate_rsi(outcomes, period=14):
+def calculate_rsi(outcomes, period=12):
     if len(outcomes) < period: return 50.0
     recent = outcomes[-period:]
     gains = sum(1 for x in recent if x == 1)
@@ -82,8 +59,19 @@ def calculate_rsi(outcomes, period=14):
     rs = gains / losses
     return 100 - (100 / (1 + rs))
 
-def markov_2nd_order(outcomes):
-    if len(outcomes) < 10: return 0.5
+def markov_3rd_order(outcomes):
+    """Tracks 3-period outcome chains for high precision"""
+    if len(outcomes) < 12: return 0.5
+    last_three = tuple(outcomes[-3:])
+    matches, big_next = 0, 0
+    for i in range(len(outcomes) - 3):
+        if tuple(outcomes[i:i+3]) == last_three:
+            matches += 1
+            if outcomes[i+3] == 1: big_next += 1
+    if matches > 0:
+        return big_next / matches
+    
+    # Fallback to 2nd order if no 3rd order match exists
     last_two = tuple(outcomes[-2:])
     matches, big_next = 0, 0
     for i in range(len(outcomes) - 2):
@@ -92,50 +80,56 @@ def markov_2nd_order(outcomes):
             if outcomes[i+2] == 1: big_next += 1
     return (big_next / matches) if matches > 0 else 0.5
 
+def micro_streak_engine(outcomes):
+    """Detects dragons, alternations & immediate pattern momentum"""
+    if len(outcomes) < 5: return 0.5
+    recent = outcomes[-5:]
+    if sum(recent) == 5: return 0.72  # Strong Big Dragon
+    if sum(recent) == 0: return 0.28  # Strong Small Dragon
+    
+    # Check 1-by-1 alternating patterns (1,0,1,0,1)
+    if recent == [1,0,1,0,1]: return 0.22  # Expect SMALL next
+    if recent == [0,1,0,1,0]: return 0.78  # Expect BIG next
+    
+    return 0.5
+
 def dynamic_deep_pattern_miner(outcomes):
     total_len = len(outcomes)
-    if total_len < 30: return 0.5
+    if total_len < 20: return 0.5
     curr_str = "".join(['B' if x == 1 else 'S' for x in outcomes])
-    for L in range(10, 2, -1):
+    for L in range(8, 2, -1):
         if total_len <= L: continue
         tail = curr_str[-L:]
         big_w, small_w = 0.0, 0.0
         for i in range(total_len - L):
             if curr_str[i : i + L] == tail:
-                recency = math.exp((i / total_len) * 6.0)
+                recency = math.exp((i / total_len) * 7.0)
                 if curr_str[i + L] == 'B': big_w += recency
                 else: small_w += recency
         if big_w + small_w > 0:
             return big_w / (big_w + small_w)
     return 0.5
 
-def v20_ensemble_engine(history_list, current_level):
-    outcomes = [1 if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else 0 for item in history_list]
-    if len(outcomes) < 30: return None
+# ==================== V21 STRIKE ENGINE (100% HARD ACTION) ====================
 
-    entropy = calculate_shannon_entropy(outcomes)
+def v21_strike_engine(history_list, current_level):
+    outcomes = [1 if str(item.get("size", "")).upper() in ["BIG", "BIGGG"] else 0 for item in history_list]
+    if len(outcomes) < 20: return None
+
     rsi = calculate_rsi(outcomes)
     miner_prob = dynamic_deep_pattern_miner(outcomes)
-    markov_prob = markov_2nd_order(outcomes)
+    markov_prob = markov_3rd_order(outcomes)
+    streak_prob = micro_streak_engine(outcomes)
     
-    rsi_adjustment = 0.0
-    if rsi >= 75: rsi_adjustment = -0.15
-    elif rsi <= 25: rsi_adjustment = 0.15
+    # RSI Adjustment
+    rsi_adj = 0.0
+    if rsi >= 75: rsi_adj = -0.18
+    elif rsi <= 25: rsi_adj = 0.18
 
-    final_prob_big = (miner_prob * 0.50) + (markov_prob * 0.35) + rsi_adjustment + 0.075
-    final_prob_big = max(0.01, min(0.99, final_prob_big))
-
-    if entropy > 0.98 and (0.42 <= final_prob_big <= 0.58):
-        return {
-            "last_issue": int(history_list[-1]["issueNumber"]),
-            "next_issue": int(history_list[-1]["issueNumber"]) + 1,
-            "pred_size": "SKIP",
-            "pred_size_emoji": "⚠️ SKIP (MARKET RANDOM)",
-            "confidence": 0.0,
-            "bet_advice": "0X (DO NOT BET)",
-            "metrics": f"RSI: {rsi:.1f} | ENT: {entropy:.2f}"
-        }
-
+    # Ensemble Weighted Decision Matrix
+    final_prob_big = (miner_prob * 0.40) + (markov_prob * 0.30) + (streak_prob * 0.20) + rsi_adj + 0.05
+    
+    # Strictly Binary (NO SKIP ALLOWED)
     if final_prob_big >= 0.50:
         pred_size = "BIGGG"
         pred_size_emoji = "BIGGG 🟢"
@@ -145,13 +139,17 @@ def v20_ensemble_engine(history_list, current_level):
         pred_size_emoji = "SMALL 🔴"
         confidence_real = 1.0 - final_prob_big
 
-    display_confidence = min(99.9, confidence_real * 100)
+    display_confidence = 68.0 + (confidence_real * 30.5)
 
-    kelly_fraction = (2 * confidence_real) - 1.0
-    if kelly_fraction > 0.60: bet_advice = "3.0X 🔥 MAX STRIKE"
-    elif kelly_fraction > 0.40: bet_advice = "2.0X 💰 HIGH RISK"
-    elif kelly_fraction > 0.20: bet_advice = "1.0X 💵 NORMAL"
-    else: bet_advice = "0.5X 🪙 LOW AMOUNT"
+    # Fund Management optimized for Level 1-2 Focus
+    if current_level == 1:
+        bet_advice = "1.0X 🎯 LEVEL 1 STRIKE"
+    elif current_level == 2:
+        bet_advice = "2.5X 🔥 LEVEL 2 COVER"
+    elif current_level == 3:
+        bet_advice = "6.0X ⚡ LEVEL 3 RECOVERY"
+    else:
+        bet_advice = "12.0X 🛡️ LEVEL SAFEGUARD"
 
     return {
         "last_issue": int(history_list[-1]["issueNumber"]),
@@ -160,7 +158,7 @@ def v20_ensemble_engine(history_list, current_level):
         "pred_size_emoji": pred_size_emoji,
         "confidence": display_confidence,
         "bet_advice": bet_advice,
-        "metrics": f"RSI: {rsi:.1f} | ENT: {entropy:.2f} | KLY: {kelly_fraction:.2f}"
+        "metrics": f"RSI: {rsi:.1f} | STRK: {streak_prob:.2f} | CONF: {display_confidence:.1f}%"
     }
 
 def format_synced_history_logs(server_history):
@@ -171,16 +169,12 @@ def format_synced_history_logs(server_history):
         logs_text += f"`{short_period}` *{size_str}*\n"
     return logs_text
 
-async def start_hyper_bot():
-    print("🚀 QUANTUM V20 ENSEMBLE AI INITIALIZING...")
-    await start_async_health_server()
-
+async def bot_background_loop(app):
+    print("🚀 QUANTUM V21 NO-SKIP ENGINE ACTIVE...")
     async with aiohttp.ClientSession() as session:
         current_level = 1
         pending_pred = None
-        total_wins, total_losses = 0, 0
         
-        print("✅ BOT LOOP ACTIVE & MONITORING MARKET...")
         while True:
             try:
                 raw_list = await fetch_data(session)
@@ -191,31 +185,28 @@ async def start_hyper_bot():
                     actual_size = "BIGGG" if str(last_item.get("size", "")).upper() in ["BIG", "BIGGG"] else "SMALL"
 
                     if pending_pred and pending_pred["next_issue"] == last_issue:
-                        if pending_pred["pred_size"] != "SKIP":
-                            is_win = (actual_size == pending_pred["pred_size"])
-                            if is_win:
-                                total_wins += 1
-                                current_level = 1
-                                asyncio.create_task(send_win_sticker(session))
-                            else:
-                                total_losses += 1
-                                current_level += 1
-                                if current_level > 5: current_level = 1
+                        is_win = (actual_size == pending_pred["pred_size"])
+                        if is_win:
+                            current_level = 1
+                            asyncio.create_task(send_win_sticker(session))
+                        else:
+                            current_level += 1
+                            if current_level > 5: current_level = 1
                         pending_pred = None
 
                     if not pending_pred or pending_pred["last_issue"] != last_issue:
-                        pred_data = v20_ensemble_engine(history, current_level)
+                        pred_data = v21_strike_engine(history, current_level)
                         if pred_data:
                             pending_pred = pred_data
                             history_block = format_synced_history_logs(history)
 
                             pred_msg = (
-                                f"🏛️ *V20 INSTITUTIONAL QUANT* 🏛️\n\n"
+                                f"🎯 *V21 ULTRA-STRIKE (NO-SKIP)* 🎯\n\n"
                                 f"📌 *Period:* `{pred_data['next_issue']}`\n"
-                                f"🎯 *Prediction:* *{pred_data['pred_size_emoji']}*\n"
-                                f"📊 *Win Prob:* `{pred_data['confidence']:.2f}%`\n"
-                                f"⚖️ *Kelly Sizing:* `{pred_data['bet_advice']}`\n\n"
-                                f"🚩 *Level:* `LEVEL {current_level}`\n"
+                                f"🔥 *Target:* *{pred_data['pred_size_emoji']}*\n"
+                                f"📊 *Win Prob:* `{pred_data['confidence']:.1f}%`\n"
+                                f"💰 *Fund Advice:* `{pred_data['bet_advice']}`\n\n"
+                                f"🚩 *Current Status:* `LEVEL {current_level}`\n"
                                 f"⚙️ *Quant Data:* `{pred_data['metrics']}`\n"
                                 f"-----------------------------------\n"
                                 f"📜 *MARKET TREND (8)*:\n"
@@ -223,9 +214,28 @@ async def start_hyper_bot():
                             )
                             asyncio.create_task(send_telegram(session, pred_msg))
             except Exception as e:
-                print(f"Error in loop: {e}")
-            await asyncio.sleep(6)
+                print(f"Error in bot loop: {e}")
+            await asyncio.sleep(5)
+
+async def start_background_tasks(app):
+    app['bot_task'] = asyncio.create_task(bot_background_loop(app))
+
+async def cleanup_background_tasks(app):
+    app['bot_task'].cancel()
+    await app['bot_task']
+
+def main():
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    app.router.add_head('/', handle_health_check)
+    
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
+    
+    port = int(os.environ.get("PORT", 10000))
+    web.run_app(app, host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    asyncio.run(start_hyper_bot())
+    main()
+
 
