@@ -1,4 +1,3 @@
-
 import json
 import time
 import math
@@ -19,24 +18,34 @@ WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g
 # ================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("QuantumV28_1")
+logger = logging.getLogger("QuantumV28_3")
 handler = RotatingFileHandler('bot.log', maxBytes=5*1024*1024, backupCount=2)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
-STATE_FILE = "engine_state_v28_1.json"
+STATE_FILE = "engine_state_v28_3.json"
 PATTERN_SIG_LEN = 14
 PATTERN_LENGTHS = [4, 6, 8, 10, 12, 14]
 ERROR_THRESHOLD = 2
 SIMILAR_ERROR_RADIUS = 1
 HOT_NUMBER_WINDOW = 20
-BET_LEVELS = [1.0, 2.5, 6.0, 12.0]
 
-# 🔥 PATTERN FILTER THRESHOLDS
-MIN_PATTERN_SAMPLES = 3      # Minimum observations before trusting
-STRONG_ACC = 0.62            # 62%+ accuracy = strong
-SUPER_ACC = 0.70             # 70%+ accuracy = super strong
-MAX_BOOST = 4.0              # Max weight multiplier
+# 🔥 3 Levels only
+BET_LEVELS = [1.0, 2.5, 6.0]
+MAX_LEVEL = 3
+
+# 🔥 Pattern filter
+MIN_PATTERN_SAMPLES = 3
+STRONG_ACC = 0.62
+SUPER_ACC = 0.70
+MAX_BOOST = 4.0
+
+# 🔥 Pattern flip
+FLIP_BELOW_ACCURACY = 0.58
+FLIP_MIN_SAMPLES = 5
+
+# 🔥 Skip threshold
+MIN_CONFIDENCE_TO_SEND = 0.55
 
 # ==================== STATE ====================
 def default_engine_state():
@@ -63,7 +72,10 @@ def load_state():
             s.setdefault("pattern_memory", {}); s.setdefault("error_patterns", {})
             s.setdefault("calibration_offset", 0.0); s.setdefault("learned_overrides", 0)
             s.setdefault("number_memory", {}); s.setdefault("hot_numbers", {})
-            s.setdefault("pattern_strength", {})  # 🔥 NEW: Per-pattern strength DB
+            s.setdefault("pattern_strength", {})
+            s.setdefault("pattern_flips", 0)
+            s.setdefault("pattern_flips_won", 0)
+            s.setdefault("skipped_rounds", 0)  # 🔥 Skip counter
             return s
         except Exception as e:
             logger.error(f"State load error: {e}")
@@ -74,7 +86,8 @@ def load_state():
         "current_loss_streak": 0, "max_b2b_loss": 0, "current_level": 1,
         "pattern_memory": {}, "error_patterns": {}, "gradient_lr": 0.01,
         "learned_overrides": 0, "number_memory": {}, "hot_numbers": {},
-        "pattern_strength": {}
+        "pattern_strength": {}, "pattern_flips": 0, "pattern_flips_won": 0,
+        "skipped_rounds": 0
     }
 
 def save_state(state):
@@ -98,7 +111,6 @@ def pattern_signature(outcomes, length=PATTERN_SIG_LEN):
     return "".join('B' if x else 'S' for x in outcomes[-length:])
 
 def short_pattern_sig(outcomes, length=6):
-    """Short signature for strong pattern tracking"""
     if len(outcomes) < length: return None
     return "".join('B' if x else 'S' for x in outcomes[-length:])
 
@@ -157,51 +169,46 @@ def calculate_entropy(outcomes, window=40):
     if p1 == 0 or p1 == 1: return 0.0
     return max(0.0, 1.0 - (-(p1*math.log2(p1) + (1-p1)*math.log2(1-p1))))
 
-# ==================== 🔥 PATTERN STRENGTH CALCULATOR ====================
+# ==================== PATTERN STRENGTH ====================
 def compute_pattern_strength(sig):
-    """
-    Compute strength score for a pattern signature.
-    Returns (probability, strength, samples).
-    
-    strength ranges 0.0 → 1.0
-      0.0     = useless, ignore
-      0.3     = weak
-      0.5     = normal
-      0.8     = strong
-      1.0     = super strong
-    """
     stats = STATE.get("pattern_strength", {}).get(sig)
-    if not stats:
-        return None, 0.0, 0
+    if not stats: return None, 0.0, 0
     hits = stats.get("hits", 0)
     misses = stats.get("misses", 0)
     total = hits + misses
-    if total < MIN_PATTERN_SAMPLES:
-        return None, 0.0, total
-    # Laplace smoothed accuracy
+    if total < MIN_PATTERN_SAMPLES: return None, 0.0, total
     acc = (hits + 1) / (total + 2)
-    # Frequency factor: caps at 15 samples
     freq_factor = min(1.0, total / 15.0)
-    # Accuracy factor: 50% = 0, 83% = 1.0
     acc_factor = max(0.0, (acc - 0.50) * 3.0)
-    # Combined strength
     strength = freq_factor * acc_factor
     return acc, min(1.0, strength), total
 
 def get_pattern_priority(outcomes):
-    """Get priority info for current pattern."""
     sig = short_pattern_sig(outcomes, 6)
     if not sig: return None, 0.0, 0
     return compute_pattern_strength(sig)
 
-# ==================== ENGINE 1: PATTERN (Strong Filter) ====================
+def check_pattern_flip(outcomes, p_big):
+    sig = short_pattern_sig(outcomes, 6)
+    if not sig: return p_big, False, ""
+    stats = STATE.get("pattern_strength", {}).get(sig)
+    if not stats: return p_big, False, ""
+    hits = stats.get("hits", 0)
+    misses = stats.get("misses", 0)
+    total = hits + misses
+    if total < FLIP_MIN_SAMPLES: return p_big, False, ""
+    acc = (hits + 1) / (total + 2)
+    if acc < FLIP_BELOW_ACCURACY:
+        reason = f"ACC {acc*100:.0f}%<{FLIP_BELOW_ACCURACY*100:.0f}% (n={total})"
+        return 1.0 - p_big, True, reason
+    return p_big, False, ""
+
+# ==================== ENGINE 1: PATTERN ====================
 def engine_pattern(outcomes):
     n = len(outcomes)
     if n < 15: return 0.5
     sig_full = "".join('B' if x else 'S' for x in outcomes)
     results, weights = [], []
-
-    # Multi-length pattern matching with STRONG FILTER
     for L in PATTERN_LENGTHS:
         if n < L + 3: continue
         tail = sig_full[-L:]
@@ -211,19 +218,13 @@ def engine_pattern(outcomes):
                 if outcomes[i+L] == 1: big += 1
                 else: small += 1
         total = big + small
-        # 🔥 STRONG FILTER: Only use if 3+ samples AND clear direction
         if total >= 3:
             prob = (big + 1) / (total + 2)
-            # Only accept if probability is far from 0.5 (strong signal)
             deviation = abs(prob - 0.5)
-            if deviation < 0.10:  # Too close to 0.5, skip
-                continue
-            # Weight: pattern length + match frequency + strength
+            if deviation < 0.10: continue
             freq_boost = min(2.0, total / 3.0)
             w = (L ** 1.5) * math.log(total + 1) * freq_boost
             results.append(prob); weights.append(w)
-
-    # Pattern DB lookup (14-length)
     sig14 = pattern_signature(outcomes, 14)
     if sig14 and sig14 in STATE.get("pattern_memory", {}):
         pm = STATE["pattern_memory"][sig14]
@@ -234,18 +235,13 @@ def engine_pattern(outcomes):
             if deviation >= 0.10:
                 w = 14 ** 1.5 * math.log(pb + ps + 1)
                 results.append(prob_db); weights.append(w)
-
-    # 🔥 STRONG PATTERN PRIORITY BOOST
     p_acc, p_strength, p_samples = get_pattern_priority(outcomes)
     if p_acc is not None and p_strength > 0.05:
-        # Strength amplifies weight: 1x → 4x
         boost = 1.0 + p_strength * (MAX_BOOST - 1.0)
-        # Also amplify the deviation for stronger prediction
         amplified_prob = 0.5 + (p_acc - 0.5) * (1.0 + p_strength)
         amplified_prob = max(0.05, min(0.95, amplified_prob))
         results.append(amplified_prob)
         weights.append(6 ** 1.7 * boost * math.log(p_samples + 1))
-
     if not results: return 0.5
     return sum(r*w for r,w in zip(results, weights)) / sum(weights)
 
@@ -389,6 +385,15 @@ def check_anti_error(outcomes, current_p_big):
             return current_p_big * 0.7 + 0.5 * 0.3, False, f"SIMILAR ({len(similar)})"
     return current_p_big, False, ""
 
+# ==================== SIGNAL LABEL ====================
+def get_signal_label(confidence):
+    deviation = confidence - 0.50
+    if deviation < 0.02: return "🟥 NONE"
+    elif deviation < 0.05: return "🟧 WEAK"
+    elif deviation < 0.10: return "🟨 MODERATE"
+    elif deviation < 0.15: return "🟩 STRONG"
+    else: return "🟢 V.STRONG"
+
 # ==================== MAIN PREDICTOR ====================
 def predict_next(history):
     outcomes = [h["size"] for h in history]
@@ -411,11 +416,18 @@ def predict_next(history):
     else:
         p_big = 0.5 - (0.5 - p_big) * (0.5 + predictability * 0.5)
 
+    # Anti-error flip
     p_big, override_active, override_reason = check_anti_error(outcomes, p_big)
 
+    # Pattern auto-flip
+    p_big, pat_flip_active, pat_flip_reason = check_pattern_flip(outcomes, p_big)
+
+    # 🔥 HONEST CONFIDENCE — no floor at 0.52
     base_conf = max(p_big, 1 - p_big)
     cal_pen = STATE.get("calibration_offset", 0.0) * 0.5
-    conf = max(0.52, min(0.95, base_conf - cal_pen))
+    conf = max(0.50, min(0.95, base_conf - cal_pen))  # 🔥 floor 0.50 (honest)
+    signal_label = get_signal_label(conf)
+
     pred_size = 1 if p_big >= 0.5 else 0
 
     numbers = [h["number"] for h in history if h["number"] >= 0]
@@ -424,21 +436,19 @@ def predict_next(history):
         top = Counter(numbers[-HOT_NUMBER_WINDOW:]).most_common(1)
         if top: hot_top = top[0]
 
-    # 🔥 Pattern strength info
     p_acc, p_strength, p_samples = get_pattern_priority(outcomes)
     strength_note = ""
     strength_label = ""
     if p_acc is not None:
         strength_note = f"Acc:{p_acc*100:.0f}% (n={p_samples})"
-        if p_strength >= 0.6:
-            strength_label = "🔥 SUPER"
-        elif p_strength >= 0.3:
-            strength_label = "⭐ STRONG"
-        elif p_strength >= 0.1:
-            strength_label = "○ WEAK"
+        if p_strength >= 0.6: strength_label = "🔥 SUPER"
+        elif p_strength >= 0.3: strength_label = "⭐ STRONG"
+        elif p_strength >= 0.1: strength_label = "○ WEAK"
+        else: strength_label = "💤 FLAT"
 
     return {
         "pred_size": pred_size, "confidence": conf,
+        "signal_label": signal_label,
         "engine_probs": engine_probs, "weights": weights,
         "regime": regime, "entropy": predictability,
         "signature": pattern_signature(outcomes),
@@ -449,7 +459,9 @@ def predict_next(history):
         "strength_label": strength_label,
         "pattern_strength": p_strength,
         "anti_error_active": override_active,
-        "anti_error_reason": override_reason
+        "anti_error_reason": override_reason,
+        "pat_flip_active": pat_flip_active,
+        "pat_flip_reason": pat_flip_reason
     }
 
 # ==================== NUMBER PREDICTOR ====================
@@ -509,7 +521,8 @@ def update_global_stats(win):
         STATE["current_loss_streak"] = STATE.get("current_loss_streak", 0) + 1
         if STATE["current_loss_streak"] > STATE.get("max_b2b_loss", 0):
             STATE["max_b2b_loss"] = STATE["current_loss_streak"]
-        STATE["current_level"] = min(STATE.get("current_level", 1) + 1, 4)
+        # 🔥 MAX LEVEL 3
+        STATE["current_level"] = min(STATE.get("current_level", 1) + 1, MAX_LEVEL)
 
 def update_pattern_memory(signature, actual_big):
     if not signature: return
@@ -529,9 +542,7 @@ def update_error_pattern(signature, won):
         ep = STATE.setdefault("error_patterns", {}).setdefault(signature, {"fail_count": 0, "total": 0})
         ep["fail_count"] += 1; ep["total"] = ep.get("total", 0) + 1
 
-# 🔥 NEW: Update pattern strength DB
 def update_pattern_strength(sig, actual_big, pred_big):
-    """Track per-short-signature accuracy"""
     if not sig: return
     stats = STATE.setdefault("pattern_strength", {}).setdefault(sig, {"hits": 0, "misses": 0})
     if actual_big == pred_big:
@@ -574,15 +585,22 @@ def build_stats_footer():
     num_db = len(STATE.get("number_memory", {}))
     strong_pats = len(STATE.get("pattern_strength", {}))
     learned = STATE.get("learned_overrides", 0)
+    pflips = STATE.get("pattern_flips", 0)
+    pflips_won = STATE.get("pattern_flips_won", 0)
+    pflip_acc = (pflips_won / pflips * 100) if pflips > 0 else 0.0
+    skipped = STATE.get("skipped_rounds", 0)
+    level_str = f"{BET_LEVELS[min(level-1, len(BET_LEVELS)-1)]}X"
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *LIFETIME STATS*\n"
         f"✅ *Win:* `{wins}` | ❌ *Loss:* `{losses}`\n"
-        f"📉 *Max B2B Loss:* `{max_b2b}` | 🔥 *Streak:* `{cur}`\n"
+        f"📉 *Max B2B:* `{max_b2b}` | 🔥 *Streak:* `{cur}`\n"
         f"🎯 *Win Rate:* `{wr:.1f}%`\n"
-        f"💰 *Next Level:* `{level}` ({BET_LEVELS[min(level-1, 3)]}X)\n"
-        f"🧠 *Patterns:* `{patterns}` | 💪 *Strong:* `{strong_pats}`\n"
-        f"🔢 *Number DB:* `{num_db}` | ⚠️ *Errors:* `{errors}` | 🎓 *Flips:* `{learned}`"
+        f"💰 *Level:* `{level}` ({level_str})\n"
+        f"🧠 *Pat:* `{patterns}` | 💪 *Strong:* `{strong_pats}`\n"
+        f"🔢 *Num:* `{num_db}` | ⚠️ *Err:* `{errors}`\n"
+        f"🎓 *AE-Flips:* `{learned}` | 🔄 *Pat-Flips:* `{pflips}` (won {pflips_won}, {pflip_acc:.0f}%)\n"
+        f"⏸️ *Skipped:* `{skipped}` (low signal)"
     )
 
 # ==================== TELEGRAM ====================
@@ -650,8 +668,12 @@ class BotStateMachine:
             sig = self.pending.get("pattern_sig")
             update_pattern_memory(sig, ab)
             update_error_pattern(sig, win)
-            # 🔥 Update pattern strength
-            update_pattern_strength(self.pending.get("short_sig"), ab, pred_big)
+            original_pred_big = self.pending.get("original_pred_big", pred_big)
+            update_pattern_strength(self.pending.get("short_sig"), ab, original_pred_big)
+            if self.pending.get("pat_flipped"):
+                STATE["pattern_flips"] = STATE.get("pattern_flips", 0) + 1
+                if win:
+                    STATE["pattern_flips_won"] = STATE.get("pattern_flips_won", 0) + 1
             update_number_memory(history)
             if self.pending.get("flipped"):
                 STATE["learned_overrides"] = STATE.get("learned_overrides", 0) + 1
@@ -660,8 +682,31 @@ class BotStateMachine:
 
         # ---- PREDICT ----
         if not self.pending or self.pending["last_issue"] != li:
+            # Get original prediction (before flips)
+            outcomes_local = [h["size"] for h in history]
+            ep_orig = {
+                "pattern": engine_pattern(outcomes_local),
+                "trend": engine_trend(outcomes_local),
+                "number_seq": engine_number_sequence(history),
+                "hot_number": engine_hot_number(history),
+                "streak_break": engine_streak_break(outcomes_local),
+            }
+            regime_local = detect_regime(outcomes_local)
+            w_local = get_adaptive_weights(regime_local)
+            original_p_big = combine_engines(ep_orig, w_local)
+            original_pred_big = (original_p_big >= 0.5)
+
             pred = predict_next(history)
             ps = pred["pred_size"]; conf = pred["confidence"]; sig = pred["signature"]
+
+            # 🔥 SKIP LOW SIGNAL
+            if conf < MIN_CONFIDENCE_TO_SEND:
+                STATE["skipped_rounds"] = STATE.get("skipped_rounds", 0) + 1
+                logger.info(f"⏸️ Skipped {li+1} — conf {conf*100:.1f}% < {MIN_CONFIDENCE_TO_SEND*100}%")
+                STATE["last_processed_issue"] = li
+                save_state(STATE)
+                return
+
             ni = li + 1
             pn = advanced_number_predictor(history, ps)
             self.pending = {
@@ -671,8 +716,10 @@ class BotStateMachine:
                 "prob_big": conf if ps == 1 else 1 - conf,
                 "engine_probs": pred["engine_probs"],
                 "pattern_sig": sig,
-                "short_sig": pred["short_sig"],  # 🔥 Save short sig for strength tracking
-                "flipped": pred["anti_error_active"]
+                "short_sig": pred["short_sig"],
+                "original_pred_big": original_pred_big,
+                "flipped": pred["anti_error_active"],
+                "pat_flipped": pred["pat_flip_active"]
             }
             STATE["prediction_memory"][str(ni)] = {"size": self.pending["pred_size"], "number": pn}
 
@@ -684,34 +731,38 @@ class BotStateMachine:
             weights_str = " ".join([f"{k[:3].upper()}:{v:.2f}" for k, v in pred["weights"].items()])
 
             override_note = ""
-            if pred["anti_error_active"]: override_note = f"\n🚨 *FLIP:* `{pred['anti_error_reason']}`"
+            if pred["anti_error_active"]: override_note = f"\n🚨 *AE-FLIP:* `{pred['anti_error_reason']}`"
             elif pred["anti_error_reason"]: override_note = f"\n⚠️ *Dampened:* `{pred['anti_error_reason']}`"
+
+            pat_flip_note = ""
+            if pred["pat_flip_active"]:
+                pat_flip_note = f"\n🔄 *PAT-FLIP:* `{pred['pat_flip_reason']}`"
 
             hot_info = ""
             if pred["hot_top"]:
                 hn, hc = pred["hot_top"]
                 hot_info = f"\n🔥 *Hot:* `{hn}` ({hc}x)"
 
-            # 🔥 Pattern strength display
             strength_info = ""
             if pred["strength_note"]:
                 strength_info = f"\n💪 *Pattern:* `{pred['strength_label']}` {pred['strength_note']}"
 
             num_sig_str = pred["num_sig"] or "N/A"
             level = STATE.get("current_level", 1)
-            fund_advice = f"{BET_LEVELS[min(level-1, 3)]}X"
+            fund_advice = f"{BET_LEVELS[min(level-1, len(BET_LEVELS)-1)]}X"
             stats_footer = build_stats_footer()
 
             msg = (
-                f"🎯 *QUANTUM V28.1 STRONG FILTER* 🎯\n"
+                f"🎯 *QUANTUM V28.3 FINAL* 🎯\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 *Period:* `{ni}`\n"
                 f"🎲 *Number:* `{pn}`\n"
                 f"🔥 *Target:* *{'BIGGG 🟢' if ps == 1 else 'SMALL 🔴'}*\n"
-                f"📊 *Confidence:* `{conf*100:.1f}%`\n"
+                f"📊 *Confidence:* `{conf*100:.1f}%` | {pred['signal_label']}\n"
                 f"📈 *Regime:* `{pred['regime']}` | *Entropy:* `{pred['entropy']:.2f}`\n"
                 f"💰 *Fund:* `{fund_advice}` (Level {level})"
-                f"{override_note}\n"
+                f"{override_note}"
+                f"{pat_flip_note}\n"
                 f"🧩 *Size Sig:* `{sig or 'N/A'}`\n"
                 f"🎯 *Short Sig:* `{pred['short_sig']}`"
                 f"{strength_info}\n"
@@ -731,12 +782,11 @@ class BotStateMachine:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    logger.info("Warmup V28.1...")
+    logger.info("Warmup V28.3...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate_and_sanitize(raw)
     if len(history) < 100: return
-    # Seed pattern memory
     for i in range(PATTERN_SIG_LEN, len(history) - 1):
         partial = history[:i]
         outcomes = [h["size"] for h in partial]
@@ -746,19 +796,26 @@ async def warmup(session):
             pm = STATE.setdefault("pattern_memory", {}).setdefault(sig, {"next_big": 0, "next_small": 0})
             if nb: pm["next_big"] += 1
             else: pm["next_small"] += 1
-    # 🔥 Seed pattern strength from 6-length sigs
     for i in range(6, len(history) - 1):
         partial = history[:i]
         outcomes = [h["size"] for h in partial]
         short_sig = short_pattern_sig(outcomes, 6)
         if not short_sig: continue
-        # What would have predicted?
-        pred = predict_next(partial)
+        outcomes_local = [h["size"] for h in partial]
+        ep = {
+            "pattern": engine_pattern(outcomes_local),
+            "trend": engine_trend(outcomes_local),
+            "number_seq": engine_number_sequence(partial),
+            "hot_number": engine_hot_number(partial),
+            "streak_break": engine_streak_break(outcomes_local),
+        }
+        regime = detect_regime(outcomes_local)
+        w = get_adaptive_weights(regime)
+        orig_p = combine_engines(ep, w)
+        orig_pred_big = (orig_p >= 0.5)
         ab = history[i]["size"] == 1
-        pred_big = (pred["pred_size"] == 1)
-        update_pattern_strength(short_sig, ab, pred_big)
+        update_pattern_strength(short_sig, ab, orig_pred_big)
     update_number_memory(history)
-    # Warm engines
     for i in range(50, len(history) - 1):
         partial = history[:i]
         outcomes = [h["size"] for h in partial]
@@ -771,11 +828,10 @@ async def warmup(session):
         except Exception: continue
     save_state(STATE)
     logger.info(f"Warmup done. Pat:{len(STATE.get('pattern_memory', {}))} "
-                f"Strong:{len(STATE.get('pattern_strength', {}))} "
-                f"Num:{len(STATE.get('number_memory', {}))}")
+                f"Strong:{len(STATE.get('pattern_strength', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V28.1 STRONG FILTER ACTIVE", status=200)
+async def health(r): return web.Response(text="V28.3 FINAL ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get('/', health)
@@ -788,5 +844,5 @@ async def main():
         await BotStateMachine().run(session)
 
 if __name__ == "__main__":
-    asyncio.run(main())     
+    asyncio.run(main())
 
