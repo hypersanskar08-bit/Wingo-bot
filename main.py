@@ -21,9 +21,10 @@ SHORT_LENGTHS = [5, 6, 7, 8, 9, 10, 11, 12]
 TOP_ACC_THRESHOLD = 0.67
 TOP_MIN_SAMPLES = 30
 STRONG_ACC_THRESHOLD = 0.59
-FLIP_MAX_ACC = 0.45          # <45% flip
-FLIP_MIN_SAMPLES = 20        # 🔥 Minimum 20 samples
-PATTERN_MIN_SAMPLES = 20     # 🔥 Ignore below 20
+FLIP_MAX_ACC = 0.45
+FLIP_MIN_SAMPLES = 20
+PATTERN_MIN_SAMPLES = 20         # Prediction floor
+PATTERN_DISPLAY_MIN = 3          # 🔥 Display floor (show even small n)
 
 PATTERN_BLACKLIST_LOSSES = 3
 MAX_LOSS_STREAK_HARD = 5
@@ -36,7 +37,7 @@ def _default_eng():
 ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break",
            "rhythm", "hot_cold", "gambler_instinct"]
 
-STATE_FILE = "engine_state_v28_5_6.json"
+STATE_FILE = "engine_state_v28_5_7.json"
 STATE = {
     "engine_stats": {e: _default_eng() for e in ENGINES},
     "number_memory": {}, "pattern_accuracy": {}, "pattern_recent": {},
@@ -152,14 +153,6 @@ def get_sig_recent_prob(arr, L, window=10):
 
 # 🔥 CORE RULES
 def apply_pattern_rules(p_raw, n):
-    """
-    Rules:
-    - 67%+ AND n>=30 → TOP (no flip)
-    - 59%+ → STRONG (no flip)
-    - <45% AND n>=20 → FLIP
-    - 45-58.9% → NORMAL (as-is)
-    - n < 20 → IGNORE (FLAT)
-    """
     if n < PATTERN_MIN_SAMPLES:
         return p_raw, False, "FLAT"
     if p_raw >= TOP_ACC_THRESHOLD and n >= TOP_MIN_SAMPLES:
@@ -170,16 +163,22 @@ def apply_pattern_rules(p_raw, n):
         return 1.0 - p_raw, True, "FLIP"
     return p_raw, False, "NORMAL"
 
-def get_best_pattern(arr):
+def get_best_pattern(arr, for_display=False):
+    """
+    for_display=True → show n>=3 (used for message display)
+    for_display=False → require n>=20 (used for prediction engine)
+    """
     best = None
     best_score = -1
+    min_n = PATTERN_DISPLAY_MIN if for_display else PATTERN_MIN_SAMPLES
+
     for L in SHORT_LENGTHS:
         if len(arr) < L: continue
         sig = make_sig(arr, L)
         if not sig: continue
         if sig in STATE.get("pattern_blacklist", []): continue
         p_raw, n = get_sig_probability(arr, L)
-        if n < PATTERN_MIN_SAMPLES: continue   # 🔥 n < 20 ignore
+        if n < min_n: continue
 
         p, was_flipped, tag = apply_pattern_rules(p_raw, n)
 
@@ -203,7 +202,7 @@ def get_best_pattern(arr):
 def eng_pattern(arr):
     n = len(arr)
     if n < 15: return 0.5
-    best = get_best_pattern(arr)
+    best = get_best_pattern(arr, for_display=False)
     if not best: return 0.5
     sig, L, p_hist, samples, p_recent, rn, was_flipped, tag, p_raw = best
 
@@ -411,7 +410,7 @@ def grad_update(probs, ab, lr=0.01):
 
 # ==================== PATTERN BLACKLIST ====================
 def check_pattern_blacklist(arr):
-    best = get_best_pattern(arr)
+    best = get_best_pattern(arr, for_display=False)
     if not best: return False
     return best[0] in STATE.get("pattern_blacklist", [])
 
@@ -518,24 +517,26 @@ def predict_next(history):
     nums = [h["number"] for h in history if h["number"] >= 0]
     hot = Counter(nums[-20:]).most_common(1) if len(nums) >= 20 else None
 
-    best = get_best_pattern(arr)
+    # 🔥 Display pattern (n>=3), Prediction uses n>=20
+    disp_best = get_best_pattern(arr, for_display=True)
     best_sig = "N/A"; best_note = ""; best_label = ""
-    if best:
-        sig, L, p_hist, samples, p_recent, rn, was_flipped, tag, p_raw = best
+    if disp_best:
+        sig, L, p_hist, samples, p_recent, rn, was_flipped, tag, p_raw = disp_best
         best_sig = f"{L}-{sig}"
-        if tag == "TOP":
+        if tag == "FLAT":
+            best_label = "📚 LEARNING"
+            best_note = f"Acc:{p_raw*100:.0f}% (n={samples}/20 needed)"
+        elif tag == "TOP":
             best_label = "🏆 TOP PRIORITY"
+            best_note = f"H:{p_hist*100:.0f}%(n={samples}) R:{p_recent*100:.0f}%(n={rn})"
         elif tag == "STRONG":
             best_label = "⭐ STRONG"
+            best_note = f"H:{p_hist*100:.0f}%(n={samples}) R:{p_recent*100:.0f}%(n={rn})"
         elif tag == "FLIP":
             best_label = "🔄 FLIPPED"
+            best_note = f"Raw:{p_raw*100:.0f}% → Flipped:{p_hist*100:.0f}% (n={samples})"
         elif tag == "NORMAL":
             best_label = "○ NORMAL"
-        else:
-            best_label = "💤 FLAT"
-        if was_flipped:
-            best_note = f"Raw:{p_raw*100:.0f}% → Flipped:{p_hist*100:.0f}% (n={samples})"
-        else:
             best_note = f"H:{p_hist*100:.0f}%(n={samples}) R:{p_recent*100:.0f}%(n={rn})"
     elif pat_blacklisted:
         best_label = "🚫 BLACKLISTED"
@@ -653,7 +654,7 @@ class Bot:
     def __init__(self): self.pending = None
 
     async def run(self, session):
-        print("🚀 QUANTUM V28.5.6 STARTED")
+        print("🚀 QUANTUM V28.5.7 STARTED")
         while True:
             try: await self.step(session)
             except Exception as e:
@@ -688,7 +689,7 @@ class Bot:
                 arr_before = arr[:-1]
                 update_pattern_accuracy(arr_before, ab)
 
-            if self.pending.get("best_sig"):
+            if self.pending.get("best_sig") and self.pending["best_sig"] != "N/A":
                 sig_str = self.pending["best_sig"].split("-", 1)[-1]
                 update_pattern_blacklist(sig_str, win)
 
@@ -726,7 +727,7 @@ class Bot:
             fund = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
             footer = fmt_footer()
 
-            msg = (f"🎯 *QUANTUM V28.5.6 SMART* 🎯\n"
+            msg = (f"🎯 *QUANTUM V28.5.7 SMART* 🎯\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                    f"📌 *Period:* `{ni}`\n"
                    f"🎲 *Number:* `{pn}`\n"
@@ -751,7 +752,7 @@ class Bot:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    print("Warmup V28.5.6...")
+    print("Warmup V28.5.7...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate(raw)
@@ -774,7 +775,7 @@ async def warmup(session):
     print(f"Warmup done. Sig-DB:{len(STATE.get('pattern_accuracy', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V28.5.6 SMART ACTIVE", status=200)
+async def health(r): return web.Response(text="V28.5.7 SMART ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get("/", health)
