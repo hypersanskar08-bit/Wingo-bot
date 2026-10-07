@@ -18,11 +18,12 @@ MAX_LEVEL = 2
 SHORT_LENGTHS = [5, 6, 7, 8, 9, 10, 11, 12]
 
 # 🔥 PATTERN RULES
-TOP_ACC_THRESHOLD = 0.67     # 67%+ = TOP (needs n>=30)
+TOP_ACC_THRESHOLD = 0.67
 TOP_MIN_SAMPLES = 30
-STRONG_ACC_THRESHOLD = 0.59  # 59%+ = STRONG (no flip)
-FLIP_MAX_ACC = 0.40          # ≤40% flip (needs n>=30)
-FLIP_MIN_SAMPLES = 30
+STRONG_ACC_THRESHOLD = 0.59
+FLIP_MAX_ACC = 0.45          # <45% flip
+FLIP_MIN_SAMPLES = 20        # 🔥 Minimum 20 samples
+PATTERN_MIN_SAMPLES = 20     # 🔥 Ignore below 20
 
 PATTERN_BLACKLIST_LOSSES = 3
 MAX_LOSS_STREAK_HARD = 5
@@ -35,7 +36,7 @@ def _default_eng():
 ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break",
            "rhythm", "hot_cold", "gambler_instinct"]
 
-STATE_FILE = "engine_state_v28_5_5.json"
+STATE_FILE = "engine_state_v28_5_6.json"
 STATE = {
     "engine_stats": {e: _default_eng() for e in ENGINES},
     "number_memory": {}, "pattern_accuracy": {}, "pattern_recent": {},
@@ -114,7 +115,7 @@ def entropy(arr, w=40):
     if p1 in (0, 1): return 0.0
     return max(0.0, 1.0 - (-(p1*math.log2(p1) + (1-p1)*math.log2(1-p1))))
 
-# ==================== PATTERN ACCURACY TRACKER ====================
+# ==================== PATTERN ACCURACY ====================
 def update_pattern_accuracy(arr_before, actual_next):
     for L in SHORT_LENGTHS:
         if len(arr_before) < L: continue
@@ -149,28 +150,27 @@ def get_sig_recent_prob(arr, L, window=10):
     b = sum(recent)
     return (b + 1) / (len(recent) + 2), len(recent)
 
-# 🔥 CORE LOGIC: Apply rules
+# 🔥 CORE RULES
 def apply_pattern_rules(p_raw, n):
     """
-    Returns (final_prob, flipped, tag)
-    
     Rules:
-    - 67%+ AND n>=30 → TOP priority (no flip)
+    - 67%+ AND n>=30 → TOP (no flip)
     - 59%+ → STRONG (no flip)
-    - ≤40% AND n>=30 → FLIP
-    - Everything else (FLAT/WEAK) → CONTRARIAN (flip)
+    - <45% AND n>=20 → FLIP
+    - 45-58.9% → NORMAL (as-is)
+    - n < 20 → IGNORE (FLAT)
     """
+    if n < PATTERN_MIN_SAMPLES:
+        return p_raw, False, "FLAT"
     if p_raw >= TOP_ACC_THRESHOLD and n >= TOP_MIN_SAMPLES:
         return p_raw, False, "TOP"
     if p_raw >= STRONG_ACC_THRESHOLD:
         return p_raw, False, "STRONG"
-    if p_raw <= FLIP_MAX_ACC and n >= FLIP_MIN_SAMPLES:
+    if p_raw < FLIP_MAX_ACC and n >= FLIP_MIN_SAMPLES:
         return 1.0 - p_raw, True, "FLIP"
-    # FLAT (46-54%) or WEAK (54-58.9%) or 40-46% → contrarian
-    return 1.0 - p_raw, True, "CONTRARIAN"
+    return p_raw, False, "NORMAL"
 
 def get_best_pattern(arr):
-    """Find best pattern applying all rules"""
     best = None
     best_score = -1
     for L in SHORT_LENGTHS:
@@ -179,26 +179,19 @@ def get_best_pattern(arr):
         if not sig: continue
         if sig in STATE.get("pattern_blacklist", []): continue
         p_raw, n = get_sig_probability(arr, L)
-        if n < 3: continue
+        if n < PATTERN_MIN_SAMPLES: continue   # 🔥 n < 20 ignore
 
-        # Apply rules
         p, was_flipped, tag = apply_pattern_rules(p_raw, n)
 
         deviation = abs(p - 0.5)
-        # Score: length + deviation + sample boost
         score = (L * 0.05) + (deviation * 3) + min(1.0, n / 15) * 0.3
-        # Priority boosts
-        if tag == "TOP":
-            score += 1.5
-        elif tag == "STRONG":
-            score += 0.5
-        elif was_flipped:
-            score += 0.3
+        if tag == "TOP": score += 1.5
+        elif tag == "STRONG": score += 0.5
+        elif tag == "FLIP": score += 0.3
 
         if score > best_score:
             rp_raw, rn = get_sig_recent_prob(arr, L, 10)
-            # Apply same rules to recent
-            if rn >= 5:
+            if rn >= PATTERN_MIN_SAMPLES:
                 rp, _, _ = apply_pattern_rules(rp_raw, rn)
             else:
                 rp = rp_raw
@@ -214,6 +207,8 @@ def eng_pattern(arr):
     if not best: return 0.5
     sig, L, p_hist, samples, p_recent, rn, was_flipped, tag, p_raw = best
 
+    if tag == "FLAT": return 0.5
+
     if rn >= 5:
         p_combined = p_hist * 0.6 + p_recent * 0.4
     else:
@@ -225,17 +220,10 @@ def eng_pattern(arr):
     length_boost = min(1.0, (L - 4) / 8)
     sample_boost = min(1.0, samples / 20)
 
-    # Top priority gets extra boost
-    if tag == "TOP":
-        boost = 1.5
-    elif tag == "STRONG":
-        boost = 1.2
-    elif tag == "FLIP":
-        boost = 1.2
-    elif tag == "CONTRARIAN":
-        boost = 1.0
-    else:
-        boost = 1.0
+    if tag == "TOP": boost = 1.5
+    elif tag == "STRONG": boost = 1.2
+    elif tag == "FLIP": boost = 1.2
+    else: boost = 1.0
 
     amplified = 0.5 + (p_combined - 0.5) * (1.0 + length_boost * 0.5 + sample_boost * 0.5) * boost
     return max(0.05, min(0.95, amplified))
@@ -530,24 +518,21 @@ def predict_next(history):
     nums = [h["number"] for h in history if h["number"] >= 0]
     hot = Counter(nums[-20:]).most_common(1) if len(nums) >= 20 else None
 
-    # Best pattern info
     best = get_best_pattern(arr)
     best_sig = "N/A"; best_note = ""; best_label = ""
     if best:
         sig, L, p_hist, samples, p_recent, rn, was_flipped, tag, p_raw = best
         best_sig = f"{L}-{sig}"
-        use_p = p_hist if rn < 5 else (p_hist * 0.6 + p_recent * 0.4)
-        dev = abs(use_p - 0.5)
         if tag == "TOP":
             best_label = "🏆 TOP PRIORITY"
         elif tag == "STRONG":
             best_label = "⭐ STRONG"
         elif tag == "FLIP":
-            best_label = "🔄 STRONG-FLIP"
-        elif tag == "CONTRARIAN":
-            best_label = "↔️ CONTRARIAN"
+            best_label = "🔄 FLIPPED"
+        elif tag == "NORMAL":
+            best_label = "○ NORMAL"
         else:
-            best_label = "○ WEAK"
+            best_label = "💤 FLAT"
         if was_flipped:
             best_note = f"Raw:{p_raw*100:.0f}% → Flipped:{p_hist*100:.0f}% (n={samples})"
         else:
@@ -668,7 +653,7 @@ class Bot:
     def __init__(self): self.pending = None
 
     async def run(self, session):
-        print("🚀 QUANTUM V28.5.5 STARTED")
+        print("🚀 QUANTUM V28.5.6 STARTED")
         while True:
             try: await self.step(session)
             except Exception as e:
@@ -741,7 +726,7 @@ class Bot:
             fund = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
             footer = fmt_footer()
 
-            msg = (f"🎯 *QUANTUM V28.5.5 SMART* 🎯\n"
+            msg = (f"🎯 *QUANTUM V28.5.6 SMART* 🎯\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                    f"📌 *Period:* `{ni}`\n"
                    f"🎲 *Number:* `{pn}`\n"
@@ -766,7 +751,7 @@ class Bot:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    print("Warmup V28.5.5...")
+    print("Warmup V28.5.6...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate(raw)
@@ -789,7 +774,7 @@ async def warmup(session):
     print(f"Warmup done. Sig-DB:{len(STATE.get('pattern_accuracy', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V28.5.5 SMART ACTIVE", status=200)
+async def health(r): return web.Response(text="V28.5.6 SMART ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get("/", health)
@@ -803,4 +788,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
