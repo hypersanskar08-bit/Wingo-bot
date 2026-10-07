@@ -3,7 +3,7 @@ import time
 import math
 import os
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, Counter
 import aiohttp
 from aiohttp import web
 
@@ -13,11 +13,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8611789455:AAFcnSZ7nlrCIPsQUKLQwdmTf2aw
 CHAT_ID = os.environ.get("CHAT_ID", "1264164655")
 WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ")
 
-# 🔥 SAFE LEVELS
 BET_LEVELS = [1.0, 2.5]
 MAX_LEVEL = 2
-FLIP_BLACKLIST_MIN = 3
-FLIP_BLACKLIST_MAX_WR = 0.35
+
+# 🔥 SHORT SIG LENGTHS (replaces 14-length size sig)
+SHORT_LENGTHS = [5, 6, 7, 8, 9, 10, 11, 12]
+
+# Pattern blacklist
+PATTERN_BLACKLIST_LOSSES = 3
+MAX_LOSS_STREAK_HARD = 5
 
 # ==================== STATE ====================
 def _default_eng():
@@ -27,14 +31,19 @@ def _default_eng():
 ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break",
            "rhythm", "hot_cold", "gambler_instinct"]
 
-STATE_FILE = "engine_state_v28_5_1.json"
+STATE_FILE = "engine_state_v28_5_4.json"
 STATE = {
     "engine_stats": {e: _default_eng() for e in ENGINES},
-    "pattern_memory": {}, "number_memory": {}, "pattern_strength": {},
-    "flip_stats": {}, "flip_blacklist": [], "total_wins": 0, "total_losses": 0,
+    "number_memory": {},
+    "pattern_accuracy": {},       # sig → {"big": N, "small": N}
+    "pattern_recent": {},         # sig → last 20 outcomes
+    "pattern_blacklist": [],
+    "pattern_losses": {},         # sig → consecutive losses
+    "total_wins": 0, "total_losses": 0,
     "current_level": 1, "current_loss_streak": 0, "max_b2b_loss": 0,
-    "pattern_flips": 0, "pattern_flips_won": 0, "bot_recent_form": [],
+    "bot_recent_form": [],
     "prediction_memory": {}, "last_processed_issue": 0, "calibration_offset": 0.0,
+    "cooldown_until": 0,
 }
 
 def load_state():
@@ -42,23 +51,21 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f: s = json.load(f)
-            for k in STATE: 
+            for k in STATE:
                 if k not in s: s[k] = STATE[k]
             for e in ENGINES:
                 if e not in s.get("engine_stats", {}): s["engine_stats"][e] = _default_eng()
             STATE = s
-        except Exception as ex:
-            print(f"State load err: {ex}")
+        except Exception as ex: print(f"State load err: {ex}")
 
 def save_state():
     try:
-        for key, cap in [("prediction_memory", 500), ("pattern_memory", 5000),
-                         ("number_memory", 5000), ("pattern_strength", 5000),
-                         ("flip_stats", 2000), ("flip_blacklist", 500),
+        for key, cap in [("prediction_memory", 500), ("number_memory", 5000),
+                         ("pattern_accuracy", 8000), ("pattern_recent", 8000),
+                         ("pattern_blacklist", 500), ("pattern_losses", 3000),
                          ("bot_recent_form", 20)]:
             if len(STATE.get(key, {})) > cap:
-                if isinstance(STATE[key], list):
-                    STATE[key] = STATE[key][-cap:]
+                if isinstance(STATE[key], list): STATE[key] = STATE[key][-cap:]
                 else:
                     for k in sorted(STATE[key].keys())[:-cap]: del STATE[key][k]
         with open(STATE_FILE, "w") as f: json.dump(STATE, f)
@@ -67,24 +74,11 @@ def save_state():
 load_state()
 
 # ==================== HELPERS ====================
-def pattern_signature(arr, n=14):
-    if len(arr) < n: return None
-    return "".join("B" if x else "S" for x in arr[-n:])
+def make_sig(arr, length):
+    """Build signature string of given length"""
+    if len(arr) < length: return None
+    return "".join("B" if x else "S" for x in arr[-length:])
 
-def short_sig(arr, n=6):
-    if len(arr) < n: return None
-    return "".join("B" if x else "S" for x in arr[-n:])
-
-def num_signature(history, n=5):
-    nums = [int(h["number"]) for h in history if str(h.get("number", "")).isdigit()]
-    if len(nums) < n: return None
-    return "-".join(str(x) for x in nums[-n:])
-
-def hamming(a, b):
-    if not a or not b or len(a) != len(b): return 999
-    return sum(1 for x, y in zip(a, b) if x != y)
-
-# ==================== DATA VALIDATION ====================
 def validate(raw_list):
     if not raw_list or not isinstance(raw_list, list): return None
     out, seen = [], set()
@@ -107,10 +101,10 @@ def detect_regime(arr):
     if len(arr) < 20: return "BALANCED"
     r = arr[-20:]
     alt = sum(1 for i in range(len(r)-1) if r[i] != r[i+1])
-    big_rate = sum(r) / len(r)
+    br = sum(r) / len(r)
     if alt >= 15: return "ALTERNATING"
-    if big_rate >= 0.70: return "BIG_HEAVY"
-    if big_rate <= 0.30: return "SMALL_HEAVY"
+    if br >= 0.70: return "BIG_HEAVY"
+    if br <= 0.30: return "SMALL_HEAVY"
     if all(x == r[0] for x in r): return "LONG_STREAK"
     return "BALANCED"
 
@@ -121,50 +115,102 @@ def entropy(arr, w=40):
     if p1 in (0, 1): return 0.0
     return max(0.0, 1.0 - (-(p1*math.log2(p1) + (1-p1)*math.log2(1-p1))))
 
+# ==================== 🔥 PATTERN ACCURACY TRACKER (Multi-Length) ====================
+def update_pattern_accuracy(arr_before, actual_next):
+    """
+    Called AFTER outcome is known.
+    Track ALL short lengths (5-12).
+    """
+    for L in SHORT_LENGTHS:
+        if len(arr_before) < L: continue
+        sig = make_sig(arr_before, L)
+        if not sig: continue
+        pa = STATE.setdefault("pattern_accuracy", {}).setdefault(sig, {"big": 0, "small": 0})
+        if actual_next == 1: pa["big"] += 1
+        else: pa["small"] += 1
+        # Recent list
+        pr = STATE.setdefault("pattern_recent", {}).setdefault(sig, [])
+        pr.append(actual_next)
+        if len(pr) > 20: STATE["pattern_recent"][sig] = pr[-20:]
+
+def get_sig_probability(arr, L):
+    """Raw probability for signature of length L"""
+    if len(arr) < L: return 0.5, 0
+    sig = make_sig(arr, L)
+    if not sig: return 0.5, 0
+    pa = STATE.get("pattern_accuracy", {}).get(sig)
+    if not pa: return 0.5, 0
+    b, s = pa.get("big", 0), pa.get("small", 0)
+    t = b + s
+    if t == 0: return 0.5, 0
+    p = (b + 1) / (t + 2)
+    return p, t
+
+def get_sig_recent_prob(arr, L, window=10):
+    if len(arr) < L: return 0.5, 0
+    sig = make_sig(arr, L)
+    if not sig: return 0.5, 0
+    pr = STATE.get("pattern_recent", {}).get(sig)
+    if not pr: return 0.5, 0
+    recent = pr[-window:]
+    if len(recent) < 3: return 0.5, len(recent)
+    b = sum(recent)
+    return (b + 1) / (len(recent) + 2), len(recent)
+
+def get_best_pattern(arr):
+    """
+    Find the best pattern across all short lengths (5-12).
+    Priority: longer length > higher samples > higher accuracy
+    Returns: (sig, length, prob, samples, recent_prob, recent_n)
+    """
+    best = None
+    best_score = -1
+    for L in SHORT_LENGTHS:
+        if len(arr) < L: continue
+        sig = make_sig(arr, L)
+        if not sig: continue
+        if sig in STATE.get("pattern_blacklist", []): continue
+        p, n = get_sig_probability(arr, L)
+        if n < 3: continue
+        # Score: length weight + accuracy strength + sample boost
+        deviation = abs(p - 0.5)
+        score = (L * 0.05) + (deviation * 3) + min(1.0, n / 15) * 0.3
+        if score > best_score:
+            rp, rn = get_sig_recent_prob(arr, L, 10)
+            best_score = score
+            best = (sig, L, p, n, rp, rn)
+    return best
+
 # ==================== ENGINES ====================
 def eng_pattern(arr):
+    """Pattern engine using multi-length short sigs (5-12)"""
     n = len(arr)
     if n < 15: return 0.5
-    sig = "".join("B" if x else "S" for x in arr)
-    res, wts = [], []
-    for L in [4, 6, 8, 10, 12, 14]:
-        if n < L + 3: continue
-        tail = sig[-L:]
-        b = s = 0
-        for i in range(n - L):
-            if sig[i:i+L] == tail:
-                if arr[i+L] == 1: b += 1
-                else: s += 1
-        tot = b + s
-        if tot >= 3:
-            p = (b + 1) / (tot + 2)
-            if abs(p - 0.5) < 0.10: continue
-            w = (L ** 1.5) * math.log(tot + 1) * min(2.0, tot / 3.0)
-            res.append(p); wts.append(w)
-    p14 = pattern_signature(arr, 14)
-    if p14 and p14 in STATE["pattern_memory"]:
-        pm = STATE["pattern_memory"][p14]
-        pb, ps = pm.get("next_big", 0), pm.get("next_small", 0)
-        if pb + ps >= 3:
-            p = (pb + 1) / (pb + ps + 2)
-            if abs(p - 0.5) >= 0.10:
-                res.append(p); wts.append(14 ** 1.5 * math.log(pb + ps + 1))
-    ss = short_sig(arr, 6)
-    if ss and ss in STATE["pattern_strength"]:
-        st = STATE["pattern_strength"][ss]
-        h, m = st.get("hits", 0), st.get("misses", 0)
-        t = h + m
-        if t >= 3:
-            acc = (h + 1) / (t + 2)
-            fq = min(1.0, t / 15.0)
-            acf = max(0.0, (acc - 0.50) * 3.0)
-            strength = fq * acf
-            if strength > 0.05:
-                boost = 1.0 + strength * 3.0
-                amp = max(0.05, min(0.95, 0.5 + (acc - 0.5) * (1.0 + strength)))
-                res.append(amp); wts.append(6 ** 1.7 * boost * math.log(t + 1))
-    if not res: return 0.5
-    return sum(p*w for p, w in zip(res, wts)) / sum(wts)
+
+    best = get_best_pattern(arr)
+    if not best: return 0.5
+    sig, L, p_hist, samples, p_recent, rn = best
+
+    # Combine hist + recent (60% hist, 40% recent)
+    if rn >= 5:
+        p_combined = p_hist * 0.6 + p_recent * 0.4
+    else:
+        p_combined = p_hist
+
+    # Strength of signal
+    deviation = abs(p_combined - 0.5)
+    if deviation < 0.05: return 0.5
+
+    # Confidence boost from length and samples
+    length_boost = min(1.0, (L - 4) / 8)  # L=5 → 0.125, L=12 → 1.0
+    sample_boost = min(1.0, samples / 20)
+
+    # Weight = base + length + samples
+    weight = 1.0 + length_boost * 2.0 + sample_boost * 1.5
+
+    # Return amplified probability
+    amplified = 0.5 + (p_combined - 0.5) * (1.0 + length_boost * 0.5 + sample_boost * 0.5)
+    return max(0.05, min(0.95, amplified))
 
 def eng_trend(arr):
     n = len(arr)
@@ -220,7 +266,6 @@ def eng_number_seq(history):
 def eng_hot_number(history):
     nums = [int(h["number"]) for h in history if h["number"] >= 0]
     if len(nums) < 20: return 0.5
-    from collections import Counter
     rec = nums[-20:]
     freq = Counter(rec)
     top = freq.most_common(3)
@@ -315,11 +360,11 @@ def eng_gambler(history):
 
 # ==================== WEIGHTS ====================
 REGIME_W = {
-    "ALTERNATING": {"pattern": 0.22, "trend": 0.09, "number_seq": 0.14, "hot_number": 0.10, "streak_break": 0.17, "rhythm": 0.13, "hot_cold": 0.08, "gambler_instinct": 0.07},
-    "BIG_HEAVY":   {"pattern": 0.19, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
-    "SMALL_HEAVY": {"pattern": 0.19, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
-    "LONG_STREAK": {"pattern": 0.16, "trend": 0.13, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.26, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.07},
-    "BALANCED":    {"pattern": 0.22, "trend": 0.12, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.11, "hot_cold": 0.09, "gambler_instinct": 0.07},
+    "ALTERNATING": {"pattern": 0.25, "trend": 0.09, "number_seq": 0.14, "hot_number": 0.10, "streak_break": 0.15, "rhythm": 0.12, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "BIG_HEAVY":   {"pattern": 0.22, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.14, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.05},
+    "SMALL_HEAVY": {"pattern": 0.22, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.14, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.05},
+    "LONG_STREAK": {"pattern": 0.20, "trend": 0.13, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.24, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.05},
+    "BALANCED":    {"pattern": 0.26, "trend": 0.12, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
 }
 
 def get_weights(regime):
@@ -348,44 +393,26 @@ def grad_update(probs, ab, lr=0.01):
         ow = st.get("gradient_weight", 1.0)
         st["gradient_weight"] = max(0.3, min(3.0, ow - lr*g))
 
-# ==================== FLIP BLACKLIST ====================
-def check_pat_flip(arr, p):
-    sig = short_sig(arr, 6)
-    if not sig: return p, False, ""
-    if sig in STATE.get("flip_blacklist", []):
-        return p, False, f"BLACKLISTED({sig})"
-    st = STATE["pattern_strength"].get(sig)
-    if not st: return p, False, ""
-    h, m = st.get("hits", 0), st.get("misses", 0)
-    t = h + m
-    if t < 5: return p, False, ""
-    acc = (h + 1) / (t + 2)
-    if acc < 0.58:
-        return 1.0 - p, True, f"ACC{acc*100:.0f}%<58%(n={t})"
-    return p, False, ""
+# ==================== PATTERN BLACKLIST ====================
+def check_pattern_blacklist(arr):
+    """Check if the BEST matching pattern is blacklisted"""
+    best = get_best_pattern(arr)
+    if not best: return False
+    sig = best[0]
+    return sig in STATE.get("pattern_blacklist", [])
 
-def update_flip_stat(sig, won):
+def update_pattern_blacklist(sig, won):
     if not sig: return
-    st = STATE.setdefault("flip_stats", {}).setdefault(sig, {"flips": 0, "wins": 0})
-    st["flips"] += 1
-    if won: st["wins"] += 1
-    if st["flips"] >= FLIP_BLACKLIST_MIN:
-        wr = st["wins"] / st["flips"]
-        if wr < FLIP_BLACKLIST_MAX_WR:
-            bl = STATE.setdefault("flip_blacklist", [])
+    if won:
+        STATE.setdefault("pattern_losses", {})[sig] = 0
+    else:
+        pl = STATE.setdefault("pattern_losses", {})
+        pl[sig] = pl.get(sig, 0) + 1
+        if pl[sig] >= PATTERN_BLACKLIST_LOSSES:
+            bl = STATE.setdefault("pattern_blacklist", [])
             if sig not in bl:
                 bl.append(sig)
-                print(f"🚫 Blacklisted flip for {sig} (WR {wr*100:.0f}%)")
-
-# ==================== ANTI-ERROR ====================
-def check_ae(arr, p):
-    sig = pattern_signature(arr)
-    if not sig: return p, False, ""
-    err = STATE.get("error_patterns", {}).get(sig)
-    if err and err.get("fail_count", 0) >= 2:
-        if err["fail_count"] / max(1, err.get("total", 1)) >= 0.6:
-            return 1.0 - p, True, f"AE({err['fail_count']}x)"
-    return p, False, ""
+                print(f"🚫 Pattern blacklisted: {sig} ({pl[sig]} losses)")
 
 # ==================== SIGNAL LABEL ====================
 def sig_label(c):
@@ -396,9 +423,25 @@ def sig_label(c):
     if d < 0.15: return "🟩 STRONG"
     return "🟢 V.STRONG"
 
+def get_form_label():
+    form = STATE.get("bot_recent_form", [])
+    if len(form) < 3: return "N/A"
+    hot_s = 0
+    for r in reversed(form):
+        if r == 1: hot_s += 1
+        else: break
+    cold_s = 0
+    for r in reversed(form):
+        if r == 0: cold_s += 1
+        else: break
+    r5 = form[-5:]
+    fs = f"{sum(r5)}/{len(r5)}"
+    if hot_s >= 3: return f"🔥 HOT ({fs})"
+    if cold_s >= 3: return f"❄️ COLD ({fs})"
+    return f"😐 NEUTRAL ({fs})"
+
 # ==================== NUMBER PREDICTOR ====================
 def predict_number(history, direction):
-    from collections import Counter
     nums = [int(h["number"]) for h in history if h["number"] >= 0]
     sizes = [h["size"] for h in history if h["number"] >= 0]
     if len(nums) < 40: return 8 if direction == 1 else 2
@@ -429,8 +472,10 @@ def predict_number(history, direction):
 # ==================== MAIN PREDICTOR ====================
 def predict_next(history):
     arr = [h["size"] for h in history]
+    pat_blacklisted = check_pattern_blacklist(arr)
+
     probs = {
-        "pattern": eng_pattern(arr),
+        "pattern": eng_pattern(arr) if not pat_blacklisted else 0.5,
         "trend": eng_trend(arr),
         "number_seq": eng_number_seq(history),
         "hot_number": eng_hot_number(history),
@@ -444,47 +489,46 @@ def predict_next(history):
     p = combine(probs, wts)
     pred = entropy(arr)
     p = (0.5 + (p-0.5)*(0.5 + pred*0.5)) if p > 0.5 else (0.5 - (0.5-p)*(0.5 + pred*0.5))
-    p, ae_a, ae_r = check_ae(arr, p)
-    p, pf_a, pf_r = check_pat_flip(arr, p)
+
+    direction = 1 if p >= 0.5 else 0
+    agree_count = 0
+    for e, prob in probs.items():
+        if (prob > 0.52 and direction == 1) or (prob < 0.48 and direction == 0):
+            agree_count += 1
+
     base = max(p, 1-p)
     conf = max(0.50, min(0.95, base))
     lab = sig_label(conf)
     ps = 1 if p >= 0.5 else 0
+
     nums = [h["number"] for h in history if h["number"] >= 0]
-    from collections import Counter
     hot = Counter(nums[-20:]).most_common(1) if len(nums) >= 20 else None
-    p14 = pattern_signature(arr)
-    ss = short_sig(arr, 6) or "N/A"
-    snote = ""; slab = ""
-    if ss != "N/A" and ss in STATE["pattern_strength"]:
-        st = STATE["pattern_strength"][ss]
-        h, m = st.get("hits", 0), st.get("misses", 0)
-        t = h + m
-        if t >= 3:
-            acc = (h + 1) / (t + 2)
-            snote = f"Acc:{acc*100:.0f}%(n={t})"
-            acf = max(0.0, (acc - 0.50) * 3.0)
-            stg = min(1.0, t/15.0) * acf
-            if stg >= 0.6: slab = "🔥 SUPER"
-            elif stg >= 0.3: slab = "⭐ STRONG"
-            elif stg >= 0.1: slab = "○ WEAK"
-            else: slab = "💤 FLAT"
-    form = STATE.get("bot_recent_form", [])
-    if form:
-        r5 = form[-5:]
-        fs = f"{sum(r5)}/{len(r5)}"
-        hot_s = sum(1 for r in reversed(form) if r == 1)
-        cold_s = sum(1 for r in reversed(form) if r == 0)
-        if hot_s >= 3: fl = f"🔥 HOT ({fs})"
-        elif cold_s >= 3: fl = f"❄️ COLD ({fs})"
-        else: fl = f"😐 NEUTRAL ({fs})"
-    else: fl = "N/A"
+
+    # 🔥 Get best pattern info for display
+    best = get_best_pattern(arr)
+    best_sig = "N/A"; best_len = 0; best_note = ""; best_label = ""
+    if best:
+        sig, L, p_hist, samples, p_recent, rn = best
+        best_sig = f"{L}-{sig}"
+        # Label based on best accuracy
+        use_p = p_hist if rn < 5 else (p_hist * 0.6 + p_recent * 0.4)
+        dev = abs(use_p - 0.5)
+        if dev >= 0.15: best_label = "🔥 SUPER"
+        elif dev >= 0.08: best_label = "⭐ STRONG"
+        elif dev >= 0.04: best_label = "○ WEAK"
+        else: best_label = "💤 FLAT"
+        best_note = f"H:{p_hist*100:.0f}%(n={samples}) R:{p_recent*100:.0f}%(n={rn})"
+    elif pat_blacklisted:
+        best_label = "🚫 BLACKLISTED"
+
+    form_label = get_form_label()
+
     return {"pred_size": ps, "conf": conf, "lab": lab,
             "probs": probs, "wts": wts, "regime": regime, "entropy": pred,
-            "sig": p14, "ss": ss, "snote": snote, "slab": slab,
-            "form": fl, "hot": hot, "ae_a": ae_a, "ae_r": ae_r,
-            "pf_a": pf_a, "pf_r": pf_r,
-            "ae_flipped": ae_a, "pf_flipped": pf_a}
+            "best_sig": best_sig, "best_len": best_len,
+            "best_note": best_note, "best_label": best_label,
+            "form": form_label, "hot": hot, "agree": agree_count,
+            "pat_blacklisted": pat_blacklisted}
 
 # ==================== STATS ====================
 def upd_eng_stats(probs, ab, reg):
@@ -513,21 +557,14 @@ def upd_global(win):
         STATE["current_loss_streak"] = STATE.get("current_loss_streak", 0) + 1
         STATE["max_b2b_loss"] = max(STATE.get("max_b2b_loss", 0), STATE["current_loss_streak"])
         STATE["current_level"] = min(STATE.get("current_level", 1) + 1, MAX_LEVEL)
+        if STATE["current_loss_streak"] >= MAX_LOSS_STREAK_HARD:
+            STATE["cooldown_until"] = time.time() + 300
+            STATE["current_level"] = 1
+            STATE["current_loss_streak"] = 0
+            print("🛑 Hard reset after 5 losses")
     f = STATE.setdefault("bot_recent_form", [])
     f.append(1 if win else 0)
     STATE["bot_recent_form"] = f[-20:]
-
-def upd_pat_mem(sig, ab):
-    if not sig: return
-    pm = STATE.setdefault("pattern_memory", {}).setdefault(sig, {"next_big": 0, "next_small": 0})
-    if ab: pm["next_big"] += 1
-    else: pm["next_small"] += 1
-
-def upd_pat_strength(sig, ab, pred_big):
-    if not sig: return
-    st = STATE.setdefault("pattern_strength", {}).setdefault(sig, {"hits": 0, "misses": 0})
-    if ab == pred_big: st["hits"] += 1
-    else: st["misses"] += 1
 
 # ==================== FORMAT ====================
 def fmt_history(history):
@@ -548,14 +585,8 @@ def fmt_footer():
     mb = STATE.get("max_b2b_loss", 0); cs = STATE.get("current_loss_streak", 0)
     lv = STATE.get("current_level", 1)
     t = w + l; wr = (w/t*100) if t > 0 else 0.0
-    pats = len(STATE.get("pattern_memory", {}))
-    errs = len(STATE.get("error_patterns", {}))
-    nums_db = len(STATE.get("number_memory", {}))
-    strong = len(STATE.get("pattern_strength", {}))
-    pflips = STATE.get("pattern_flips", 0)
-    pw = STATE.get("pattern_flips_won", 0)
-    pa = (pw/pflips*100) if pflips > 0 else 0.0
-    bl = len(STATE.get("flip_blacklist", []))
+    pacc = len(STATE.get("pattern_accuracy", {}))
+    pbl = len(STATE.get("pattern_blacklist", []))
     lvl_s = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
     return (f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 *LIFETIME*\n"
@@ -563,10 +594,7 @@ def fmt_footer():
             f"📉 *Max B2B:* `{mb}` | 🔥 *Streak:* `{cs}`\n"
             f"🎯 *WR:* `{wr:.1f}%`\n"
             f"💰 *Level:* `{lv}` ({lvl_s})\n"
-            f"🧠 *Pat:* `{pats}` | 💪 *Strong:* `{strong}`\n"
-            f"🔢 *Num:* `{nums_db}` | ⚠️ *Err:* `{errs}`\n"
-            f"🔄 *Flips:* `{pflips}` ({pa:.0f}% won)\n"
-            f"🚫 *Blacklisted:* `{bl}`")
+            f"🧬 *Sig-DB:* `{pacc}` | 🚫 *BL:* `{pbl}`")
 
 # ==================== TELEGRAM ====================
 async def tg_send(session, msg):
@@ -593,16 +621,12 @@ async def fetch_data(session):
                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     d = await r.json()
-                    # 🔥 ROBUST FETCH — handles multiple response formats
                     if isinstance(d, dict):
                         if "data" in d and isinstance(d["data"], dict) and "list" in d["data"]:
                             return d["data"]["list"]
-                        if "list" in d:
-                            return d["list"]
-                    elif isinstance(d, list):
-                        return d
-        except Exception as e:
-            print(f"API att {att}: {e}")
+                        if "list" in d: return d["list"]
+                    elif isinstance(d, list): return d
+        except Exception as e: print(f"API att {att}: {e}")
         await asyncio.sleep(2 ** att)
     return None
 
@@ -611,7 +635,7 @@ class Bot:
     def __init__(self): self.pending = None
 
     async def run(self, session):
-        print("🚀 QUANTUM V28.5.1 BOT STARTED")
+        print("🚀 QUANTUM V28.5.4 STARTED")
         while True:
             try: await self.step(session)
             except Exception as e:
@@ -620,6 +644,10 @@ class Bot:
             await asyncio.sleep(5)
 
     async def step(self, session):
+        if time.time() < STATE.get("cooldown_until", 0):
+            await asyncio.sleep(5)
+            return
+
         raw = await fetch_data(session)
         if not raw: return
         history = validate(raw)
@@ -638,15 +666,17 @@ class Bot:
             actual_s = "BIGGG" if ab else "SMALL"
             win = actual_s == self.pending["pred_size"]
             upd_global(win)
-            upd_pat_mem(self.pending.get("p14"), ab)
-            if self.pending.get("ss"):
-                upd_pat_strength(self.pending["ss"], ab, pred_big)
-            if self.pending.get("pf_flipped"):
-                STATE["pattern_flips"] = STATE.get("pattern_flips", 0) + 1
-                if win: STATE["pattern_flips_won"] = STATE.get("pattern_flips_won", 0) + 1
-                update_flip_stat(self.pending.get("ss"), win)
-            if self.pending.get("ae_flipped"):
-                STATE["learned_overrides"] = STATE.get("learned_overrides", 0) + 1
+
+            # Update pattern accuracy for all lengths
+            if len(arr) >= 2:
+                arr_before = arr[:-1]
+                update_pattern_accuracy(arr_before, ab)
+
+            # Blacklist tracking
+            if self.pending.get("best_sig"):
+                sig_str = self.pending["best_sig"].split("-", 1)[-1]  # remove length prefix
+                update_pattern_blacklist(sig_str, win)
+
             if win: asyncio.create_task(tg_sticker(session))
             self.pending = None
 
@@ -658,9 +688,8 @@ class Bot:
             self.pending = {
                 "last_issue": li, "next_issue": ni,
                 "pred_size": "BIGGG" if pred["pred_size"] == 1 else "SMALL",
-                "pred_number": pn, "probs": pred["probs"], "p14": pred["sig"],
-                "ss": pred["ss"], "ae_flipped": pred["ae_flipped"],
-                "pf_flipped": pred["pf_flipped"]
+                "pred_number": pn, "probs": pred["probs"],
+                "best_sig": pred["best_sig"],
             }
             STATE.setdefault("prediction_memory", {})[str(ni)] = {"size": self.pending["pred_size"], "number": pn}
 
@@ -670,28 +699,32 @@ class Bot:
             cons2 = f"BRK:{ep['streak_break']:.2f} RHY:{ep['rhythm']:.2f} HCD:{ep['hot_cold']:.2f} GMB:{ep['gambler_instinct']:.2f}"
             wstr = " ".join(f"{k[:3].upper()}:{v:.2f}" for k, v in pred["wts"].items())
 
-            ae = f"\n🚨 *AE-FLIP:* `{pred['ae_r']}`" if pred["ae_flipped"] else ""
-            pf = ""
-            if pred["pf_flipped"]: pf = f"\n🔄 *PAT-FLIP:* `{pred['pf_r']}`"
-            elif "BLACKLISTED" in (pred["pf_r"] or ""): pf = f"\n🚫 *FLIP SKIPPED:* `{pred['pf_r']}`"
             hot = f"\n🔥 *Hot:* `{pred['hot'][0][0]}` ({pred['hot'][0][1]}x)" if pred["hot"] else ""
-            stg = f"\n💪 *Pattern:* `{pred['slab']}` {pred['snote']}" if pred["snote"] else ""
+
+            # 🔥 Best pattern display
+            pat_display = ""
+            if pred["best_label"]:
+                pat_display = f"\n🎯 *Best Sig:* `{pred['best_sig']}`\n"
+                pat_display += f"💪 *Pattern:* `{pred['best_label']}`"
+                if pred["best_note"]:
+                    pat_display += f"\n   {pred['best_note']}"
+
             lv = STATE.get("current_level", 1)
             fund = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
             footer = fmt_footer()
 
-            msg = (f"🎯 *QUANTUM V28.5.1 ADAPTIVE* 🎯\n"
+            msg = (f"🎯 *QUANTUM V28.5.4 MULTI-SIG* 🎯\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                    f"📌 *Period:* `{ni}`\n"
                    f"🎲 *Number:* `{pn}`\n"
                    f"🔥 *Target:* *{'BIGGG 🟢' if pred['pred_size'] == 1 else 'SMALL 🔴'}*\n"
                    f"📊 *Conf:* `{pred['conf']*100:.1f}%` | {pred['lab']}\n"
                    f"🎰 *Form:* {pred['form']}\n"
+                   f"🎯 *Agreement:* `{pred['agree']}/8`\n"
                    f"📈 *Regime:* `{pred['regime']}` | *Ent:* `{pred['entropy']:.2f}`\n"
                    f"💰 *Fund:* `{fund}` (Level {lv})"
-                   f"{ae}{pf}\n"
-                   f"🧩 *Size Sig:* `{pred['sig'] or 'N/A'}`\n"
-                   f"🎯 *Short Sig:* `{pred['ss']}`{stg}\n"
+                   f"{pat_display}"
+                   f"{hot}\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                    f"🧠 *8-Engine:*\n`{cons1}`\n`{cons2}`\n"
                    f"⚖️ *Weights:* `{wstr}`\n"
@@ -705,28 +738,20 @@ class Bot:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    print("Warmup V28.5.1...")
+    print("Warmup V28.5.4...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate(raw)
     if len(history) < 100: return
-    for i in range(14, len(history) - 1):
-        part = history[:i]; a = [h["size"] for h in part]
-        sg = pattern_signature(a, 14)
-        if sg:
-            nb = history[i]["size"] == 1
-            pm = STATE.setdefault("pattern_memory", {}).setdefault(sg, {"next_big": 0, "next_small": 0})
-            if nb: pm["next_big"] += 1
-            else: pm["next_small"] += 1
-    for i in range(6, len(history) - 1):
-        part = history[:i]; a = [h["size"] for h in part]
-        ss = short_sig(a, 6)
-        if not ss: continue
-        try:
-            pr = predict_next(part)
-            ab = history[i]["size"] == 1
-            upd_pat_strength(ss, ab, pr["pred_size"] == 1)
-        except: continue
+
+    # 🔥 Seed pattern accuracy across all lengths 5-12
+    arr = [h["size"] for h in history]
+    for i in range(5, len(arr)):
+        arr_before = arr[:i]
+        actual = arr[i]
+        update_pattern_accuracy(arr_before, actual)
+
+    # Warm engine stats
     for i in range(50, len(history) - 1):
         part = history[:i]; a = [h["size"] for h in part]
         reg = detect_regime(a)
@@ -737,10 +762,10 @@ async def warmup(session):
             grad_update(pr["probs"], ab)
         except: continue
     save_state()
-    print(f"Warmup done. Pat:{len(STATE.get('pattern_memory', {}))} Strong:{len(STATE.get('pattern_strength', {}))}")
+    print(f"Warmup done. Sig-DB:{len(STATE.get('pattern_accuracy', {}))} Engines:{len(STATE.get('engine_stats', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V28.5.1 ADAPTIVE ACTIVE", status=200)
+async def health(r): return web.Response(text="V28.5.4 MULTI-SIG ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get("/", health)
