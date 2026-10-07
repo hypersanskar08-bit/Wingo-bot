@@ -15,11 +15,15 @@ WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g
 
 BET_LEVELS = [1.0, 2.5]
 MAX_LEVEL = 2
-
-# 🔥 SHORT SIG LENGTHS (replaces 14-length size sig)
 SHORT_LENGTHS = [5, 6, 7, 8, 9, 10, 11, 12]
 
-# Pattern blacklist
+# 🔥 PATTERN RULES
+TOP_ACC_THRESHOLD = 0.67     # 67%+ = TOP (needs n>=30)
+TOP_MIN_SAMPLES = 30
+STRONG_ACC_THRESHOLD = 0.59  # 59%+ = STRONG (no flip)
+FLIP_MAX_ACC = 0.40          # ≤40% flip (needs n>=30)
+FLIP_MIN_SAMPLES = 30
+
 PATTERN_BLACKLIST_LOSSES = 3
 MAX_LOSS_STREAK_HARD = 5
 
@@ -31,19 +35,15 @@ def _default_eng():
 ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break",
            "rhythm", "hot_cold", "gambler_instinct"]
 
-STATE_FILE = "engine_state_v28_5_4.json"
+STATE_FILE = "engine_state_v28_5_5.json"
 STATE = {
     "engine_stats": {e: _default_eng() for e in ENGINES},
-    "number_memory": {},
-    "pattern_accuracy": {},       # sig → {"big": N, "small": N}
-    "pattern_recent": {},         # sig → last 20 outcomes
-    "pattern_blacklist": [],
-    "pattern_losses": {},         # sig → consecutive losses
+    "number_memory": {}, "pattern_accuracy": {}, "pattern_recent": {},
+    "pattern_blacklist": [], "pattern_losses": {},
     "total_wins": 0, "total_losses": 0,
     "current_level": 1, "current_loss_streak": 0, "max_b2b_loss": 0,
-    "bot_recent_form": [],
-    "prediction_memory": {}, "last_processed_issue": 0, "calibration_offset": 0.0,
-    "cooldown_until": 0,
+    "bot_recent_form": [], "prediction_memory": {},
+    "last_processed_issue": 0, "calibration_offset": 0.0, "cooldown_until": 0,
 }
 
 def load_state():
@@ -75,7 +75,6 @@ load_state()
 
 # ==================== HELPERS ====================
 def make_sig(arr, length):
-    """Build signature string of given length"""
     if len(arr) < length: return None
     return "".join("B" if x else "S" for x in arr[-length:])
 
@@ -115,12 +114,8 @@ def entropy(arr, w=40):
     if p1 in (0, 1): return 0.0
     return max(0.0, 1.0 - (-(p1*math.log2(p1) + (1-p1)*math.log2(1-p1))))
 
-# ==================== 🔥 PATTERN ACCURACY TRACKER (Multi-Length) ====================
+# ==================== PATTERN ACCURACY TRACKER ====================
 def update_pattern_accuracy(arr_before, actual_next):
-    """
-    Called AFTER outcome is known.
-    Track ALL short lengths (5-12).
-    """
     for L in SHORT_LENGTHS:
         if len(arr_before) < L: continue
         sig = make_sig(arr_before, L)
@@ -128,13 +123,11 @@ def update_pattern_accuracy(arr_before, actual_next):
         pa = STATE.setdefault("pattern_accuracy", {}).setdefault(sig, {"big": 0, "small": 0})
         if actual_next == 1: pa["big"] += 1
         else: pa["small"] += 1
-        # Recent list
         pr = STATE.setdefault("pattern_recent", {}).setdefault(sig, [])
         pr.append(actual_next)
         if len(pr) > 20: STATE["pattern_recent"][sig] = pr[-20:]
 
 def get_sig_probability(arr, L):
-    """Raw probability for signature of length L"""
     if len(arr) < L: return 0.5, 0
     sig = make_sig(arr, L)
     if not sig: return 0.5, 0
@@ -143,8 +136,7 @@ def get_sig_probability(arr, L):
     b, s = pa.get("big", 0), pa.get("small", 0)
     t = b + s
     if t == 0: return 0.5, 0
-    p = (b + 1) / (t + 2)
-    return p, t
+    return (b + 1) / (t + 2), t
 
 def get_sig_recent_prob(arr, L, window=10):
     if len(arr) < L: return 0.5, 0
@@ -157,12 +149,28 @@ def get_sig_recent_prob(arr, L, window=10):
     b = sum(recent)
     return (b + 1) / (len(recent) + 2), len(recent)
 
+# 🔥 CORE LOGIC: Apply rules
+def apply_pattern_rules(p_raw, n):
+    """
+    Returns (final_prob, flipped, tag)
+    
+    Rules:
+    - 67%+ AND n>=30 → TOP priority (no flip)
+    - 59%+ → STRONG (no flip)
+    - ≤40% AND n>=30 → FLIP
+    - Everything else (FLAT/WEAK) → CONTRARIAN (flip)
+    """
+    if p_raw >= TOP_ACC_THRESHOLD and n >= TOP_MIN_SAMPLES:
+        return p_raw, False, "TOP"
+    if p_raw >= STRONG_ACC_THRESHOLD:
+        return p_raw, False, "STRONG"
+    if p_raw <= FLIP_MAX_ACC and n >= FLIP_MIN_SAMPLES:
+        return 1.0 - p_raw, True, "FLIP"
+    # FLAT (46-54%) or WEAK (54-58.9%) or 40-46% → contrarian
+    return 1.0 - p_raw, True, "CONTRARIAN"
+
 def get_best_pattern(arr):
-    """
-    Find the best pattern across all short lengths (5-12).
-    Priority: longer length > higher samples > higher accuracy
-    Returns: (sig, length, prob, samples, recent_prob, recent_n)
-    """
+    """Find best pattern applying all rules"""
     best = None
     best_score = -1
     for L in SHORT_LENGTHS:
@@ -170,46 +178,66 @@ def get_best_pattern(arr):
         sig = make_sig(arr, L)
         if not sig: continue
         if sig in STATE.get("pattern_blacklist", []): continue
-        p, n = get_sig_probability(arr, L)
+        p_raw, n = get_sig_probability(arr, L)
         if n < 3: continue
-        # Score: length weight + accuracy strength + sample boost
+
+        # Apply rules
+        p, was_flipped, tag = apply_pattern_rules(p_raw, n)
+
         deviation = abs(p - 0.5)
+        # Score: length + deviation + sample boost
         score = (L * 0.05) + (deviation * 3) + min(1.0, n / 15) * 0.3
+        # Priority boosts
+        if tag == "TOP":
+            score += 1.5
+        elif tag == "STRONG":
+            score += 0.5
+        elif was_flipped:
+            score += 0.3
+
         if score > best_score:
-            rp, rn = get_sig_recent_prob(arr, L, 10)
+            rp_raw, rn = get_sig_recent_prob(arr, L, 10)
+            # Apply same rules to recent
+            if rn >= 5:
+                rp, _, _ = apply_pattern_rules(rp_raw, rn)
+            else:
+                rp = rp_raw
             best_score = score
-            best = (sig, L, p, n, rp, rn)
+            best = (sig, L, p, n, rp, rn, was_flipped, tag, p_raw)
     return best
 
 # ==================== ENGINES ====================
 def eng_pattern(arr):
-    """Pattern engine using multi-length short sigs (5-12)"""
     n = len(arr)
     if n < 15: return 0.5
-
     best = get_best_pattern(arr)
     if not best: return 0.5
-    sig, L, p_hist, samples, p_recent, rn = best
+    sig, L, p_hist, samples, p_recent, rn, was_flipped, tag, p_raw = best
 
-    # Combine hist + recent (60% hist, 40% recent)
     if rn >= 5:
         p_combined = p_hist * 0.6 + p_recent * 0.4
     else:
         p_combined = p_hist
 
-    # Strength of signal
     deviation = abs(p_combined - 0.5)
-    if deviation < 0.05: return 0.5
+    if deviation < 0.03: return 0.5
 
-    # Confidence boost from length and samples
-    length_boost = min(1.0, (L - 4) / 8)  # L=5 → 0.125, L=12 → 1.0
+    length_boost = min(1.0, (L - 4) / 8)
     sample_boost = min(1.0, samples / 20)
 
-    # Weight = base + length + samples
-    weight = 1.0 + length_boost * 2.0 + sample_boost * 1.5
+    # Top priority gets extra boost
+    if tag == "TOP":
+        boost = 1.5
+    elif tag == "STRONG":
+        boost = 1.2
+    elif tag == "FLIP":
+        boost = 1.2
+    elif tag == "CONTRARIAN":
+        boost = 1.0
+    else:
+        boost = 1.0
 
-    # Return amplified probability
-    amplified = 0.5 + (p_combined - 0.5) * (1.0 + length_boost * 0.5 + sample_boost * 0.5)
+    amplified = 0.5 + (p_combined - 0.5) * (1.0 + length_boost * 0.5 + sample_boost * 0.5) * boost
     return max(0.05, min(0.95, amplified))
 
 def eng_trend(arr):
@@ -360,11 +388,11 @@ def eng_gambler(history):
 
 # ==================== WEIGHTS ====================
 REGIME_W = {
-    "ALTERNATING": {"pattern": 0.25, "trend": 0.09, "number_seq": 0.14, "hot_number": 0.10, "streak_break": 0.15, "rhythm": 0.12, "hot_cold": 0.08, "gambler_instinct": 0.07},
-    "BIG_HEAVY":   {"pattern": 0.22, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.14, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.05},
-    "SMALL_HEAVY": {"pattern": 0.22, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.14, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.05},
-    "LONG_STREAK": {"pattern": 0.20, "trend": 0.13, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.24, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.05},
-    "BALANCED":    {"pattern": 0.26, "trend": 0.12, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "ALTERNATING": {"pattern": 0.28, "trend": 0.08, "number_seq": 0.12, "hot_number": 0.10, "streak_break": 0.14, "rhythm": 0.11, "hot_cold": 0.10, "gambler_instinct": 0.07},
+    "BIG_HEAVY":   {"pattern": 0.25, "trend": 0.15, "number_seq": 0.12, "hot_number": 0.11, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.06},
+    "SMALL_HEAVY": {"pattern": 0.25, "trend": 0.15, "number_seq": 0.12, "hot_number": 0.11, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.06},
+    "LONG_STREAK": {"pattern": 0.22, "trend": 0.12, "number_seq": 0.09, "hot_number": 0.09, "streak_break": 0.24, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.05},
+    "BALANCED":    {"pattern": 0.28, "trend": 0.11, "number_seq": 0.12, "hot_number": 0.10, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.07},
 }
 
 def get_weights(regime):
@@ -395,11 +423,9 @@ def grad_update(probs, ab, lr=0.01):
 
 # ==================== PATTERN BLACKLIST ====================
 def check_pattern_blacklist(arr):
-    """Check if the BEST matching pattern is blacklisted"""
     best = get_best_pattern(arr)
     if not best: return False
-    sig = best[0]
-    return sig in STATE.get("pattern_blacklist", [])
+    return best[0] in STATE.get("pattern_blacklist", [])
 
 def update_pattern_blacklist(sig, won):
     if not sig: return
@@ -504,20 +530,28 @@ def predict_next(history):
     nums = [h["number"] for h in history if h["number"] >= 0]
     hot = Counter(nums[-20:]).most_common(1) if len(nums) >= 20 else None
 
-    # 🔥 Get best pattern info for display
+    # Best pattern info
     best = get_best_pattern(arr)
-    best_sig = "N/A"; best_len = 0; best_note = ""; best_label = ""
+    best_sig = "N/A"; best_note = ""; best_label = ""
     if best:
-        sig, L, p_hist, samples, p_recent, rn = best
+        sig, L, p_hist, samples, p_recent, rn, was_flipped, tag, p_raw = best
         best_sig = f"{L}-{sig}"
-        # Label based on best accuracy
         use_p = p_hist if rn < 5 else (p_hist * 0.6 + p_recent * 0.4)
         dev = abs(use_p - 0.5)
-        if dev >= 0.15: best_label = "🔥 SUPER"
-        elif dev >= 0.08: best_label = "⭐ STRONG"
-        elif dev >= 0.04: best_label = "○ WEAK"
-        else: best_label = "💤 FLAT"
-        best_note = f"H:{p_hist*100:.0f}%(n={samples}) R:{p_recent*100:.0f}%(n={rn})"
+        if tag == "TOP":
+            best_label = "🏆 TOP PRIORITY"
+        elif tag == "STRONG":
+            best_label = "⭐ STRONG"
+        elif tag == "FLIP":
+            best_label = "🔄 STRONG-FLIP"
+        elif tag == "CONTRARIAN":
+            best_label = "↔️ CONTRARIAN"
+        else:
+            best_label = "○ WEAK"
+        if was_flipped:
+            best_note = f"Raw:{p_raw*100:.0f}% → Flipped:{p_hist*100:.0f}% (n={samples})"
+        else:
+            best_note = f"H:{p_hist*100:.0f}%(n={samples}) R:{p_recent*100:.0f}%(n={rn})"
     elif pat_blacklisted:
         best_label = "🚫 BLACKLISTED"
 
@@ -525,8 +559,7 @@ def predict_next(history):
 
     return {"pred_size": ps, "conf": conf, "lab": lab,
             "probs": probs, "wts": wts, "regime": regime, "entropy": pred,
-            "best_sig": best_sig, "best_len": best_len,
-            "best_note": best_note, "best_label": best_label,
+            "best_sig": best_sig, "best_note": best_note, "best_label": best_label,
             "form": form_label, "hot": hot, "agree": agree_count,
             "pat_blacklisted": pat_blacklisted}
 
@@ -635,7 +668,7 @@ class Bot:
     def __init__(self): self.pending = None
 
     async def run(self, session):
-        print("🚀 QUANTUM V28.5.4 STARTED")
+        print("🚀 QUANTUM V28.5.5 STARTED")
         while True:
             try: await self.step(session)
             except Exception as e:
@@ -657,7 +690,6 @@ class Bot:
         arr = [h["size"] for h in history]
         regime = detect_regime(arr)
 
-        # EVALUATE
         if self.pending and self.pending["next_issue"] == li:
             ab = last["size"] == 1
             pred_big = self.pending["pred_size"] == "BIGGG"
@@ -667,20 +699,17 @@ class Bot:
             win = actual_s == self.pending["pred_size"]
             upd_global(win)
 
-            # Update pattern accuracy for all lengths
             if len(arr) >= 2:
                 arr_before = arr[:-1]
                 update_pattern_accuracy(arr_before, ab)
 
-            # Blacklist tracking
             if self.pending.get("best_sig"):
-                sig_str = self.pending["best_sig"].split("-", 1)[-1]  # remove length prefix
+                sig_str = self.pending["best_sig"].split("-", 1)[-1]
                 update_pattern_blacklist(sig_str, win)
 
             if win: asyncio.create_task(tg_sticker(session))
             self.pending = None
 
-        # PREDICT
         if not self.pending or self.pending["last_issue"] != li:
             pred = predict_next(history)
             ni = li + 1
@@ -701,7 +730,6 @@ class Bot:
 
             hot = f"\n🔥 *Hot:* `{pred['hot'][0][0]}` ({pred['hot'][0][1]}x)" if pred["hot"] else ""
 
-            # 🔥 Best pattern display
             pat_display = ""
             if pred["best_label"]:
                 pat_display = f"\n🎯 *Best Sig:* `{pred['best_sig']}`\n"
@@ -713,7 +741,7 @@ class Bot:
             fund = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
             footer = fmt_footer()
 
-            msg = (f"🎯 *QUANTUM V28.5.4 MULTI-SIG* 🎯\n"
+            msg = (f"🎯 *QUANTUM V28.5.5 SMART* 🎯\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                    f"📌 *Period:* `{ni}`\n"
                    f"🎲 *Number:* `{pn}`\n"
@@ -738,20 +766,16 @@ class Bot:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    print("Warmup V28.5.4...")
+    print("Warmup V28.5.5...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate(raw)
     if len(history) < 100: return
-
-    # 🔥 Seed pattern accuracy across all lengths 5-12
     arr = [h["size"] for h in history]
     for i in range(5, len(arr)):
         arr_before = arr[:i]
         actual = arr[i]
         update_pattern_accuracy(arr_before, actual)
-
-    # Warm engine stats
     for i in range(50, len(history) - 1):
         part = history[:i]; a = [h["size"] for h in part]
         reg = detect_regime(a)
@@ -762,10 +786,10 @@ async def warmup(session):
             grad_update(pr["probs"], ab)
         except: continue
     save_state()
-    print(f"Warmup done. Sig-DB:{len(STATE.get('pattern_accuracy', {}))} Engines:{len(STATE.get('engine_stats', {}))}")
+    print(f"Warmup done. Sig-DB:{len(STATE.get('pattern_accuracy', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V28.5.4 MULTI-SIG ACTIVE", status=200)
+async def health(r): return web.Response(text="V28.5.5 SMART ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get("/", health)
