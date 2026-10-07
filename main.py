@@ -11,27 +11,33 @@ import aiohttp
 from aiohttp import web
 
 # ==================== CONFIG ====================
-API_URL = os.environ.get("API_URL", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500")
+API_URL = os.environ.get("API_URL", "https://sky-predictor-1012593183186417.asia-southeast1.run.app/api/wingo-history-1m-500")
+API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8611789455:AAFcnSZ7nlrCIPsQUKLQwdmTf2aw2szmLFk")
 CHAT_ID = os.environ.get("CHAT_ID", "1264164655")
 WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ")
 # ================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("QuantumV32_1")
+logger = logging.getLogger("QuantumV34")
 handler = RotatingFileHandler('bot.log', maxBytes=5*1024*1024, backupCount=2)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
-STATE_FILE = "engine_state_v32_1.json"
+STATE_FILE = "engine_state_v34.json"
 PATTERN_SIG_LEN = 14
-ERROR_SIG_LEN = 8  # 🔥 FIX 1: Error signature short kiya
 PATTERN_LENGTHS = [4, 6, 8, 10, 12, 14]
+ERROR_SIG_LEN = 8
 ERROR_THRESHOLD = 2
-SIMILAR_ERROR_RADIUS = 1
 HOT_NUMBER_WINDOW = 20
+HOT_NUMBER_MIN_DOMINANCE = 0.35
 ARITH_WINDOW = 40
 BET_LEVELS = [1.0, 2.5, 6.0, 12.0]
+
+# 🔥 PATTERN PRIORITY thresholds
+PATTERN_MIN_SAMPLES = 5
+PATTERN_GOOD_ACC = 0.60   # >=60% = high priority
+PATTERN_GREAT_ACC = 0.70  # >=70% = super priority
 
 # ==================== STATE ====================
 def default_engine_state():
@@ -39,14 +45,11 @@ def default_engine_state():
         "alpha": 1.0, "beta": 1.0,
         "hits": 0, "misses": 0, "total": 0,
         "recent_hits": 0, "recent_total": 0,
-        "brier_sum": 0.0, "gradient_weight": 1.0,
-        "regime_stats": {}
+        "gradient_weight": 1.0,
     }
 
-# 🔥 Removed dead engines (jack, skip, vshape, cyclic, mirror)
-ENGINES = ["pattern", "trend", "arith", "symmetry", "opposite",
-           "number_seq", "repeated_num", "double_detect", "overlap_series",
-           "connected_series", "auto_formula"]
+ENGINES = ["pattern", "trend", "trend_shift", "trend_follow", "slope",
+           "number_seq", "hot_number", "streak_break", "arith", "double_detect"]
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -55,19 +58,14 @@ def load_state():
             for eng in ENGINES:
                 if eng not in s.get("engine_stats", {}):
                     s.setdefault("engine_stats", {})[eng] = default_engine_state()
-            # Remove dead engines
-            for dead in ["mirror", "cyclic", "vshape", "skip_series", "jack_corr"]:
-                if dead in s.get("engine_stats", {}):
-                    del s["engine_stats"][dead]
             s.setdefault("total_wins", 0); s.setdefault("total_losses", 0)
             s.setdefault("current_loss_streak", 0); s.setdefault("max_b2b_loss", 0)
             s.setdefault("current_level", 1)
             s.setdefault("pattern_memory", {}); s.setdefault("error_patterns", {})
+            s.setdefault("pattern_stats", {})  # 🔥 NEW: Per-pattern accuracy
             s.setdefault("calibration_offset", 0.0); s.setdefault("learned_overrides", 0)
-            s.setdefault("number_memory", {}); s.setdefault("hot_numbers", {})
-            s.setdefault("arith_rules", {}); s.setdefault("trans_memory", {})
-            s.setdefault("series_history", {}); s.setdefault("connected_history", {})
-            s.setdefault("auto_formulas", {})
+            s.setdefault("number_memory", {})
+            s.setdefault("confidence_buckets", {})  # 🔥 NEW: Calibration
             return s
         except Exception as e:
             logger.error(f"State load error: {e}")
@@ -77,18 +75,15 @@ def load_state():
         "calibration_offset": 0.0, "total_wins": 0, "total_losses": 0,
         "current_loss_streak": 0, "max_b2b_loss": 0, "current_level": 1,
         "pattern_memory": {}, "error_patterns": {}, "gradient_lr": 0.01,
-        "learned_overrides": 0, "number_memory": {}, "hot_numbers": {},
-        "arith_rules": {}, "trans_memory": {}, "series_history": {},
-        "connected_history": {}, "auto_formulas": {}
+        "learned_overrides": 0, "number_memory": {},
+        "pattern_stats": {}, "confidence_buckets": {}
     }
 
 def save_state(state):
     try:
         for key, cap in [("prediction_memory", 500), ("pattern_memory", 5000),
                          ("error_patterns", 500), ("number_memory", 5000),
-                         ("arith_rules", 3000), ("trans_memory", 5000),
-                         ("series_history", 5000), ("connected_history", 3000),
-                         ("auto_formulas", 2000)]:
+                         ("pattern_stats", 5000)]:
             if len(state.get(key, {})) > cap:
                 for k in sorted(state[key].keys())[:-cap]:
                     del state[key][k]
@@ -104,8 +99,11 @@ def pattern_signature(outcomes, length=PATTERN_SIG_LEN):
     if len(outcomes) < length: return None
     return "".join('B' if x else 'S' for x in outcomes[-length:])
 
+def short_pattern_sig(outcomes, length=8):
+    if len(outcomes) < length: return None
+    return "".join('B' if x else 'S' for x in outcomes[-length:])
+
 def error_signature(outcomes, length=ERROR_SIG_LEN):
-    """🔥 FIX 1: Short signature for error tracking (8 length)"""
     if len(outcomes) < length: return None
     return "".join('B' if x else 'S' for x in outcomes[-length:])
 
@@ -113,19 +111,6 @@ def number_signature(history, length=5):
     nums = [h["number"] for h in history if h["number"] >= 0]
     if len(nums) < length: return None
     return "-".join(str(n) for n in nums[-length:])
-
-def hamming_distance(s1, s2):
-    if not s1 or not s2 or len(s1) != len(s2): return 999
-    return sum(1 for a, b in zip(s1, s2) if a != b)
-
-def find_similar_error_signatures(current_sig, radius=SIMILAR_ERROR_RADIUS):
-    if not current_sig: return []
-    matches = []
-    for sig, data in STATE.get("error_patterns", {}).items():
-        if data.get("fail_count", 0) >= ERROR_THRESHOLD:
-            d = hamming_distance(sig, current_sig)
-            if 0 < d <= radius: matches.append((sig, data, d))
-    return matches
 
 # ==================== DATA VALIDATION ====================
 def validate_and_sanitize(raw_list):
@@ -164,12 +149,39 @@ def calculate_entropy(outcomes, window=40):
     if p1 == 0 or p1 == 1: return 0.0
     return max(0.0, 1.0 - (-(p1*math.log2(p1) + (1-p1)*math.log2(1-p1))))
 
-# ==================== ENGINE 1: PATTERN ====================
+# ==================== 🔥 PATTERN ACCURACY TRACKER ====================
+def get_pattern_priority(outcomes):
+    """
+    Check current pattern signature's historical accuracy.
+    Returns (probability, confidence_weight, sample_size).
+    If pattern has high accuracy + frequency, it gets priority.
+    """
+    sig = short_pattern_sig(outcomes, 8)
+    if not sig: return None, 0.0, 0
+    stats = STATE.get("pattern_stats", {}).get(sig)
+    if not stats: return None, 0.0, 0
+    hits = stats.get("hits", 0)
+    misses = stats.get("misses", 0)
+    total = hits + misses
+    if total < PATTERN_MIN_SAMPLES: return None, 0.0, total
+    acc = hits / total
+    # Laplace-smoothed for stability
+    smoothed_acc = (hits + 1) / (total + 2)
+    # Weight: how much to trust this pattern (frequency + accuracy)
+    # Higher frequency + higher accuracy = more trust
+    freq_factor = min(1.0, total / 20.0)  # caps at 20 samples
+    acc_factor = max(0.0, (smoothed_acc - 0.5) * 2)  # 0.5 → 0, 1.0 → 1
+    weight = freq_factor * acc_factor
+    return smoothed_acc, weight, total
+
+# ==================== ENGINE 1: PATTERN (Priority Boosted) ====================
 def engine_pattern(outcomes):
     n = len(outcomes)
-    if n < 10: return 0.5
+    if n < 15: return 0.5
     sig_full = "".join('B' if x else 'S' for x in outcomes)
     results, weights = [], []
+
+    # Multi-length pattern matching
     for L in PATTERN_LENGTHS:
         if n < L + 3: continue
         tail = sig_full[-L:]
@@ -181,19 +193,30 @@ def engine_pattern(outcomes):
         total = big + small
         if total >= 2:
             prob = (big + 1) / (total + 2)
-            w = (L ** 1.2) * math.log(total + 1)
+            w = (L ** 1.5) * math.log(total + 1)
             results.append(prob); weights.append(w)
+
+    # Pattern DB lookup (14-length)
     sig14 = pattern_signature(outcomes, 14)
     if sig14 and sig14 in STATE.get("pattern_memory", {}):
         pm = STATE["pattern_memory"][sig14]
         pb = pm.get("next_big", 0); ps = pm.get("next_small", 0)
         if pb + ps >= 2:
             prob_db = (pb + 1) / (pb + ps + 2)
-            results.append(prob_db); weights.append(14 ** 1.2 * math.log(pb + ps + 1))
+            results.append(prob_db); weights.append(14 ** 1.5 * math.log(pb + ps + 1))
+
+    # 🔥 PATTERN PRIORITY BOOST: 8-length signature accuracy
+    p_acc, p_weight, p_samples = get_pattern_priority(outcomes)
+    if p_acc is not None and p_weight > 0.1:
+        # Boost: multiply by weight (up to ~3x priority)
+        priority_boost = 1.0 + p_weight * 3.0
+        results.append(p_acc)
+        weights.append(8 ** 1.7 * priority_boost * math.log(p_samples + 1))
+
     if not results: return 0.5
     return sum(r*w for r,w in zip(results, weights)) / sum(weights)
 
-# ==================== ENGINE 2: TREND ====================
+# ==================== ENGINE 2: TREND (Classic EMA) ====================
 def engine_trend(outcomes):
     n = len(outcomes)
     if n < 20: return 0.5
@@ -216,103 +239,91 @@ def engine_trend(outcomes):
     combined = macd_signal * 0.5 + velocity * 0.3 + burst * 0.2
     return max(0.15, min(0.85, 0.5 + 0.5 * math.tanh(combined * 2.0)))
 
-# ==================== ENGINE 3: ARITHMETIC ====================
-def engine_arithmetic(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 10: return 0.5
-    recent = numbers[-ARITH_WINDOW:]
-    recent_sizes = sizes[-ARITH_WINDOW:]
-    if len(recent) < 5: return 0.5
-    last = recent[-1]; prev = recent[-2] if len(recent) >= 2 else None
-    prev2 = recent[-3] if len(recent) >= 3 else None
-    big_votes = 0.0; small_votes = 0.0
-    if prev is not None:
-        target = abs(last - prev)
-        for i in range(len(recent) - 3):
-            a, b, c = recent[i], recent[i+1], recent[i+2]
-            if abs(a - b) == target:
-                if i + 3 < len(recent_sizes):
-                    nxt = recent_sizes[i+3]
-                    w = math.exp((i / len(recent)) * 2.5)
-                    if nxt == 1: big_votes += w
-                    else: small_votes += w
-    if prev is not None:
-        target_sum = last + prev
-        if target_sum <= 9:
-            for i in range(len(recent) - 3):
-                a, b = recent[i], recent[i+1]
-                if a + b == target_sum:
-                    if i + 2 < len(recent_sizes):
-                        nxt = recent_sizes[i+2]
-                        w = math.exp((i / len(recent)) * 2.0) * 0.6
-                        if nxt == 1: big_votes += w
-                        else: small_votes += w
-    if prev2 is not None and prev2 == last:
-        for i in range(len(recent) - 4):
-            if recent[i] == recent[i+2] == prev2:
-                if i + 3 < len(recent_sizes):
-                    w = math.exp((i / len(recent)) * 2.5) * 0.8
-                    if recent_sizes[i+3] == 1: big_votes += w
-                    else: small_votes += w
-    if last in (0, 9):
-        for i in range(len(recent) - 1):
-            if recent[i] == last:
-                if i + 1 < len(recent_sizes):
-                    w = math.exp((i / len(recent)) * 2.0)
-                    if recent_sizes[i+1] == 1: big_votes += w
-                    else: small_votes += w
-    total = big_votes + small_votes
-    if total < 0.5: return 0.5
-    return (big_votes + 0.5) / (total + 1.0)
+# ==================== 🔥 ENGINE 3: TREND SHIFT DETECTOR ====================
+def engine_trend_shift(outcomes):
+    """
+    Detects when trend has shifted recently.
+    Uses fast vs slow EMA crossover over short window.
+    If crossover happened in last 2-3 periods, strong signal.
+    """
+    n = len(outcomes)
+    if n < 15: return 0.5
+    def ema(arr, span):
+        a = 2 / (span + 1); e = arr[0]
+        for x in arr[1:]: e = a * x + (1 - a) * e
+        return e
+    # Fast and slow EMA over recent
+    fast = ema(outcomes[-10:], 3)
+    slow = ema(outcomes[-15:], 8)
+    # Check if crossed recently
+    fast_prev = ema(outcomes[-11:-1], 3)
+    slow_prev = ema(outcomes[-16:-1], 8)
+    crossed_up = (fast_prev <= slow_prev) and (fast > slow)
+    crossed_down = (fast_prev >= slow_prev) and (fast < slow)
+    diff = fast - slow
+    if crossed_up:
+        return 0.75  # Strong BIG signal after upshift
+    if crossed_down:
+        return 0.25  # Strong SMALL signal after downshift
+    # No crossover: medium strength
+    return max(0.20, min(0.80, 0.5 + math.tanh(diff * 5.0) * 0.30))
 
-# ==================== ENGINE 4: SYMMETRY ====================
-def engine_symmetry(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 15: return 0.5
-    last3 = numbers[-3:]
-    if len(last3) < 3: return 0.5
-    if last3[0] == last3[2] and last3[0] != last3[1]:
-        A, B = last3[0], last3[1]
-        midpoint = (A + B) / 2
-        mid_is_big = midpoint >= 5
-        big_w = small_w = 0.0
-        for i in range(len(numbers) - 4):
-            if numbers[i] == numbers[i+2] == A and numbers[i+1] == B:
-                recency = math.exp((i / len(numbers)) * 3.0)
-                if abs(numbers[i+3] - midpoint) <= 1: recency *= 1.5
-                if sizes[i+3] == 1: big_w += recency
-                else: small_w += recency
-        if big_w + small_w >= 0.5:
-            return (big_w + 0.5) / (big_w + small_w + 1.0)
-        return 0.60 if mid_is_big else 0.40
-    if len(numbers) >= 4 and numbers[-1] == numbers[-2] and numbers[-3] != numbers[-1]:
-        A = numbers[-1]
-        big_w = small_w = 0.0
-        for i in range(len(numbers) - 2):
-            if numbers[i] == numbers[i+1] == A:
-                if i + 2 < len(sizes):
-                    recency = math.exp((i / len(numbers)) * 3.0)
-                    if sizes[i+2] == 1: big_w += recency
-                    else: small_w += recency
-        total = big_w + small_w
-        if total >= 1.0: return (big_w + 0.5) / (total + 1.0)
-    return 0.5
-
-# ==================== ENGINE 5: OPPOSITE ====================
-def engine_opposite(outcomes):
-    if len(outcomes) < 6: return 0.5
-    recent = outcomes[-10:]
-    streak_len = 1; streak_val = recent[-1]
+# ==================== 🔥 ENGINE 4: TREND FOLLOW-UP ====================
+def engine_trend_follow(outcomes):
+    """
+    If trend has been consistent for N periods, expect continuation (short-term).
+    Uses run-length of same direction.
+    """
+    n = len(outcomes)
+    if n < 8: return 0.5
+    recent = outcomes[-8:]
+    # Count consecutive same at the end
+    streak = 1
+    val = recent[-1]
     for i in range(len(recent) - 2, -1, -1):
-        if recent[i] == streak_val: streak_len += 1
+        if recent[i] == val: streak += 1
         else: break
-    if streak_len >= 6: return 0.12 if streak_val == 1 else 0.88
-    elif streak_len == 5: return 0.20 if streak_val == 1 else 0.80
-    elif streak_len == 4: return 0.30 if streak_val == 1 else 0.70
-    elif streak_len == 3: return 0.42 if streak_val == 1 else 0.58
-    return 0.5
+    # Also check 3-period momentum direction
+    if n >= 6:
+        s1 = sum(outcomes[-3:]) / 3
+        s2 = sum(outcomes[-6:-3]) / 3
+        momentum = s1 - s2
+    else:
+        momentum = 0
+    # Follow-up bias: 2-3 run continues, 4+ starts to fade
+    if streak == 2:
+        base = 0.62 if val == 1 else 0.38
+    elif streak == 3:
+        base = 0.58 if val == 1 else 0.42
+    elif streak >= 4:
+        base = 0.45 if val == 1 else 0.55
+    else:
+        base = 0.50
+    # Add momentum bias
+    base += momentum * 0.10
+    return max(0.15, min(0.85, base))
+
+# ==================== 🔥 ENGINE 5: SLOPE ANALYZER ====================
+def engine_slope(outcomes):
+    """
+    Linear regression slope of last 12 outcomes.
+    Positive slope → BIG trend, Negative slope → SMALL trend.
+    """
+    n = len(outcomes)
+    if n < 12: return 0.5
+    window = outcomes[-12:]
+    m = len(window)
+    xs = list(range(m))
+    mean_x = sum(xs) / m
+    mean_y = sum(window) / m
+    num = sum((xs[i] - mean_x) * (window[i] - mean_y) for i in range(m))
+    den = sum((xs[i] - mean_x) ** 2 for i in range(m))
+    if den == 0: return 0.5
+    slope = num / den
+    # Slope range: -0.5 to +0.5 typically
+    # Convert to probability
+    p_big = 0.5 + math.tanh(slope * 8.0) * 0.35
+    return max(0.15, min(0.85, p_big))
 
 # ==================== ENGINE 6: NUMBER SEQUENCE ====================
 def engine_number_sequence(history):
@@ -325,7 +336,7 @@ def engine_number_sequence(history):
     elif last_nums[0] > last_nums[1] > last_nums[2]: pattern = "DESC"
     elif last_nums[0] == last_nums[1] == last_nums[2]: pattern = "SAME3"
     elif last_nums[1] == last_nums[2]: pattern = "SAME2"
-    elif abs(last_nums[0] - last_nums[1]) == 1 and abs(last_nums[1] - last_nums[2]) == 1: pattern = "SEQ"
+    elif abs(last_nums[0]-last_nums[1]) == 1 and abs(last_nums[1]-last_nums[2]) == 1: pattern = "SEQ"
     else: pattern = "OTHER"
     big_count = small_count = 0.0
     for i in range(len(numbers) - 3):
@@ -341,40 +352,84 @@ def engine_number_sequence(history):
             if sizes[i+3] == 1: big_count += recency_w
             else: small_count += recency_w
     total = big_count + small_count
-    if total < 1.0: return 0.5
+    if total < 1.5: return 0.5
     return (big_count + 0.5) / (total + 1.0)
 
-# ==================== ENGINE 7: REPEATED NUMBER ====================
-def engine_repeated_number(history):
+# ==================== ENGINE 7: HOT NUMBER ====================
+def engine_hot_number(history):
+    numbers = [h["number"] for h in history if h["number"] >= 0]
+    if len(numbers) < HOT_NUMBER_WINDOW: return 0.5
+    recent = numbers[-HOT_NUMBER_WINDOW:]
+    freq = Counter(recent)
+    top = freq.most_common(3)
+    if not top: return 0.5
+    most_freq_num, most_freq_cnt = top[0]
+    dominance = most_freq_cnt / len(recent)
+    if dominance < HOT_NUMBER_MIN_DOMINANCE: return 0.5
+    big_weight = sum(cnt for num, cnt in top if num >= 5)
+    small_weight = sum(cnt for num, cnt in top if num < 5)
+    total = big_weight + small_weight
+    if total < 3: return 0.5
+    base = big_weight / total
+    side_boost = 0.15 if most_freq_num >= 5 else -0.15
+    return max(0.15, min(0.85, base + side_boost))
+
+# ==================== ENGINE 8: STREAK BREAK ====================
+def engine_streak_break(outcomes):
+    if len(outcomes) < 6: return 0.5
+    recent = outcomes[-10:]
+    streak_len = 1; streak_val = recent[-1]
+    for i in range(len(recent) - 2, -1, -1):
+        if recent[i] == streak_val: streak_len += 1
+        else: break
+    if streak_len >= 6: return 0.12 if streak_val == 1 else 0.88
+    elif streak_len == 5: return 0.20 if streak_val == 1 else 0.80
+    elif streak_len == 4: return 0.30 if streak_val == 1 else 0.70
+    elif streak_len == 3: return 0.42 if streak_val == 1 else 0.58
+    return 0.5
+
+# ==================== ENGINE 9: ARITHMETIC ====================
+def engine_arithmetic(history):
     numbers = [h["number"] for h in history if h["number"] >= 0]
     sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 20: return 0.5
-    recent_nums = numbers[-12:]
-    freq = Counter(recent_nums)
-    if not freq: return 0.5
-    top_num, top_count = freq.most_common(1)[0]
-    if top_count < 3: return 0.5
-    current_prev_size = None
-    for i in range(len(numbers) - 1, -1, -1):
-        if numbers[i] == top_num:
-            if i > 0: current_prev_size = sizes[i - 1]
-            break
-    if current_prev_size is None: return 0.5
-    big_after = 0.0; small_after = 0.0; matches = 0
-    for i in range(1, len(numbers)):
-        if numbers[i] == top_num and sizes[i-1] == current_prev_size:
-            if i + 1 < len(sizes):
-                recency = math.exp((i / len(numbers)) * 3.5)
-                if sizes[i + 1] == 1: big_after += recency
-                else: small_after += recency
-                matches += 1
-    total = big_after + small_after
-    if matches < 2 or total < 1.0:
-        if top_num <= 4: return 0.40
-        else: return 0.60
-    return (big_after + 0.5) / (total + 1.0)
+    if len(numbers) < 15: return 0.5
+    recent = numbers[-ARITH_WINDOW:]
+    recent_sizes = sizes[-ARITH_WINDOW:]
+    if len(recent) < 5: return 0.5
+    last = recent[-1]; prev = recent[-2] if len(recent) >= 2 else None
+    prev2 = recent[-3] if len(recent) >= 3 else None
+    big_votes = 0.0; small_votes = 0.0
+    if prev is not None:
+        target = abs(last - prev)
+        for i in range(len(recent) - 3):
+            a, b, c = recent[i], recent[i+1], recent[i+2]
+            if abs(a - b) == target:
+                if i + 3 < len(recent_sizes):
+                    w = math.exp((i / len(recent)) * 2.5)
+                    if recent_sizes[i+3] == 1: big_votes += w
+                    else: small_votes += w
+    if prev is not None:
+        target_sum = last + prev
+        if target_sum <= 9:
+            for i in range(len(recent) - 3):
+                a, b = recent[i], recent[i+1]
+                if a + b == target_sum:
+                    if i + 2 < len(recent_sizes):
+                        w = math.exp((i / len(recent)) * 2.0) * 0.6
+                        if recent_sizes[i+2] == 1: big_votes += w
+                        else: small_votes += w
+    if prev2 is not None and prev2 == last:
+        for i in range(len(recent) - 4):
+            if recent[i] == recent[i+2] == prev2:
+                if i + 3 < len(recent_sizes):
+                    w = math.exp((i / len(recent)) * 2.5) * 0.8
+                    if recent_sizes[i+3] == 1: big_votes += w
+                    else: small_votes += w
+    total = big_votes + small_votes
+    if total < 1.0: return 0.5
+    return (big_votes + 0.5) / (total + 1.0)
 
-# ==================== ENGINE 8: DOUBLE DETECTOR ====================
+# ==================== ENGINE 10: DOUBLE DETECT ====================
 def engine_double_detect(history):
     numbers = [h["number"] for h in history if h["number"] >= 0]
     sizes = [h["size"] for h in history if h["number"] >= 0]
@@ -402,225 +457,13 @@ def engine_double_detect(history):
         return 0.38 if last == 1 else 0.62
     return (big_after + 0.5) / (total + 1.0)
 
-# ==================== ENGINE 9: OVERLAPPING SERIES ====================
-def detect_overlap_series(numbers, offset=0, window_size=4):
-    if len(numbers) < window_size: return None
-    window = numbers[offset:offset+window_size] if offset+window_size <= len(numbers) else numbers[-(window_size):]
-    if len(window) < 4: return None
-    a, b, c, d = window[0], window[1], window[2], window[3]
-    sig_parts = []
-    if c == (a + b) % 10: sig_parts.append("P@0")
-    if c == abs(a - b): sig_parts.append("M@0")
-    if d == (b + c) % 10: sig_parts.append("P@1")
-    if d == abs(b - c): sig_parts.append("M@1")
-    if d == (a + b) % 10: sig_parts.append("P@skip")
-    if d == abs(a - b): sig_parts.append("M@skip")
-    if not sig_parts: return None
-    return "|".join(sorted(sig_parts))
-
-def engine_overlapping_series(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 15: return 0.5
-    current_sig = detect_overlap_series(numbers, offset=len(numbers)-4, window_size=4)
-    sig_5 = None
-    if len(numbers) >= 5:
-        w5 = numbers[-5:]
-        parts = []
-        for j in range(3):
-            a, b = w5[j], w5[j+1]
-            if j + 2 < 5:
-                actual = w5[j+2]
-                if actual == (a + b) % 10: parts.append(f"P@{j}")
-                elif actual == abs(a - b): parts.append(f"M@{j}")
-        if parts: sig_5 = "|".join(sorted(parts))
-    if not current_sig and not sig_5: return 0.5
-    combined_sig = current_sig or ""
-    if sig_5: combined_sig = combined_sig + "::" + sig_5 if combined_sig else sig_5
-    series_hist = STATE.get("series_history", {})
-    hist = series_hist.get(combined_sig)
-    if hist and (hist.get("big", 0) + hist.get("small", 0)) >= 3:
-        total = hist["big"] + hist["small"]
-        return (hist["big"] + 0.5) / (total + 1.0)
-    rule_type = set()
-    for part in (current_sig or "").split("|"):
-        if "P" in part: rule_type.add("PLUS")
-        if "M" in part: rule_type.add("MINUS")
-    for part in (sig_5 or "").split("|"):
-        if "P" in part: rule_type.add("PLUS")
-        if "M" in part: rule_type.add("MINUS")
-    loose_sig = "&".join(sorted(rule_type))
-    if loose_sig:
-        hist_loose = series_hist.get("LOOSE::" + loose_sig)
-        if hist_loose and (hist_loose.get("big", 0) + hist_loose.get("small", 0)) >= 5:
-            total = hist_loose["big"] + hist_loose["small"]
-            return (hist_loose["big"] + 0.5) / (total + 1.0)
-    recent_nums = numbers[-10:]
-    recent_sizes = sizes[-10:]
-    big_after = 0.0; small_after = 0.0
-    for i in range(2, len(recent_nums) - 1):
-        a, b = recent_nums[i-2], recent_nums[i-1]
-        c = recent_nums[i]
-        if c == (a + b) % 10 or c == abs(a - b):
-            if i + 1 < len(recent_sizes):
-                w = math.exp((i / len(recent_nums)) * 2.0)
-                if recent_sizes[i+1] == 1: big_after += w
-                else: small_after += w
-    total = big_after + small_after
-    if total >= 0.5:
-        return (big_after + 0.5) / (total + 1.0)
-    return 0.5
-
-# ==================== ENGINE 10: CONNECTED SERIES ====================
-def analyze_connected_series(numbers):
-    if len(numbers) < 5: return None, 0.0, ""
-    recent = numbers[-7:]
-    n = len(recent)
-    skip_indices = set()
-    first_occurrence = {}
-    for i in range(n):
-        num = recent[i]
-        if num in first_occurrence:
-            skip_indices.add(first_occurrence[num])
-        else:
-            first_occurrence[num] = i
-    filtered = [(i, recent[i]) for i in range(n) if i not in skip_indices]
-    meaningful = []
-    for idx, (i, num) in enumerate(filtered):
-        connected = False
-        for jdx, (j, other) in enumerate(filtered):
-            if i == j: continue
-            if abs(num - other) <= 2:
-                connected = True
-                break
-        if connected: meaningful.append((i, num))
-    if len(meaningful) < 2: return None, 0.0, ""
-    predictions = []
-    for i in range(len(meaningful)):
-        for j in range(i+1, len(meaningful)):
-            pos_a, a = meaningful[i]
-            pos_b, b = meaningful[j]
-            gap = abs(a - b)
-            pos_weight = 0.5 + (max(pos_a, pos_b) / n) * 0.5
-            if gap == 1:
-                if pos_b > pos_a:
-                    direction = 1 if b > a else -1
-                    pred = b + direction
-                    if 0 <= pred <= 9:
-                        predictions.append((pred, 1.0 * pos_weight, f"{a},{b}→{pred}"))
-            elif gap == 2:
-                pred = (a + b) // 2
-                predictions.append((pred, 0.85 * pos_weight, f"mid({a},{b})={pred}"))
-    if not predictions: return None, 0.0, ""
-    number_votes = {}
-    for pred, w, info in predictions:
-        number_votes[pred] = number_votes.get(pred, 0) + w
-    best_num = max(number_votes, key=number_votes.get)
-    total_weight = sum(number_votes.values())
-    conf_num = number_votes[best_num] / total_weight if total_weight > 0 else 0
-    info_str = " | ".join([p[2] for p in predictions[:2]])
-    return best_num, conf_num, info_str
-
-def engine_connected_series(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    if len(numbers) < 7: return 0.5
-    pred_num, conf, _ = analyze_connected_series(numbers)
-    if pred_num is None: return 0.5
-    # 🔥 FIX 3: Simplified signature
-    recent = numbers[-5:]  # 5 numbers only
-    sig_parts = []
-    for i in range(len(recent)):
-        for j in range(i+1, len(recent)):
-            gap = abs(recent[i] - recent[j])
-            if gap in (1, 2): sig_parts.append(f"{gap}")
-    sig_key = "CS_" + "-".join(sorted(set(sig_parts))) if sig_parts else ""
-    if pred_num >= 5:
-        base = 0.5 + min(0.35, conf * 0.4)
-    else:
-        base = 0.5 - min(0.35, conf * 0.4)
-    if sig_key:
-        ch = STATE.get("connected_history", {}).get(sig_key)
-        if ch and (ch.get("big", 0) + ch.get("small", 0)) >= 3:
-            total = ch["big"] + ch["small"]
-            hist_lean = ch["big"] / total
-            base = base * 0.7 + hist_lean * 0.3
-    return max(0.15, min(0.85, base))
-
-# ==================== ENGINE 11: AUTO FORMULA ====================
-def apply_formula(a, b, c, formula_id):
-    try:
-        if formula_id == "sum": return (a + b) % 10
-        if formula_id == "diff": return abs(a - b)
-        if formula_id == "mid": return (a + b) // 2
-        if formula_id == "mul": return (a * b) % 10
-        if formula_id == "sum3": return (a + b + c) % 10
-        if formula_id == "diff3": return abs(a - b - c)
-        if formula_id == "diffsum": return abs((a + b) - c)
-        if formula_id == "diffplus1": return (abs(a - b) + 1) % 10
-        if formula_id == "summinus1": return (a + b - 1) % 10
-        if formula_id == "avg3": return (a + b + c) // 3
-        if formula_id == "units": return ((a + b) % 10)
-        if formula_id == "gap1": return (b + 1) % 10
-        if formula_id == "gap2": return (b + 2) % 10
-        if formula_id == "gapminus1": return (b - 1) % 10
-        if formula_id == "gapminus2": return (b - 2) % 10
-        if formula_id == "alt_sumdiff": return (a + b if a > b else abs(a - b)) % 10
-    except Exception:
-        return None
-    return None
-
-ALL_FORMULAS = ["sum", "diff", "mid", "mul", "sum3", "diff3", "diffsum",
-                "diffplus1", "summinus1", "avg3", "units", "gap1", "gap2",
-                "gapminus1", "gapminus2", "alt_sumdiff"]
-
-def discover_formulas(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    if len(numbers) < 20: return
-    for formula in ALL_FORMULAS:
-        hits = 0; total = 0
-        for i in range(len(numbers) - 3):
-            a, b, c = numbers[i], numbers[i+1], numbers[i+2]
-            pred = apply_formula(a, b, c, formula)
-            if pred is None: continue
-            if c == pred:
-                total += 1; hits += 1
-            else:
-                total += 1
-        if total >= 10:
-            accuracy = hits / total
-            af = STATE.setdefault("auto_formulas", {}).setdefault(formula, {"hits": 0, "total": 0, "accuracy": 0})
-            af["hits"] = hits
-            af["total"] = total
-            af["accuracy"] = accuracy
-
-def engine_auto_formula(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    if len(numbers) < 10: return 0.5
-    af = STATE.get("auto_formulas", {})
-    if not af: return 0.5
-    good_formulas = [(f, d) for f, d in af.items() if d.get("accuracy", 0) >= 0.15]
-    if not good_formulas: return 0.5
-    a, b, c = numbers[-3], numbers[-2], numbers[-1]
-    votes = {}
-    for formula_id, data in good_formulas:
-        pred = apply_formula(a, b, c, formula_id)
-        if pred is None: continue
-        acc = data.get("accuracy", 0)
-        votes[pred] = votes.get(pred, 0) + acc
-    if not votes: return 0.5
-    big_w = sum(w for n, w in votes.items() if n >= 5)
-    small_w = sum(w for n, w in votes.items() if n < 5)
-    total = big_w + small_w
-    if total < 0.5: return 0.5
-    return (big_w + 0.5) / (total + 1.0)
-
 # ==================== ADAPTIVE WEIGHTS ====================
 REGIME_EXPERT_WEIGHTS = {
-    "ALTERNATING":   {"pattern": 0.14, "trend": 0.08, "arith": 0.14, "symmetry": 0.12, "opposite": 0.08, "number_seq": 0.10, "repeated_num": 0.12, "double_detect": 0.10, "overlap_series": 0.16, "connected_series": 0.10, "auto_formula": 0.10},
-    "BIG_HEAVY":     {"pattern": 0.14, "trend": 0.15, "arith": 0.13, "symmetry": 0.11, "opposite": 0.13, "number_seq": 0.09, "repeated_num": 0.09, "double_detect": 0.10, "overlap_series": 0.14, "connected_series": 0.10, "auto_formula": 0.12},
-    "SMALL_HEAVY":   {"pattern": 0.14, "trend": 0.15, "arith": 0.13, "symmetry": 0.11, "opposite": 0.13, "number_seq": 0.09, "repeated_num": 0.09, "double_detect": 0.10, "overlap_series": 0.14, "connected_series": 0.10, "auto_formula": 0.12},
-    "LONG_STREAK":   {"pattern": 0.10, "trend": 0.11, "arith": 0.10, "symmetry": 0.08, "opposite": 0.22, "number_seq": 0.08, "repeated_num": 0.09, "double_detect": 0.12, "overlap_series": 0.15, "connected_series": 0.10, "auto_formula": 0.10},
-    "BALANCED":      {"pattern": 0.15, "trend": 0.10, "arith": 0.13, "symmetry": 0.11, "opposite": 0.10, "number_seq": 0.09, "repeated_num": 0.12, "double_detect": 0.09, "overlap_series": 0.15, "connected_series": 0.10, "auto_formula": 0.11},
+    "ALTERNATING":   {"pattern": 0.18, "trend": 0.08, "trend_shift": 0.12, "trend_follow": 0.08, "slope": 0.08, "number_seq": 0.10, "hot_number": 0.08, "streak_break": 0.15, "arith": 0.08, "double_detect": 0.05},
+    "BIG_HEAVY":     {"pattern": 0.18, "trend": 0.14, "trend_shift": 0.10, "trend_follow": 0.12, "slope": 0.12, "number_seq": 0.08, "hot_number": 0.08, "streak_break": 0.08, "arith": 0.06, "double_detect": 0.04},
+    "SMALL_HEAVY":   {"pattern": 0.18, "trend": 0.14, "trend_shift": 0.10, "trend_follow": 0.12, "slope": 0.12, "number_seq": 0.08, "hot_number": 0.08, "streak_break": 0.08, "arith": 0.06, "double_detect": 0.04},
+    "LONG_STREAK":   {"pattern": 0.14, "trend": 0.10, "trend_shift": 0.10, "trend_follow": 0.15, "slope": 0.10, "number_seq": 0.06, "hot_number": 0.06, "streak_break": 0.22, "arith": 0.04, "double_detect": 0.03},
+    "BALANCED":      {"pattern": 0.20, "trend": 0.10, "trend_shift": 0.12, "trend_follow": 0.10, "slope": 0.10, "number_seq": 0.08, "hot_number": 0.08, "streak_break": 0.10, "arith": 0.08, "double_detect": 0.04},
 }
 
 def get_adaptive_weights(regime):
@@ -643,35 +486,76 @@ def combine_engines(engine_probs, weights):
     return sum(engine_probs[e] * weights[e] for e in engine_probs) / total_w
 
 def gradient_update(engine_probs, actual_big, lr=0.01):
-    """🔥 FIX 2: Weight recovery for high-confidence engines"""
     actual = 1.0 if actual_big else 0.0
     for eng, prob in engine_probs.items():
         stats = STATE["engine_stats"].setdefault(eng, default_engine_state())
         grad = (prob - actual) * (prob - 0.5) * 2.0
         old_w = stats.get("gradient_weight", 1.0)
         new_w = max(0.3, min(3.0, old_w - lr * grad))
-        # 🔥 FIX: High-confidence recovery
         confidence = max(prob, 1 - prob)
-        if confidence >= 0.70 and new_w < 0.10:
-            new_w = 0.10  # Minimum floor for high-confidence engines
+        if confidence >= 0.70 and new_w < 0.15:
+            new_w = 0.15
         stats["gradient_weight"] = new_w
 
-# ==================== ANTI-ERROR (FIX 1: Short signature) ====================
+# ==================== ANTI-ERROR ====================
 def check_anti_error(outcomes, current_p_big):
-    """🔥 FIX 1: Uses 8-length signature instead of 14"""
     sig = error_signature(outcomes, ERROR_SIG_LEN)
     if not sig: return current_p_big, False, ""
     err = STATE.get("error_patterns", {}).get(sig)
     if err and err.get("fail_count", 0) >= ERROR_THRESHOLD:
         fail_ratio = err.get("fail_count", 0) / max(1, err.get("total", 1))
         if fail_ratio >= 0.6:
-            return 1.0 - current_p_big, True, f"EXACT ({err['fail_count']}x)"
-    similar = find_similar_error_signatures(sig, radius=SIMILAR_ERROR_RADIUS)
-    if similar:
-        ratio = sum(s[1].get("fail_count", 0) for s in similar) / max(1, sum(s[1].get("total", 1) for s in similar))
-        if ratio >= 0.65:
-            return current_p_big * 0.7 + 0.5 * 0.3, False, f"SIMILAR ({len(similar)})"
+            return 1.0 - current_p_big, True, f"FLIP ({err['fail_count']}x)"
     return current_p_big, False, ""
+
+# ==================== 🔥 CONFIDENCE CALIBRATION ====================
+def calibrate_confidence(raw_conf, pred_size):
+    """
+    Look at historical confidence buckets and their actual win rate.
+    Shrink small-sample buckets toward 0.5.
+    Return actual calibrated confidence.
+    """
+    # Bucket raw confidence into 5% bins
+    bucket_key = str(int(raw_conf * 20) / 20)  # 0.55, 0.60, 0.65, ...
+    buckets = STATE.get("confidence_buckets", {})
+    bucket = buckets.get(bucket_key)
+    if not bucket:
+        return raw_conf  # No history yet
+    wins = bucket.get("wins", 0)
+    total = bucket.get("total", 0)
+    if total < 10:
+        # Small sample: shrink toward raw
+        return raw_conf * 0.7 + 0.5 * 0.3
+    actual_acc = wins / total
+    # Blend 60% actual + 40% raw
+    calibrated = raw_conf * 0.4 + actual_acc * 0.6
+    # Bound
+    return max(0.52, min(0.95, calibrated))
+
+def update_confidence_bucket(raw_conf, win):
+    bucket_key = str(int(raw_conf * 20) / 20)
+    buckets = STATE.setdefault("confidence_buckets", {})
+    b = buckets.setdefault(bucket_key, {"wins": 0, "total": 0})
+    b["total"] += 1
+    if win: b["wins"] += 1
+
+# ==================== PATTERN STATS UPDATE ====================
+def update_pattern_stats(outcomes, actual_big, pred_big):
+    """
+    Track per-pattern (8-length) accuracy.
+    Called after outcome is known.
+    """
+    # Signature BEFORE the outcome (from the prediction time)
+    # We stored it in pending_pred
+    pass  # Handled in step() with stored signature
+
+def record_pattern_outcome(sig, actual_big, pred_big):
+    if not sig: return
+    stats = STATE.setdefault("pattern_stats", {}).setdefault(sig, {"hits": 0, "misses": 0})
+    if actual_big == pred_big:
+        stats["hits"] += 1
+    else:
+        stats["misses"] += 1
 
 # ==================== MAIN PREDICTOR ====================
 def predict_next(history):
@@ -680,32 +564,38 @@ def predict_next(history):
     engine_probs = {
         "pattern": engine_pattern(outcomes),
         "trend": engine_trend(outcomes),
-        "arith": engine_arithmetic(history),
-        "symmetry": engine_symmetry(history),
-        "opposite": engine_opposite(outcomes),
+        "trend_shift": engine_trend_shift(outcomes),
+        "trend_follow": engine_trend_follow(outcomes),
+        "slope": engine_slope(outcomes),
         "number_seq": engine_number_sequence(history),
-        "repeated_num": engine_repeated_number(history),
+        "hot_number": engine_hot_number(history),
+        "streak_break": engine_streak_break(outcomes),
+        "arith": engine_arithmetic(history),
         "double_detect": engine_double_detect(history),
-        "overlap_series": engine_overlapping_series(history),
-        "connected_series": engine_connected_series(history),
-        "auto_formula": engine_auto_formula(history),
     }
 
     regime = detect_regime(outcomes)
     weights = get_adaptive_weights(regime)
     p_big = combine_engines(engine_probs, weights)
 
+    # Entropy damping
     predictability = calculate_entropy(outcomes)
     if p_big > 0.5:
         p_big = 0.5 + (p_big - 0.5) * (0.5 + predictability * 0.5)
     else:
         p_big = 0.5 - (0.5 - p_big) * (0.5 + predictability * 0.5)
 
+    # Anti-error
     p_big, override_active, override_reason = check_anti_error(outcomes, p_big)
 
+    # Raw confidence
     base_conf = max(p_big, 1 - p_big)
     cal_pen = STATE.get("calibration_offset", 0.0) * 0.5
-    conf = max(0.52, min(0.95, base_conf - cal_pen))
+    raw_conf = max(0.52, min(0.95, base_conf - cal_pen))
+
+    # 🔥 Apply historical calibration
+    final_conf = calibrate_confidence(raw_conf, p_big)
+
     pred_size = 1 if p_big >= 0.5 else 0
 
     numbers = [h["number"] for h in history if h["number"] >= 0]
@@ -714,27 +604,23 @@ def predict_next(history):
         top = Counter(numbers[-HOT_NUMBER_WINDOW:]).most_common(1)
         if top: hot_top = top[0]
 
-    arith_note = ""
-    if len(numbers) >= 2:
-        a, b = numbers[-1], numbers[-2]
-        arith_note = f"|{a}-{b}|={abs(a-b)} {a}+{b}={a+b}"
+    # Pattern priority info
+    p_acc, p_weight, p_samples = get_pattern_priority(outcomes)
+    pattern_note = ""
+    if p_acc is not None:
+        pattern_note = f"Acc:{p_acc:.2f}(n={p_samples})"
 
-    cs_pred, cs_conf, cs_info = analyze_connected_series(numbers)
-    cs_str = f"→{cs_pred} ({cs_info})" if cs_pred is not None else "N/A"
-
-    af = STATE.get("auto_formulas", {})
-    top_formulas = sorted(af.items(), key=lambda x: x[1].get("accuracy", 0), reverse=True)[:2]
-    formulas_str = " ".join([f"{f[:6]}:{d.get('accuracy', 0):.2f}" for f, d in top_formulas]) if top_formulas else "N/A"
+    # Current short sig
+    short_sig = short_pattern_sig(outcomes, 8) or "N/A"
 
     return {
-        "pred_size": pred_size, "confidence": conf,
+        "pred_size": pred_size, "confidence": final_conf, "raw_conf": raw_conf,
         "engine_probs": engine_probs, "weights": weights,
         "regime": regime, "entropy": predictability,
         "signature": pattern_signature(outcomes),
+        "short_sig": short_sig, "pattern_note": pattern_note,
         "num_sig": number_signature(history, 5),
-        "hot_top": hot_top, "arith_note": arith_note,
-        "cs_str": cs_str, "cs_pred": cs_pred, "cs_conf": cs_conf,
-        "formulas_str": formulas_str,
+        "hot_top": hot_top,
         "anti_error_active": override_active,
         "anti_error_reason": override_reason
     }
@@ -757,51 +643,15 @@ def advanced_number_predictor(history_list, predicted_size):
                 nx = numbers[i+o]
                 if nx in candidates: c[nx] += 1; t += 1
         for n in candidates: mk[o-1][n] = (c.get(n, 0) + 1) / (t + K)
-
-    arith_candidates = set()
-    if len(numbers) >= 2:
-        a, b = numbers[-1], numbers[-2]
-        for val in [abs(a-b), (a+b) % 10]:
-            if val in candidates: arith_candidates.add(val)
-
-    trans_candidates = set()
-    if len(numbers) >= 2:
-        trans_key = f"{numbers[-2]}->{numbers[-1]}"
-        tm = STATE.get("trans_memory", {}).get(trans_key)
-        if tm:
-            for n_str, cnt in tm.items():
-                try:
-                    n = int(n_str)
-                    if n in candidates and cnt >= 2: trans_candidates.add(n)
-                except: pass
-
-    cs_pred, cs_conf, _ = analyze_connected_series(numbers)
-    cs_candidate = cs_pred if cs_pred is not None and cs_pred in candidates else None
-
-    af_candidates = set()
-    if len(numbers) >= 3:
-        a, b, c = numbers[-3], numbers[-2], numbers[-1]
-        for f_id, f_data in STATE.get("auto_formulas", {}).items():
-            if f_data.get("accuracy", 0) >= 0.15:
-                pred = apply_formula(a, b, c, f_id)
-                if pred is not None and pred in candidates:
-                    af_candidates.add(pred)
-
     s2n = {0: Counter(), 1: Counter()}
     for i in range(1, len(numbers)):
         if numbers[i] in candidates: s2n[sizes[i-1]][numbers[i]] += 1
-
     scores = {}
     for n in candidates:
         s1 = (freq_all.get(n, 0) + 1) / (len(numbers) + K)
         s2 = (freq_recent.get(n, 0) + 1) / (tr + K)
         s6 = (s2n[sizes[-1]].get(n, 0) + 1) / (sum(s2n[sizes[-1]].values()) + K)
-        arith_bonus = 0.35 if n in arith_candidates else 0.0
-        trans_bonus = 0.30 if n in trans_candidates else 0.0
-        cs_bonus = 0.60 * cs_conf if n == cs_candidate else 0.0
-        af_bonus = 0.30 if n in af_candidates else 0.0
-        scores[n] = (s1*0.10 + s2*0.12 + mk[0][n]*0.13 + mk[1][n]*0.13 + mk[2][n]*0.13 + s6*0.39
-                     + arith_bonus + trans_bonus + cs_bonus + af_bonus)
+        scores[n] = s1*0.10 + s2*0.12 + mk[0][n]*0.13 + mk[1][n]*0.13 + mk[2][n]*0.13 + s6*0.39
     return max(scores, key=scores.get)
 
 # ==================== STATS ====================
@@ -814,11 +664,6 @@ def update_engine_stats(engine_probs, actual_big, regime):
         stats["total"] += 1; stats["recent_total"] += 1
         if hit: stats["hits"] += 1; stats["recent_hits"] += 1
         else: stats["misses"] += 1
-        pa = 1.0 if actual_big else 0.0
-        stats["brier_sum"] += (prob - pa) ** 2
-        rs = stats.setdefault("regime_stats", {}).setdefault(regime, {"hits": 0, "total": 0})
-        rs["total"] += 1
-        if hit: rs["hits"] += 1
         if stats["recent_total"] > 50:
             stats["recent_hits"] = int(stats["recent_hits"] * 0.8)
             stats["recent_total"] = int(stats["recent_total"] * 0.8)
@@ -841,7 +686,6 @@ def update_pattern_memory(signature, actual_big):
     else: pm["next_small"] += 1
 
 def update_error_pattern(outcomes, won):
-    """🔥 FIX 1: Uses 8-length signature"""
     sig = error_signature(outcomes, ERROR_SIG_LEN)
     if not sig: return
     if won:
@@ -863,70 +707,6 @@ def update_number_memory(history):
         nm = STATE.setdefault("number_memory", {}).setdefault(seq, {"next_big": 0, "next_small": 0})
         if sizes[i+3] == 1: nm["next_big"] += 1
         else: nm["next_small"] += 1
-    for i in range(len(numbers) - 2):
-        key = f"{numbers[i]}->{numbers[i+1]}"
-        tm = STATE.setdefault("trans_memory", {}).setdefault(key, {})
-        nxt = str(numbers[i+2])
-        tm[nxt] = tm.get(nxt, 0) + 1
-
-def update_arith_rules(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 5: return
-    for i in range(len(numbers) - 3):
-        a, b, c = numbers[i], numbers[i+1], numbers[i+2]
-        diff = abs(a - b)
-        if diff == c:
-            key = f"|{a}-{b}|={c}"
-            rule = STATE.setdefault("arith_rules", {}).setdefault(key, {"next_big": 0, "next_small": 0, "count": 0})
-            if sizes[i+3] == 1: rule["next_big"] += 1
-            else: rule["next_small"] += 1
-            rule["count"] += 1
-        s = a + b
-        if s == c:
-            key = f"{a}+{b}={c}"
-            rule = STATE.setdefault("arith_rules", {}).setdefault(key, {"next_big": 0, "next_small": 0, "count": 0})
-            if sizes[i+3] == 1: rule["next_big"] += 1
-            else: rule["next_small"] += 1
-            rule["count"] += 1
-
-def update_series_history(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 6: return
-    for end_idx in range(4, len(numbers)):
-        window_start = end_idx - 4
-        if window_start < 0: continue
-        sig = detect_overlap_series(numbers[:end_idx], offset=window_start, window_size=4)
-        if not sig: continue
-        if end_idx >= len(sizes): continue
-        next_size = sizes[end_idx]
-        sh = STATE.setdefault("series_history", {}).setdefault(sig, {"big": 0, "small": 0})
-        if next_size == 1: sh["big"] += 1
-        else: sh["small"] += 1
-
-def update_connected_history(history):
-    """🔥 FIX 3: Simplified signature"""
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 8: return
-    for end_idx in range(7, len(numbers)):
-        sub_nums = numbers[:end_idx]
-        pred_num, conf, _ = analyze_connected_series(sub_nums)
-        if pred_num is None: continue
-        recent = sub_nums[-5:]  # 🔥 5 numbers
-        sig_parts = []
-        for i in range(len(recent)):
-            for j in range(i+1, len(recent)):
-                gap = abs(recent[i] - recent[j])
-                if gap in (1, 2): sig_parts.append(f"{gap}")
-        if not sig_parts: continue
-        sig_key = "CS_" + "-".join(sorted(set(sig_parts)))
-        if end_idx >= len(sizes): continue
-        actual_size = sizes[end_idx]
-        ch = STATE.setdefault("connected_history", {}).setdefault(sig_key, {"big": 0, "small": 0})
-        if actual_size == 1: ch["big"] += 1
-        else: ch["small"] += 1
 
 # ==================== FORMATTERS ====================
 def format_synced_history_logs(history):
@@ -951,21 +731,16 @@ def build_stats_footer():
     patterns = len(STATE.get("pattern_memory", {}))
     errors = len(STATE.get("error_patterns", {}))
     num_db = len(STATE.get("number_memory", {}))
-    arith_db = len(STATE.get("arith_rules", {}))
-    trans_db = len(STATE.get("trans_memory", {}))
-    series_db = len(STATE.get("series_history", {}))
-    cs_db = len(STATE.get("connected_history", {}))
-    formulas = len(STATE.get("auto_formulas", {}))
+    p_stats = len(STATE.get("pattern_stats", {}))
     learned = STATE.get("learned_overrides", 0)
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *LIFETIME STATS*\n"
         f"✅ *Win:* `{wins}` | ❌ *Loss:* `{losses}`\n"
-        f"📉 *Max B2B Loss:* `{max_b2b}` | 🔥 *Streak:* `{cur}`\n"
+        f"📉 *Max B2B:* `{max_b2b}` | 🔥 *Streak:* `{cur}`\n"
         f"🎯 *Win Rate:* `{wr:.1f}%`\n"
-        f"💰 *Next Level:* `{level}` ({BET_LEVELS[min(level-1, 3)]}X)\n"
-        f"🧠 *Pat:* `{patterns}` | 🔢 *Num:* `{num_db}` | 🔀 *Trans:* `{trans_db}`\n"
-        f"🧬 *Ser:* `{series_db}` | 🔗 *CS:* `{cs_db}` | ⚡ *Form:* `{formulas}`\n"
+        f"💰 *Level:* `{level}` ({BET_LEVELS[min(level-1, 3)]}X)\n"
+        f"🧠 *Pat:* `{patterns}` | 🔢 *Num:* `{num_db}` | 🎯 *PStats:* `{p_stats}`\n"
         f"⚠️ *Err:* `{errors}` | 🎓 *Flips:* `{learned}`"
     )
 
@@ -1023,6 +798,7 @@ class BotStateMachine:
         # ---- EVALUATE ----
         if self.pending and self.pending["next_issue"] == li:
             ab = last["size"] == 1
+            pred_big = (self.pending["pred_size"] == "BIGGG")
             update_engine_stats(self.pending["engine_probs"], ab, regime)
             gradient_update(self.pending["engine_probs"], ab, STATE.get("gradient_lr", 0.01))
             brier = (self.pending["prob_big"] - (1 if ab else 0)) ** 2
@@ -1030,13 +806,15 @@ class BotStateMachine:
             actual_size_str = "BIGGG" if ab else "SMALL"
             win = (actual_size_str == self.pending["pred_size"])
             update_global_stats(win)
+
+            # 🔥 Update pattern stats with stored signature
+            record_pattern_outcome(self.pending.get("short_sig"), ab, pred_big)
+            # 🔥 Update confidence bucket
+            update_confidence_bucket(self.pending.get("raw_conf", 0.5), win)
+
             update_pattern_memory(self.pending.get("pattern_sig"), ab)
-            # 🔥 FIX: Use 8-length signature for error tracking
             update_error_pattern(outcomes, win)
             update_number_memory(history)
-            update_arith_rules(history)
-            update_series_history(history)
-            update_connected_history(history)
             if self.pending.get("flipped"):
                 STATE["learned_overrides"] = STATE.get("learned_overrides", 0) + 1
             if win: asyncio.create_task(send_win_sticker(session))
@@ -1054,53 +832,57 @@ class BotStateMachine:
                 "pred_number": pn,
                 "prob_big": conf if ps == 1 else 1 - conf,
                 "engine_probs": pred["engine_probs"],
-                "pattern_sig": sig, "flipped": pred["anti_error_active"]
+                "pattern_sig": sig,
+                "short_sig": pred["short_sig"],
+                "raw_conf": pred["raw_conf"],
+                "flipped": pred["anti_error_active"]
             }
             STATE["prediction_memory"][str(ni)] = {"size": self.pending["pred_size"], "number": pn}
 
             hb = format_synced_history_logs(history)
             ep = pred["engine_probs"]
             cons1 = (f"PAT:{ep['pattern']:.2f} TRD:{ep['trend']:.2f} "
-                     f"ARH:{ep['arith']:.2f} SYM:{ep['symmetry']:.2f} "
-                     f"OPP:{ep['opposite']:.2f} NSQ:{ep['number_seq']:.2f}")
-            cons2 = (f"REP:{ep['repeated_num']:.2f} DBL:{ep['double_detect']:.2f} "
-                     f"OVL:{ep['overlap_series']:.2f} CS:{ep['connected_series']:.2f} "
-                     f"FORM:{ep['auto_formula']:.2f}")
+                     f"TSH:{ep['trend_shift']:.2f} TFL:{ep['trend_follow']:.2f} "
+                     f"SLP:{ep['slope']:.2f}")
+            cons2 = (f"NSQ:{ep['number_seq']:.2f} HOT:{ep['hot_number']:.2f} "
+                     f"BRK:{ep['streak_break']:.2f} ARH:{ep['arith']:.2f} "
+                     f"DBL:{ep['double_detect']:.2f}")
             weights_str = " ".join([f"{k[:3].upper()}:{v:.2f}" for k, v in pred["weights"].items()])
 
             override_note = ""
-            if pred["anti_error_active"]: override_note = f"\n🚨 *FLIP:* `{pred['anti_error_reason']}`"
-            elif pred["anti_error_reason"]: override_note = f"\n⚠️ *Dampened:* `{pred['anti_error_reason']}`"
+            if pred["anti_error_active"]: override_note = f"\n🚨 *{pred['anti_error_reason']}*"
 
             hot_info = ""
             if pred["hot_top"]:
                 hn, hc = pred["hot_top"]
                 hot_info = f"\n🔥 *Hot:* `{hn}` ({hc}x)"
 
-            num_sig_str = pred["num_sig"] or "N/A"
+            pattern_info = ""
+            if pred["pattern_note"]:
+                pattern_info = f"\n🎯 *Pattern Acc:* `{pred['pattern_note']}`"
 
+            num_sig_str = pred["num_sig"] or "N/A"
             level = STATE.get("current_level", 1)
             fund_advice = f"{BET_LEVELS[min(level-1, 3)]}X"
             stats_footer = build_stats_footer()
 
             msg = (
-                f"🎯 *QUANTUM V32.1 (FIXED)* 🎯\n"
+                f"🎯 *QUANTUM V34 PATTERN-PRIORITY* 🎯\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 *Period:* `{ni}`\n"
                 f"🎲 *Number:* `{pn}`\n"
                 f"🔥 *Target:* *{'BIGGG 🟢' if ps == 1 else 'SMALL 🔴'}*\n"
-                f"📊 *Confidence:* `{conf*100:.1f}%`\n"
+                f"📊 *Confidence:* `{conf*100:.1f}%` (raw `{pred['raw_conf']*100:.1f}%`)\n"
                 f"📈 *Regime:* `{pred['regime']}` | *Entropy:* `{pred['entropy']:.2f}`\n"
                 f"💰 *Fund:* `{fund_advice}` (Level {level})"
                 f"{override_note}\n"
                 f"🧩 *Size Sig:* `{sig or 'N/A'}`\n"
-                f"🔗 *Connected:* `{pred['cs_str']}`\n"
-                f"⚡ *Top Formulas:* `{pred['formulas_str']}`\n"
-                f"🔢 *Num Sig:* `{num_sig_str}` | ⚡ `{pred['arith_note']}`"
+                f"🎯 *Short Sig:* `{pred['short_sig']}`"
+                f"{pattern_info}\n"
+                f"🔢 *Num Sig:* `{num_sig_str}`"
                 f"{hot_info}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧠 *11-Engine Consensus:*\n"
-                f"`{cons1}`\n`{cons2}`\n"
+                f"🧠 *10-Engine Consensus:*\n`{cons1}`\n`{cons2}`\n"
                 f"⚖️ *Weights:* `{weights_str}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📜 *TREND (8)*:\n{hb}"
@@ -1113,7 +895,7 @@ class BotStateMachine:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    logger.info("Warmup V32.1...")
+    logger.info("Warmup V34...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate_and_sanitize(raw)
@@ -1128,11 +910,6 @@ async def warmup(session):
             if nb: pm["next_big"] += 1
             else: pm["next_small"] += 1
     update_number_memory(history)
-    update_arith_rules(history)
-    update_series_history(history)
-    update_connected_history(history)
-    discover_formulas(history)
-    logger.info(f"Formulas discovered: {len(STATE.get('auto_formulas', {}))}")
     for i in range(50, len(history) - 1):
         partial = history[:i]
         outcomes = [h["size"] for h in partial]
@@ -1140,16 +917,22 @@ async def warmup(session):
         try:
             pred = predict_next(partial)
             ab = history[i]["size"] == 1
+            pred_big = (pred["pred_size"] == 1)
             update_engine_stats(pred["engine_probs"], ab, regime)
             gradient_update(pred["engine_probs"], ab, STATE.get("gradient_lr", 0.01))
+            # 🔥 Warm up pattern stats
+            record_pattern_outcome(pred["short_sig"], ab, pred_big)
+            # Warm up confidence buckets
+            win = (ab == pred_big)
+            update_confidence_bucket(pred["raw_conf"], win)
         except Exception: continue
     save_state(STATE)
     logger.info(f"Warmup done. Pat:{len(STATE.get('pattern_memory', {}))} "
-                f"Num:{len(STATE.get('number_memory', {}))} "
-                f"CS:{len(STATE.get('connected_history', {}))}")
+                f"PStats:{len(STATE.get('pattern_stats', {}))} "
+                f"Buckets:{len(STATE.get('confidence_buckets', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V32.1 FIXED ACTIVE", status=200)
+async def health(r): return web.Response(text="V34 PATTERN-PRIORITY ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get('/', health)
