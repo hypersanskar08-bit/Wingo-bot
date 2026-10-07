@@ -18,34 +18,25 @@ WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g
 # ================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("QuantumV28_3")
+logger = logging.getLogger("QuantumV28_4")
 handler = RotatingFileHandler('bot.log', maxBytes=5*1024*1024, backupCount=2)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
-STATE_FILE = "engine_state_v28_3.json"
+STATE_FILE = "engine_state_v28_4.json"
 PATTERN_SIG_LEN = 14
 PATTERN_LENGTHS = [4, 6, 8, 10, 12, 14]
 ERROR_THRESHOLD = 2
 SIMILAR_ERROR_RADIUS = 1
 HOT_NUMBER_WINDOW = 20
 
-# 🔥 3 Levels only
 BET_LEVELS = [1.0, 2.5, 6.0]
 MAX_LEVEL = 3
 
-# 🔥 Pattern filter
 MIN_PATTERN_SAMPLES = 3
-STRONG_ACC = 0.62
-SUPER_ACC = 0.70
 MAX_BOOST = 4.0
-
-# 🔥 Pattern flip
 FLIP_BELOW_ACCURACY = 0.58
 FLIP_MIN_SAMPLES = 5
-
-# 🔥 Skip threshold
-MIN_CONFIDENCE_TO_SEND = 0.55
 
 # ==================== STATE ====================
 def default_engine_state():
@@ -57,7 +48,9 @@ def default_engine_state():
         "regime_stats": {}
     }
 
-ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break"]
+# 🔥 8 Engines — added rhythm, hot_cold, gambler_instinct
+ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break",
+           "rhythm", "hot_cold", "gambler_instinct"]
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -75,7 +68,9 @@ def load_state():
             s.setdefault("pattern_strength", {})
             s.setdefault("pattern_flips", 0)
             s.setdefault("pattern_flips_won", 0)
-            s.setdefault("skipped_rounds", 0)  # 🔥 Skip counter
+            # 🔥 Gambler mind state
+            s.setdefault("bot_recent_form", [])   # Last 10 results (1=win, 0=loss)
+            s.setdefault("jack_history", [])       # Last N jack positions
             return s
         except Exception as e:
             logger.error(f"State load error: {e}")
@@ -87,17 +82,21 @@ def load_state():
         "pattern_memory": {}, "error_patterns": {}, "gradient_lr": 0.01,
         "learned_overrides": 0, "number_memory": {}, "hot_numbers": {},
         "pattern_strength": {}, "pattern_flips": 0, "pattern_flips_won": 0,
-        "skipped_rounds": 0
+        "bot_recent_form": [], "jack_history": []
     }
 
 def save_state(state):
     try:
         for key, cap in [("prediction_memory", 500), ("pattern_memory", 5000),
                          ("error_patterns", 500), ("number_memory", 5000),
-                         ("pattern_strength", 5000)]:
+                         ("pattern_strength", 5000), ("bot_recent_form", 20),
+                         ("jack_history", 50)]:
             if len(state.get(key, {})) > cap:
-                for k in sorted(state[key].keys())[:-cap]:
-                    del state[key][k]
+                if isinstance(state[key], list):
+                    state[key] = state[key][-cap:]
+                else:
+                    for k in sorted(state[key].keys())[:-cap]:
+                        del state[key][k]
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
     except Exception as e:
@@ -333,13 +332,186 @@ def engine_streak_break(outcomes):
     elif streak_len == 3: return 0.42 if streak_val == 1 else 0.58
     return 0.5
 
+# ==================== 🥁 ENGINE 6: RHYTHM ====================
+def engine_rhythm(outcomes):
+    """
+    Gambler's "feel" for the game's rhythm.
+    Detects periodic waves/cycles in the outcome sequence.
+    Uses autocorrelation at small lags to find the "beat".
+    """
+    n = len(outcomes)
+    if n < 20: return 0.5
+    
+    recent = outcomes[-30:] if n >= 30 else outcomes
+    m = len(recent)
+    mean = sum(recent) / m
+    
+    # Find best lag (2-8) with strongest correlation
+    best_lag = 0
+    best_corr = 0.0
+    for lag in range(2, 9):
+        if lag >= m - 2: continue
+        num = sum((recent[i] - mean) * (recent[i+lag] - mean) for i in range(m - lag))
+        d1 = sum((recent[i] - mean) ** 2 for i in range(m - lag))
+        d2 = sum((recent[i+lag] - mean) ** 2 for i in range(m - lag))
+        den = math.sqrt(d1 * d2)
+        if den > 0:
+            corr = num / den
+            if abs(corr) > abs(best_corr):
+                best_corr = corr
+                best_lag = lag
+    
+    if best_lag == 0 or abs(best_corr) < 0.20:
+        return 0.5
+    
+    # Predict based on rhythm: what was at position (n - best_lag)?
+    if best_corr > 0:
+        # Positive correlation: next follows the pattern
+        target = recent[-best_lag]
+    else:
+        # Negative: next is opposite
+        target = 1 - recent[-best_lag]
+    
+    # Strength of signal based on correlation
+    strength = min(0.35, abs(best_corr) * 0.5)
+    if target == 1:
+        return 0.5 + strength
+    else:
+        return 0.5 - strength
+
+# ==================== 🔥 ENGINE 7: HOT/COLD HAND ====================
+def engine_hot_cold(outcomes):
+    """
+    Tracks bot's OWN recent prediction form.
+    - Hot hand: last 4+ predictions won → follow the bot's current engine consensus with boost
+    - Cold hand: last 4+ predictions lost → dampen confidence
+    Returns probability based on recent form and current trend.
+    """
+    form = STATE.get("bot_recent_form", [])
+    if len(form) < 3:
+        return 0.5
+    
+    # Last N results (0=loss, 1=win)
+    recent_form = form[-6:]
+    wins = sum(recent_form)
+    total = len(recent_form)
+    win_rate = wins / total
+    
+    # Hot hand detection
+    hot_streak = 0
+    for r in reversed(form):
+        if r == 1: hot_streak += 1
+        else: break
+    
+    cold_streak = 0
+    for r in reversed(form):
+        if r == 0: cold_streak += 1
+        else: break
+    
+    # Base prediction: follow recent outcome momentum
+    # When bot is on hot streak, current trend is working. Boost that direction.
+    if len(outcomes) < 3: return 0.5
+    recent_outcomes = outcomes[-3:]
+    momentum = sum(recent_outcomes) / 3.0
+    
+    # Adjust based on bot's form
+    if hot_streak >= 3:
+        # Bot is reading market well — boost current momentum
+        p_big = 0.5 + (momentum - 0.5) * 1.5
+    elif cold_streak >= 3:
+        # Bot is misreading — reverse the momentum signal
+        p_big = 0.5 - (momentum - 0.5) * 1.0
+    else:
+        p_big = 0.5 + (momentum - 0.5) * 0.5
+    
+    return max(0.15, min(0.85, p_big))
+
+# ==================== 🎰 ENGINE 8: GAMBLER INSTINCT ====================
+def engine_gambler_instinct(history):
+    """
+    Combines multiple "gambler sense" signals:
+    - Jack timing (how many periods since 0 or 5 appeared)
+    - Number spread (are numbers spreading or clustering?)
+    - Recent choppiness
+    - Session pressure (wins vs losses)
+    """
+    numbers = [h["number"] for h in history if h["number"] >= 0]
+    sizes = [h["size"] for h in history if h["number"] >= 0]
+    if len(numbers) < 20 or len(sizes) < 20: return 0.5
+    
+    signals = []
+    weights = []
+    
+    # Signal 1: Jack timing
+    # Find last jack (0 or 5) position
+    periods_since_jack = 0
+    for i in range(len(numbers) - 1, -1, -1):
+        if numbers[i] in (0, 5):
+            periods_since_jack = len(numbers) - 1 - i
+            break
+    else:
+        periods_since_jack = 20
+    
+    # Jacks occur ~20% of time (2 numbers out of 10). Mean gap = 5 periods.
+    # If > 8 periods since last jack, higher chance of next being jack
+    if periods_since_jack >= 8:
+        jack_pressure = min(1.0, (periods_since_jack - 5) / 10.0)
+        # Jacks: 0 (SMALL), 5 (BIG). Look at last two jacks to see which is "due"
+        recent_jacks = [n for n in numbers[-30:] if n in (0, 5)]
+        if recent_jacks:
+            last_jack = recent_jacks[-1]
+            # If last jack was 0, expect 5 next (BIG)
+            # If last jack was 5, expect 0 next (SMALL)
+            jack_bias = 0.5 + (0.15 * jack_pressure if last_jack == 0 else -0.15 * jack_pressure)
+            signals.append(jack_bias)
+            weights.append(0.6)
+    
+    # Signal 2: Number spread
+    # If recent numbers are clustered (few unique), next is likely different
+    recent_nums = numbers[-12:]
+    unique_ratio = len(set(recent_nums)) / len(recent_nums)
+    if unique_ratio < 0.5:
+        # Very clustered — expect spread, mixed signal
+        pass
+    elif unique_ratio > 0.85:
+        # Well spread — normal
+        pass
+    
+    # Signal 3: Choppiness (alternating pattern)
+    recent_sizes = sizes[-15:]
+    alternations = sum(1 for i in range(len(recent_sizes)-1) if recent_sizes[i] != recent_sizes[i+1])
+    chop_ratio = alternations / (len(recent_sizes) - 1)
+    if chop_ratio > 0.75:
+        # Very choppy — follow last (continuation of chop)
+        next_pred = 1 - recent_sizes[-1]
+        signals.append(0.5 + (0.10 if next_pred == 1 else -0.10))
+        weights.append(0.4)
+    
+    # Signal 4: Session pressure (if we're losing badly, be more conservative)
+    total_wins = STATE.get("total_wins", 0)
+    total_losses = STATE.get("total_losses", 0)
+    if total_wins + total_losses >= 10:
+        session_wr = total_wins / (total_wins + total_losses)
+        if session_wr < 0.45:
+            # Losing session — trust the last outcome less
+            last = sizes[-1]
+            counter = 1 - last
+            signals.append(0.5 + (0.08 if counter == 1 else -0.08))
+            weights.append(0.3)
+    
+    if not signals: return 0.5
+    
+    total_w = sum(weights)
+    p_big = sum(s * w for s, w in zip(signals, weights)) / total_w
+    return max(0.20, min(0.80, p_big))
+
 # ==================== ADAPTIVE WEIGHTS ====================
 REGIME_EXPERT_WEIGHTS = {
-    "ALTERNATING":   {"pattern": 0.30, "trend": 0.12, "number_seq": 0.20, "hot_number": 0.15, "streak_break": 0.23},
-    "BIG_HEAVY":     {"pattern": 0.25, "trend": 0.22, "number_seq": 0.18, "hot_number": 0.15, "streak_break": 0.20},
-    "SMALL_HEAVY":   {"pattern": 0.25, "trend": 0.22, "number_seq": 0.18, "hot_number": 0.15, "streak_break": 0.20},
-    "LONG_STREAK":   {"pattern": 0.22, "trend": 0.18, "number_seq": 0.15, "hot_number": 0.12, "streak_break": 0.33},
-    "BALANCED":      {"pattern": 0.30, "trend": 0.17, "number_seq": 0.18, "hot_number": 0.15, "streak_break": 0.20},
+    "ALTERNATING":   {"pattern": 0.22, "trend": 0.09, "number_seq": 0.14, "hot_number": 0.10, "streak_break": 0.17, "rhythm": 0.13, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "BIG_HEAVY":     {"pattern": 0.19, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "SMALL_HEAVY":   {"pattern": 0.19, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "LONG_STREAK":   {"pattern": 0.16, "trend": 0.13, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.26, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.07},
+    "BALANCED":      {"pattern": 0.22, "trend": 0.12, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.11, "hot_cold": 0.09, "gambler_instinct": 0.07},
 }
 
 def get_adaptive_weights(regime):
@@ -404,6 +576,9 @@ def predict_next(history):
         "number_seq": engine_number_sequence(history),
         "hot_number": engine_hot_number(history),
         "streak_break": engine_streak_break(outcomes),
+        "rhythm": engine_rhythm(outcomes),
+        "hot_cold": engine_hot_cold(outcomes),
+        "gambler_instinct": engine_gambler_instinct(history),
     }
 
     regime = detect_regime(outcomes)
@@ -416,16 +591,12 @@ def predict_next(history):
     else:
         p_big = 0.5 - (0.5 - p_big) * (0.5 + predictability * 0.5)
 
-    # Anti-error flip
     p_big, override_active, override_reason = check_anti_error(outcomes, p_big)
-
-    # Pattern auto-flip
     p_big, pat_flip_active, pat_flip_reason = check_pattern_flip(outcomes, p_big)
 
-    # 🔥 HONEST CONFIDENCE — no floor at 0.52
     base_conf = max(p_big, 1 - p_big)
     cal_pen = STATE.get("calibration_offset", 0.0) * 0.5
-    conf = max(0.50, min(0.95, base_conf - cal_pen))  # 🔥 floor 0.50 (honest)
+    conf = max(0.50, min(0.95, base_conf - cal_pen))
     signal_label = get_signal_label(conf)
 
     pred_size = 1 if p_big >= 0.5 else 0
@@ -446,6 +617,21 @@ def predict_next(history):
         elif p_strength >= 0.1: strength_label = "○ WEAK"
         else: strength_label = "💤 FLAT"
 
+    # 🔥 Bot's current form
+    form = STATE.get("bot_recent_form", [])
+    if form:
+        recent5 = form[-5:]
+        wins5 = sum(recent5)
+        form_str = f"{wins5}/{len(recent5)}"
+        # Streak
+        hot = sum(1 for r in reversed(form) if r == 1)
+        cold = sum(1 for r in reversed(form) if r == 0)
+        if hot >= 3: form_label = f"🔥 HOT ({form_str})"
+        elif cold >= 3: form_label = f"❄️ COLD ({form_str})"
+        else: form_label = f"😐 NEUTRAL ({form_str})"
+    else:
+        form_label = "N/A"
+
     return {
         "pred_size": pred_size, "confidence": conf,
         "signal_label": signal_label,
@@ -458,6 +644,7 @@ def predict_next(history):
         "strength_note": strength_note,
         "strength_label": strength_label,
         "pattern_strength": p_strength,
+        "form_label": form_label,
         "anti_error_active": override_active,
         "anti_error_reason": override_reason,
         "pat_flip_active": pat_flip_active,
@@ -521,8 +708,12 @@ def update_global_stats(win):
         STATE["current_loss_streak"] = STATE.get("current_loss_streak", 0) + 1
         if STATE["current_loss_streak"] > STATE.get("max_b2b_loss", 0):
             STATE["max_b2b_loss"] = STATE["current_loss_streak"]
-        # 🔥 MAX LEVEL 3
         STATE["current_level"] = min(STATE.get("current_level", 1) + 1, MAX_LEVEL)
+    # 🔥 Track bot's form
+    form = STATE.setdefault("bot_recent_form", [])
+    form.append(1 if win else 0)
+    if len(form) > 20:
+        STATE["bot_recent_form"] = form[-20:]
 
 def update_pattern_memory(signature, actual_big):
     if not signature: return
@@ -588,7 +779,6 @@ def build_stats_footer():
     pflips = STATE.get("pattern_flips", 0)
     pflips_won = STATE.get("pattern_flips_won", 0)
     pflip_acc = (pflips_won / pflips * 100) if pflips > 0 else 0.0
-    skipped = STATE.get("skipped_rounds", 0)
     level_str = f"{BET_LEVELS[min(level-1, len(BET_LEVELS)-1)]}X"
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -599,8 +789,7 @@ def build_stats_footer():
         f"💰 *Level:* `{level}` ({level_str})\n"
         f"🧠 *Pat:* `{patterns}` | 💪 *Strong:* `{strong_pats}`\n"
         f"🔢 *Num:* `{num_db}` | ⚠️ *Err:* `{errors}`\n"
-        f"🎓 *AE-Flips:* `{learned}` | 🔄 *Pat-Flips:* `{pflips}` (won {pflips_won}, {pflip_acc:.0f}%)\n"
-        f"⏸️ *Skipped:* `{skipped}` (low signal)"
+        f"🎓 *AE-Flips:* `{learned}` | 🔄 *Pat-Flips:* `{pflips}` (won {pflips_won}, {pflip_acc:.0f}%)"
     )
 
 # ==================== TELEGRAM ====================
@@ -682,7 +871,6 @@ class BotStateMachine:
 
         # ---- PREDICT ----
         if not self.pending or self.pending["last_issue"] != li:
-            # Get original prediction (before flips)
             outcomes_local = [h["size"] for h in history]
             ep_orig = {
                 "pattern": engine_pattern(outcomes_local),
@@ -690,6 +878,9 @@ class BotStateMachine:
                 "number_seq": engine_number_sequence(history),
                 "hot_number": engine_hot_number(history),
                 "streak_break": engine_streak_break(outcomes_local),
+                "rhythm": engine_rhythm(outcomes_local),
+                "hot_cold": engine_hot_cold(outcomes_local),
+                "gambler_instinct": engine_gambler_instinct(history),
             }
             regime_local = detect_regime(outcomes_local)
             w_local = get_adaptive_weights(regime_local)
@@ -698,14 +889,6 @@ class BotStateMachine:
 
             pred = predict_next(history)
             ps = pred["pred_size"]; conf = pred["confidence"]; sig = pred["signature"]
-
-            # 🔥 SKIP LOW SIGNAL
-            if conf < MIN_CONFIDENCE_TO_SEND:
-                STATE["skipped_rounds"] = STATE.get("skipped_rounds", 0) + 1
-                logger.info(f"⏸️ Skipped {li+1} — conf {conf*100:.1f}% < {MIN_CONFIDENCE_TO_SEND*100}%")
-                STATE["last_processed_issue"] = li
-                save_state(STATE)
-                return
 
             ni = li + 1
             pn = advanced_number_predictor(history, ps)
@@ -725,9 +908,11 @@ class BotStateMachine:
 
             hb = format_synced_history_logs(history)
             ep = pred["engine_probs"]
-            cons = (f"PAT:{ep['pattern']:.2f} TRD:{ep['trend']:.2f} "
-                    f"NSQ:{ep['number_seq']:.2f} HOT:{ep['hot_number']:.2f} "
-                    f"BRK:{ep['streak_break']:.2f}")
+            cons1 = (f"PAT:{ep['pattern']:.2f} TRD:{ep['trend']:.2f} "
+                     f"NSQ:{ep['number_seq']:.2f} HOT:{ep['hot_number']:.2f} "
+                     f"BRK:{ep['streak_break']:.2f}")
+            cons2 = (f"RHY:{ep['rhythm']:.2f} HCD:{ep['hot_cold']:.2f} "
+                     f"GMB:{ep['gambler_instinct']:.2f}")
             weights_str = " ".join([f"{k[:3].upper()}:{v:.2f}" for k, v in pred["weights"].items()])
 
             override_note = ""
@@ -753,12 +938,13 @@ class BotStateMachine:
             stats_footer = build_stats_footer()
 
             msg = (
-                f"🎯 *QUANTUM V28.3 FINAL* 🎯\n"
+                f"🎯 *QUANTUM V28.4 GAMBLER MIND* 🎯\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 *Period:* `{ni}`\n"
                 f"🎲 *Number:* `{pn}`\n"
                 f"🔥 *Target:* *{'BIGGG 🟢' if ps == 1 else 'SMALL 🔴'}*\n"
                 f"📊 *Confidence:* `{conf*100:.1f}%` | {pred['signal_label']}\n"
+                f"🎰 *Bot Form:* {pred['form_label']}\n"
                 f"📈 *Regime:* `{pred['regime']}` | *Entropy:* `{pred['entropy']:.2f}`\n"
                 f"💰 *Fund:* `{fund_advice}` (Level {level})"
                 f"{override_note}"
@@ -769,7 +955,7 @@ class BotStateMachine:
                 f"🔢 *Num Sig:* `{num_sig_str}`"
                 f"{hot_info}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧠 *5-Engine Consensus:*\n`{cons}`\n"
+                f"🧠 *8-Engine Consensus:*\n`{cons1}`\n`{cons2}`\n"
                 f"⚖️ *Weights:* `{weights_str}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📜 *TREND (8)*:\n{hb}"
@@ -782,7 +968,7 @@ class BotStateMachine:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    logger.info("Warmup V28.3...")
+    logger.info("Warmup V28.4...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate_and_sanitize(raw)
@@ -808,6 +994,9 @@ async def warmup(session):
             "number_seq": engine_number_sequence(partial),
             "hot_number": engine_hot_number(partial),
             "streak_break": engine_streak_break(outcomes_local),
+            "rhythm": engine_rhythm(outcomes_local),
+            "hot_cold": engine_hot_cold(outcomes_local),
+            "gambler_instinct": engine_gambler_instinct(partial),
         }
         regime = detect_regime(outcomes_local)
         w = get_adaptive_weights(regime)
@@ -828,10 +1017,11 @@ async def warmup(session):
         except Exception: continue
     save_state(STATE)
     logger.info(f"Warmup done. Pat:{len(STATE.get('pattern_memory', {}))} "
-                f"Strong:{len(STATE.get('pattern_strength', {}))}")
+                f"Strong:{len(STATE.get('pattern_strength', {}))} "
+                f"Engines:{len(STATE.get('engine_stats', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V28.3 FINAL ACTIVE", status=200)
+async def health(r): return web.Response(text="V28.4 GAMBLER MIND ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get('/', health)
