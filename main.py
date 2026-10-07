@@ -18,13 +18,14 @@ WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g
 # ================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("QuantumV32")
+logger = logging.getLogger("QuantumV32_1")
 handler = RotatingFileHandler('bot.log', maxBytes=5*1024*1024, backupCount=2)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
-STATE_FILE = "engine_state_v32.json"
+STATE_FILE = "engine_state_v32_1.json"
 PATTERN_SIG_LEN = 14
+ERROR_SIG_LEN = 8  # 🔥 FIX 1: Error signature short kiya
 PATTERN_LENGTHS = [4, 6, 8, 10, 12, 14]
 ERROR_THRESHOLD = 2
 SIMILAR_ERROR_RADIUS = 1
@@ -42,10 +43,10 @@ def default_engine_state():
         "regime_stats": {}
     }
 
+# 🔥 Removed dead engines (jack, skip, vshape, cyclic, mirror)
 ENGINES = ["pattern", "trend", "arith", "symmetry", "opposite",
            "number_seq", "repeated_num", "double_detect", "overlap_series",
-           "connected_series", "auto_formula", "mirror", "cyclic",
-           "vshape", "skip_series", "jack_corr"]
+           "connected_series", "auto_formula"]
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -54,6 +55,10 @@ def load_state():
             for eng in ENGINES:
                 if eng not in s.get("engine_stats", {}):
                     s.setdefault("engine_stats", {})[eng] = default_engine_state()
+            # Remove dead engines
+            for dead in ["mirror", "cyclic", "vshape", "skip_series", "jack_corr"]:
+                if dead in s.get("engine_stats", {}):
+                    del s["engine_stats"][dead]
             s.setdefault("total_wins", 0); s.setdefault("total_losses", 0)
             s.setdefault("current_loss_streak", 0); s.setdefault("max_b2b_loss", 0)
             s.setdefault("current_level", 1)
@@ -96,6 +101,11 @@ STATE = load_state()
 
 # ==================== HELPERS ====================
 def pattern_signature(outcomes, length=PATTERN_SIG_LEN):
+    if len(outcomes) < length: return None
+    return "".join('B' if x else 'S' for x in outcomes[-length:])
+
+def error_signature(outcomes, length=ERROR_SIG_LEN):
+    """🔥 FIX 1: Short signature for error tracking (8 length)"""
     if len(outcomes) < length: return None
     return "".join('B' if x else 'S' for x in outcomes[-length:])
 
@@ -516,7 +526,8 @@ def engine_connected_series(history):
     if len(numbers) < 7: return 0.5
     pred_num, conf, _ = analyze_connected_series(numbers)
     if pred_num is None: return 0.5
-    recent = numbers[-7:]
+    # 🔥 FIX 3: Simplified signature
+    recent = numbers[-5:]  # 5 numbers only
     sig_parts = []
     for i in range(len(recent)):
         for j in range(i+1, len(recent)):
@@ -545,32 +556,10 @@ def apply_formula(a, b, c, formula_id):
         if formula_id == "sum3": return (a + b + c) % 10
         if formula_id == "diff3": return abs(a - b - c)
         if formula_id == "diffsum": return abs((a + b) - c)
-        if formula_id == "gcd": return math.gcd(a, b) if a > 0 and b > 0 else a
-        if formula_id == "lcm":
-            g = math.gcd(a, b)
-            return ((a * b) // g) % 10 if g > 0 else 0
-        if formula_id == "xor": return a ^ b
-        if formula_id == "or": return (a | b) % 10
-        if formula_id == "and": return (a & b) % 10
         if formula_id == "diffplus1": return (abs(a - b) + 1) % 10
         if formula_id == "summinus1": return (a + b - 1) % 10
         if formula_id == "avg3": return (a + b + c) // 3
-        if formula_id == "digitalroot": return ((a + b) - 1) % 9 + 1 if (a+b) > 0 else 0
-        if formula_id == "sqdiff": return (a*a - b*b) % 10
-        if formula_id == "ab_plus_c": return (a + b + c) % 10
-        if formula_id == "abc_diff": return abs(a - b + c)
-        if formula_id == "reverse":
-            s = str((a + b) % 100)
-            return int(s[::-1]) % 10
-        if formula_id == "tens": return ((a + b) // 10) % 10
         if formula_id == "units": return ((a + b) % 10)
-        if formula_id == "halfsum": return (a + b) % 5
-        if formula_id == "third": return (a + b) % 3
-        if formula_id == "prime":
-            primes = [2,3,5,7]
-            return primes[(a+b) % 4]
-        if formula_id == "fib_step":
-            return (a + b) % 10 if (a <= 9 and b <= 9) else 0
         if formula_id == "gap1": return (b + 1) % 10
         if formula_id == "gap2": return (b + 2) % 10
         if formula_id == "gapminus1": return (b - 1) % 10
@@ -580,13 +569,9 @@ def apply_formula(a, b, c, formula_id):
         return None
     return None
 
-ALL_FORMULAS = [
-    "sum", "diff", "mid", "mul", "sum3", "diff3", "diffsum", "gcd", "lcm",
-    "xor", "or", "and", "diffplus1", "summinus1", "avg3", "digitalroot",
-    "sqdiff", "ab_plus_c", "abc_diff", "reverse", "tens", "units",
-    "halfsum", "third", "prime", "fib_step", "gap1", "gap2",
-    "gapminus1", "gapminus2", "alt_sumdiff"
-]
+ALL_FORMULAS = ["sum", "diff", "mid", "mul", "sum3", "diff3", "diffsum",
+                "diffplus1", "summinus1", "avg3", "units", "gap1", "gap2",
+                "gapminus1", "gapminus2", "alt_sumdiff"]
 
 def discover_formulas(history):
     numbers = [h["number"] for h in history if h["number"] >= 0]
@@ -610,11 +595,10 @@ def discover_formulas(history):
 
 def engine_auto_formula(history):
     numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
     if len(numbers) < 10: return 0.5
     af = STATE.get("auto_formulas", {})
     if not af: return 0.5
-    good_formulas = [(f, d) for f, d in af.items() if d.get("accuracy", 0) >= 0.20]
+    good_formulas = [(f, d) for f, d in af.items() if d.get("accuracy", 0) >= 0.15]
     if not good_formulas: return 0.5
     a, b, c = numbers[-3], numbers[-2], numbers[-1]
     votes = {}
@@ -630,169 +614,13 @@ def engine_auto_formula(history):
     if total < 0.5: return 0.5
     return (big_w + 0.5) / (total + 1.0)
 
-# ==================== ENGINE 12: MIRROR ====================
-def engine_mirror(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 15: return 0.5
-    for length in [5, 4]:
-        if len(numbers) < length: continue
-        recent = numbers[-length:]
-        is_palindrome = all(recent[i] == recent[length-1-i] for i in range(length//2))
-        if is_palindrome:
-            big_w = small_w = 0.0
-            for i in range(length, len(numbers)):
-                window = numbers[i-length:i]
-                if all(window[j] == window[length-1-j] for j in range(length//2)):
-                    if i < len(sizes):
-                        recency = math.exp((i / len(numbers)) * 3.0)
-                        if sizes[i] == 1: big_w += recency
-                        else: small_w += recency
-            total = big_w + small_w
-            if total >= 0.5:
-                return (big_w + 0.5) / (total + 1.0)
-    if len(numbers) >= 6:
-        if numbers[-3:] == list(reversed(numbers[-6:-3])):
-            big_w = small_w = 0.0
-            for i in range(6, len(numbers)):
-                if numbers[i-3:i] == list(reversed(numbers[i-6:i-3])):
-                    if i < len(sizes):
-                        recency = math.exp((i / len(numbers)) * 3.0)
-                        if sizes[i] == 1: big_w += recency
-                        else: small_w += recency
-            total = big_w + small_w
-            if total >= 0.5:
-                return (big_w + 0.5) / (total + 1.0)
-    return 0.5
-
-# ==================== ENGINE 13: CYCLIC ====================
-def engine_cyclic(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 15: return 0.5
-    for block_size in [4, 3, 2]:
-        if len(numbers) < block_size * 2: continue
-        last_block = numbers[-block_size:]
-        prev_block = numbers[-2*block_size:-block_size]
-        if last_block == prev_block:
-            big_w = small_w = 0.0
-            for i in range(block_size * 2, len(numbers)):
-                if numbers[i-block_size:i] == numbers[i-2*block_size:i-block_size]:
-                    if i < len(sizes):
-                        recency = math.exp((i / len(numbers)) * 3.0)
-                        if sizes[i] == 1: big_w += recency
-                        else: small_w += recency
-            total = big_w + small_w
-            if total >= 0.5:
-                return (big_w + 0.5) / (total + 1.0)
-    if len(sizes) >= 8:
-        recent_sizes = sizes[-4:]
-        prev_sizes = sizes[-8:-4]
-        if recent_sizes == prev_sizes:
-            big_w = small_w = 0.0
-            for i in range(8, len(sizes)):
-                if sizes[i-4:i] == sizes[i-8:i-4]:
-                    recency = math.exp((i / len(sizes)) * 3.0)
-                    if sizes[i] == 1: big_w += recency
-                    else: small_w += recency
-            total = big_w + small_w
-            if total >= 0.5:
-                return (big_w + 0.5) / (total + 1.0)
-    return 0.5
-
-# ==================== ENGINE 14: V-SHAPE ====================
-def engine_vshape(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 10: return 0.5
-    recent = numbers[-4:]
-    ascending = all(recent[i] < recent[i+1] for i in range(len(recent)-1))
-    descending = all(recent[i] > recent[i+1] for i in range(len(recent)-1))
-    if not (ascending or descending): return 0.5
-    big_w = small_w = 0.0
-    for i in range(4, len(numbers)):
-        window = numbers[i-4:i]
-        if all(window[j] < window[j+1] for j in range(3)):
-            if i < len(sizes):
-                recency = math.exp((i / len(numbers)) * 3.0)
-                if sizes[i] == 1: big_w += recency
-                else: small_w += recency
-        elif all(window[j] > window[j+1] for j in range(3)):
-            if i < len(sizes):
-                recency = math.exp((i / len(numbers)) * 3.0)
-                if sizes[i] == 1: big_w += recency
-                else: small_w += recency
-    total = big_w + small_w
-    if total >= 0.5:
-        return (big_w + 0.5) / (total + 1.0)
-    return 0.5
-
-# ==================== ENGINE 15: SKIP SERIES ====================
-def engine_skip_series(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 10: return 0.5
-    for gap in [2, 3, 4]:
-        recent = numbers[-4:]
-        if len(recent) < 3: continue
-        d1 = recent[-2] - recent[-3]
-        d2 = recent[-1] - recent[-2]
-        if d1 == gap and d2 == gap:
-            big_w = small_w = 0.0
-            for i in range(3, len(numbers)):
-                d_1 = numbers[i-1] - numbers[i-2]
-                d_2 = numbers[i] - numbers[i-1]
-                if d_1 == gap and d_2 == gap:
-                    if i + 1 < len(sizes):
-                        recency = math.exp((i / len(numbers)) * 3.0)
-                        if sizes[i+1] == 1: big_w += recency
-                        else: small_w += recency
-            total = big_w + small_w
-            if total >= 0.5:
-                return (big_w + 0.5) / (total + 1.0)
-        if d1 == -gap and d2 == -gap:
-            big_w = small_w = 0.0
-            for i in range(3, len(numbers)):
-                d_1 = numbers[i-1] - numbers[i-2]
-                d_2 = numbers[i] - numbers[i-1]
-                if d_1 == -gap and d_2 == -gap:
-                    if i + 1 < len(sizes):
-                        recency = math.exp((i / len(numbers)) * 3.0)
-                        if sizes[i+1] == 1: big_w += recency
-                        else: small_w += recency
-            total = big_w + small_w
-            if total >= 0.5:
-                return (big_w + 0.5) / (total + 1.0)
-    return 0.5
-
-# ==================== ENGINE 16: JACK CORRELATION ====================
-def engine_jack_corr(history):
-    numbers = [h["number"] for h in history if h["number"] >= 0]
-    sizes = [h["size"] for h in history if h["number"] >= 0]
-    if len(numbers) < 15: return 0.5
-    last = numbers[-1]
-    if last not in (0, 5): return 0.5
-    big_w = small_w = 0.0
-    total_matches = 0
-    for i in range(len(numbers) - 1):
-        if numbers[i] == last:
-            if i + 1 < len(sizes):
-                recency = math.exp((i / len(numbers)) * 3.0)
-                if sizes[i+1] == 1: big_w += recency
-                else: small_w += recency
-                total_matches += 1
-    total = big_w + small_w
-    if total_matches < 3 or total < 0.5:
-        return 0.5
-    return (big_w + 0.5) / (total + 1.0)
-
 # ==================== ADAPTIVE WEIGHTS ====================
 REGIME_EXPERT_WEIGHTS = {
-    "ALTERNATING":   {"pattern": 0.08, "trend": 0.05, "arith": 0.08, "symmetry": 0.06, "opposite": 0.05, "number_seq": 0.06, "repeated_num": 0.08, "double_detect": 0.07, "overlap_series": 0.13, "connected_series": 0.08, "auto_formula": 0.08, "mirror": 0.05, "cyclic": 0.05, "vshape": 0.04, "skip_series": 0.05, "jack_corr": 0.03},
-    "BIG_HEAVY":     {"pattern": 0.08, "trend": 0.09, "arith": 0.08, "symmetry": 0.06, "opposite": 0.09, "number_seq": 0.06, "repeated_num": 0.06, "double_detect": 0.07, "overlap_series": 0.11, "connected_series": 0.07, "auto_formula": 0.08, "mirror": 0.05, "cyclic": 0.04, "vshape": 0.04, "skip_series": 0.04, "jack_corr": 0.03},
-    "SMALL_HEAVY":   {"pattern": 0.08, "trend": 0.09, "arith": 0.08, "symmetry": 0.06, "opposite": 0.09, "number_seq": 0.06, "repeated_num": 0.06, "double_detect": 0.07, "overlap_series": 0.11, "connected_series": 0.07, "auto_formula": 0.08, "mirror": 0.05, "cyclic": 0.04, "vshape": 0.04, "skip_series": 0.04, "jack_corr": 0.03},
-    "LONG_STREAK":   {"pattern": 0.06, "trend": 0.07, "arith": 0.06, "symmetry": 0.05, "opposite": 0.14, "number_seq": 0.05, "repeated_num": 0.06, "double_detect": 0.08, "overlap_series": 0.12, "connected_series": 0.07, "auto_formula": 0.07, "mirror": 0.04, "cyclic": 0.04, "vshape": 0.04, "skip_series": 0.04, "jack_corr": 0.01},
-    "BALANCED":      {"pattern": 0.09, "trend": 0.06, "arith": 0.08, "symmetry": 0.07, "opposite": 0.06, "number_seq": 0.05, "repeated_num": 0.08, "double_detect": 0.06, "overlap_series": 0.12, "connected_series": 0.07, "auto_formula": 0.10, "mirror": 0.05, "cyclic": 0.04, "vshape": 0.03, "skip_series": 0.04, "jack_corr": 0.03},
+    "ALTERNATING":   {"pattern": 0.14, "trend": 0.08, "arith": 0.14, "symmetry": 0.12, "opposite": 0.08, "number_seq": 0.10, "repeated_num": 0.12, "double_detect": 0.10, "overlap_series": 0.16, "connected_series": 0.10, "auto_formula": 0.10},
+    "BIG_HEAVY":     {"pattern": 0.14, "trend": 0.15, "arith": 0.13, "symmetry": 0.11, "opposite": 0.13, "number_seq": 0.09, "repeated_num": 0.09, "double_detect": 0.10, "overlap_series": 0.14, "connected_series": 0.10, "auto_formula": 0.12},
+    "SMALL_HEAVY":   {"pattern": 0.14, "trend": 0.15, "arith": 0.13, "symmetry": 0.11, "opposite": 0.13, "number_seq": 0.09, "repeated_num": 0.09, "double_detect": 0.10, "overlap_series": 0.14, "connected_series": 0.10, "auto_formula": 0.12},
+    "LONG_STREAK":   {"pattern": 0.10, "trend": 0.11, "arith": 0.10, "symmetry": 0.08, "opposite": 0.22, "number_seq": 0.08, "repeated_num": 0.09, "double_detect": 0.12, "overlap_series": 0.15, "connected_series": 0.10, "auto_formula": 0.10},
+    "BALANCED":      {"pattern": 0.15, "trend": 0.10, "arith": 0.13, "symmetry": 0.11, "opposite": 0.10, "number_seq": 0.09, "repeated_num": 0.12, "double_detect": 0.09, "overlap_series": 0.15, "connected_series": 0.10, "auto_formula": 0.11},
 }
 
 def get_adaptive_weights(regime):
@@ -815,16 +643,23 @@ def combine_engines(engine_probs, weights):
     return sum(engine_probs[e] * weights[e] for e in engine_probs) / total_w
 
 def gradient_update(engine_probs, actual_big, lr=0.01):
+    """🔥 FIX 2: Weight recovery for high-confidence engines"""
     actual = 1.0 if actual_big else 0.0
     for eng, prob in engine_probs.items():
         stats = STATE["engine_stats"].setdefault(eng, default_engine_state())
         grad = (prob - actual) * (prob - 0.5) * 2.0
         old_w = stats.get("gradient_weight", 1.0)
-        stats["gradient_weight"] = max(0.3, min(3.0, old_w - lr * grad))
+        new_w = max(0.3, min(3.0, old_w - lr * grad))
+        # 🔥 FIX: High-confidence recovery
+        confidence = max(prob, 1 - prob)
+        if confidence >= 0.70 and new_w < 0.10:
+            new_w = 0.10  # Minimum floor for high-confidence engines
+        stats["gradient_weight"] = new_w
 
-# ==================== ANTI-ERROR ====================
+# ==================== ANTI-ERROR (FIX 1: Short signature) ====================
 def check_anti_error(outcomes, current_p_big):
-    sig = pattern_signature(outcomes)
+    """🔥 FIX 1: Uses 8-length signature instead of 14"""
+    sig = error_signature(outcomes, ERROR_SIG_LEN)
     if not sig: return current_p_big, False, ""
     err = STATE.get("error_patterns", {}).get(sig)
     if err and err.get("fail_count", 0) >= ERROR_THRESHOLD:
@@ -854,11 +689,6 @@ def predict_next(history):
         "overlap_series": engine_overlapping_series(history),
         "connected_series": engine_connected_series(history),
         "auto_formula": engine_auto_formula(history),
-        "mirror": engine_mirror(history),
-        "cyclic": engine_cyclic(history),
-        "vshape": engine_vshape(history),
-        "skip_series": engine_skip_series(history),
-        "jack_corr": engine_jack_corr(history),
     }
 
     regime = detect_regime(outcomes)
@@ -952,7 +782,7 @@ def advanced_number_predictor(history_list, predicted_size):
     if len(numbers) >= 3:
         a, b, c = numbers[-3], numbers[-2], numbers[-1]
         for f_id, f_data in STATE.get("auto_formulas", {}).items():
-            if f_data.get("accuracy", 0) >= 0.20:
+            if f_data.get("accuracy", 0) >= 0.15:
                 pred = apply_formula(a, b, c, f_id)
                 if pred is not None and pred in candidates:
                     af_candidates.add(pred)
@@ -1010,16 +840,18 @@ def update_pattern_memory(signature, actual_big):
     if actual_big: pm["next_big"] += 1
     else: pm["next_small"] += 1
 
-def update_error_pattern(signature, won):
-    if not signature: return
+def update_error_pattern(outcomes, won):
+    """🔥 FIX 1: Uses 8-length signature"""
+    sig = error_signature(outcomes, ERROR_SIG_LEN)
+    if not sig: return
     if won:
-        ep = STATE.setdefault("error_patterns", {}).get(signature)
+        ep = STATE.setdefault("error_patterns", {}).get(sig)
         if ep:
             ep["fail_count"] = max(0, ep["fail_count"] - 1)
             ep["total"] = ep.get("total", 1) + 1
-            if ep["fail_count"] == 0: del STATE["error_patterns"][signature]
+            if ep["fail_count"] == 0: del STATE["error_patterns"][sig]
     else:
-        ep = STATE.setdefault("error_patterns", {}).setdefault(signature, {"fail_count": 0, "total": 0})
+        ep = STATE.setdefault("error_patterns", {}).setdefault(sig, {"fail_count": 0, "total": 0})
         ep["fail_count"] += 1; ep["total"] = ep.get("total", 0) + 1
 
 def update_number_memory(history):
@@ -1072,17 +904,9 @@ def update_series_history(history):
         sh = STATE.setdefault("series_history", {}).setdefault(sig, {"big": 0, "small": 0})
         if next_size == 1: sh["big"] += 1
         else: sh["small"] += 1
-        rule_type = set()
-        for part in sig.split("|"):
-            if "P" in part: rule_type.add("PLUS")
-            if "M" in part: rule_type.add("MINUS")
-        loose_sig = "&".join(sorted(rule_type))
-        if loose_sig:
-            sh_loose = STATE.setdefault("series_history", {}).setdefault("LOOSE::" + loose_sig, {"big": 0, "small": 0})
-            if next_size == 1: sh_loose["big"] += 1
-            else: sh_loose["small"] += 1
 
 def update_connected_history(history):
+    """🔥 FIX 3: Simplified signature"""
     numbers = [h["number"] for h in history if h["number"] >= 0]
     sizes = [h["size"] for h in history if h["number"] >= 0]
     if len(numbers) < 8: return
@@ -1090,7 +914,7 @@ def update_connected_history(history):
         sub_nums = numbers[:end_idx]
         pred_num, conf, _ = analyze_connected_series(sub_nums)
         if pred_num is None: continue
-        recent = sub_nums[-7:]
+        recent = sub_nums[-5:]  # 🔥 5 numbers
         sig_parts = []
         for i in range(len(recent)):
             for j in range(i+1, len(recent)):
@@ -1206,9 +1030,9 @@ class BotStateMachine:
             actual_size_str = "BIGGG" if ab else "SMALL"
             win = (actual_size_str == self.pending["pred_size"])
             update_global_stats(win)
-            sig = self.pending.get("pattern_sig")
-            update_pattern_memory(sig, ab)
-            update_error_pattern(sig, win)
+            update_pattern_memory(self.pending.get("pattern_sig"), ab)
+            # 🔥 FIX: Use 8-length signature for error tracking
+            update_error_pattern(outcomes, win)
             update_number_memory(history)
             update_arith_rules(history)
             update_series_history(history)
@@ -1238,13 +1062,10 @@ class BotStateMachine:
             ep = pred["engine_probs"]
             cons1 = (f"PAT:{ep['pattern']:.2f} TRD:{ep['trend']:.2f} "
                      f"ARH:{ep['arith']:.2f} SYM:{ep['symmetry']:.2f} "
-                     f"OPP:{ep['opposite']:.2f} NSQ:{ep['number_seq']:.2f} "
-                     f"REP:{ep['repeated_num']:.2f}")
-            cons2 = (f"DBL:{ep['double_detect']:.2f} OVL:{ep['overlap_series']:.2f} "
-                     f"CS:{ep['connected_series']:.2f} FORM:{ep['auto_formula']:.2f} "
-                     f"MIR:{ep['mirror']:.2f} CYC:{ep['cyclic']:.2f}")
-            cons3 = (f"VSH:{ep['vshape']:.2f} SKP:{ep['skip_series']:.2f} "
-                     f"JCK:{ep['jack_corr']:.2f}")
+                     f"OPP:{ep['opposite']:.2f} NSQ:{ep['number_seq']:.2f}")
+            cons2 = (f"REP:{ep['repeated_num']:.2f} DBL:{ep['double_detect']:.2f} "
+                     f"OVL:{ep['overlap_series']:.2f} CS:{ep['connected_series']:.2f} "
+                     f"FORM:{ep['auto_formula']:.2f}")
             weights_str = " ".join([f"{k[:3].upper()}:{v:.2f}" for k, v in pred["weights"].items()])
 
             override_note = ""
@@ -1263,7 +1084,7 @@ class BotStateMachine:
             stats_footer = build_stats_footer()
 
             msg = (
-                f"🎯 *QUANTUM V32 AUTO-DISCOVERY* 🎯\n"
+                f"🎯 *QUANTUM V32.1 (FIXED)* 🎯\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 *Period:* `{ni}`\n"
                 f"🎲 *Number:* `{pn}`\n"
@@ -1278,8 +1099,8 @@ class BotStateMachine:
                 f"🔢 *Num Sig:* `{num_sig_str}` | ⚡ `{pred['arith_note']}`"
                 f"{hot_info}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧠 *16-Engine Consensus:*\n"
-                f"`{cons1}`\n`{cons2}`\n`{cons3}`\n"
+                f"🧠 *11-Engine Consensus:*\n"
+                f"`{cons1}`\n`{cons2}`\n"
                 f"⚖️ *Weights:* `{weights_str}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📜 *TREND (8)*:\n{hb}"
@@ -1292,7 +1113,7 @@ class BotStateMachine:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    logger.info("Warmup V32...")
+    logger.info("Warmup V32.1...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate_and_sanitize(raw)
@@ -1325,11 +1146,10 @@ async def warmup(session):
     save_state(STATE)
     logger.info(f"Warmup done. Pat:{len(STATE.get('pattern_memory', {}))} "
                 f"Num:{len(STATE.get('number_memory', {}))} "
-                f"Form:{len(STATE.get('auto_formulas', {}))} "
                 f"CS:{len(STATE.get('connected_history', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V32 AUTO-DISCOVERY ACTIVE", status=200)
+async def health(r): return web.Response(text="V32.1 FIXED ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get('/', health)
