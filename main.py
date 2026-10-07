@@ -7,625 +7,751 @@ from collections import defaultdict
 import aiohttp
 from aiohttp import web
 
-# ==================== CONFIGURATION ====================
-API_URL   = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500"
-BOT_TOKEN = "8611789455:AAFcnSZ7nlrCIPsQUKLQwdmTf2aw2szmLFk"
-CHAT_ID   = "1264164655"
-WIN_STICKER_ID = "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ"
-# =======================================================
+# ==================== CONFIG ====================
+API_URL = os.environ.get("API_URL", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8611789455:AAFcnSZ7nlrCIPsQUKLQwdmTf2aw2szmLFk")
+CHAT_ID = os.environ.get("CHAT_ID", "1264164655")
+WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ")
 
-# ─────────────────────────────────────────────
-# WEB SERVER
-# ─────────────────────────────────────────────
-async def handle_health(request):
-    return web.Response(text="QUANTUM V22 ACTIVE", status=200)
+# 🔥 SAFE LEVELS
+BET_LEVELS = [1.0, 2.5]
+MAX_LEVEL = 2
+FLIP_BLACKLIST_MIN = 3
+FLIP_BLACKLIST_MAX_WR = 0.35
 
-# ─────────────────────────────────────────────
-# TELEGRAM HELPERS
-# ─────────────────────────────────────────────
-async def send_telegram(session, message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+# ==================== STATE ====================
+def _default_eng():
+    return {"alpha": 1.0, "beta": 1.0, "hits": 0, "misses": 0, "total": 0,
+            "recent_hits": 0, "recent_total": 0, "gradient_weight": 1.0}
+
+ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break",
+           "rhythm", "hot_cold", "gambler_instinct"]
+
+STATE_FILE = "engine_state_v28_5_1.json"
+STATE = {
+    "engine_stats": {e: _default_eng() for e in ENGINES},
+    "pattern_memory": {}, "number_memory": {}, "pattern_strength": {},
+    "flip_stats": {}, "flip_blacklist": [], "total_wins": 0, "total_losses": 0,
+    "current_level": 1, "current_loss_streak": 0, "max_b2b_loss": 0,
+    "pattern_flips": 0, "pattern_flips_won": 0, "bot_recent_form": [],
+    "prediction_memory": {}, "last_processed_issue": 0, "calibration_offset": 0.0,
+}
+
+def load_state():
+    global STATE
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f: s = json.load(f)
+            for k in STATE: 
+                if k not in s: s[k] = STATE[k]
+            for e in ENGINES:
+                if e not in s.get("engine_stats", {}): s["engine_stats"][e] = _default_eng()
+            STATE = s
+        except Exception as ex:
+            print(f"State load err: {ex}")
+
+def save_state():
     try:
-        async with session.post(url, json=payload,
+        for key, cap in [("prediction_memory", 500), ("pattern_memory", 5000),
+                         ("number_memory", 5000), ("pattern_strength", 5000),
+                         ("flip_stats", 2000), ("flip_blacklist", 500),
+                         ("bot_recent_form", 20)]:
+            if len(STATE.get(key, {})) > cap:
+                if isinstance(STATE[key], list):
+                    STATE[key] = STATE[key][-cap:]
+                else:
+                    for k in sorted(STATE[key].keys())[:-cap]: del STATE[key][k]
+        with open(STATE_FILE, "w") as f: json.dump(STATE, f)
+    except Exception as e: print(f"Save err: {e}")
+
+load_state()
+
+# ==================== HELPERS ====================
+def pattern_signature(arr, n=14):
+    if len(arr) < n: return None
+    return "".join("B" if x else "S" for x in arr[-n:])
+
+def short_sig(arr, n=6):
+    if len(arr) < n: return None
+    return "".join("B" if x else "S" for x in arr[-n:])
+
+def num_signature(history, n=5):
+    nums = [int(h["number"]) for h in history if str(h.get("number", "")).isdigit()]
+    if len(nums) < n: return None
+    return "-".join(str(x) for x in nums[-n:])
+
+def hamming(a, b):
+    if not a or not b or len(a) != len(b): return 999
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+# ==================== DATA VALIDATION ====================
+def validate(raw_list):
+    if not raw_list or not isinstance(raw_list, list): return None
+    out, seen = [], set()
+    for item in reversed(raw_list):
+        try:
+            iss = int(item.get("issueNumber", 0))
+            if iss == 0 or iss in seen: continue
+            sz_raw = str(item.get("size", "")).upper()
+            if sz_raw not in ["BIG", "BIGGG", "SMALL"]: continue
+            sz = 1 if sz_raw in ["BIG", "BIGGG"] else 0
+            num_raw = item.get("number", None)
+            num = -1 if (num_raw is None or num_raw == "") else int(float(num_raw))
+            out.append({"issue": iss, "size": sz, "number": num})
+            seen.add(iss)
+        except: continue
+    return out
+
+# ==================== REGIME & ENTROPY ====================
+def detect_regime(arr):
+    if len(arr) < 20: return "BALANCED"
+    r = arr[-20:]
+    alt = sum(1 for i in range(len(r)-1) if r[i] != r[i+1])
+    big_rate = sum(r) / len(r)
+    if alt >= 15: return "ALTERNATING"
+    if big_rate >= 0.70: return "BIG_HEAVY"
+    if big_rate <= 0.30: return "SMALL_HEAVY"
+    if all(x == r[0] for x in r): return "LONG_STREAK"
+    return "BALANCED"
+
+def entropy(arr, w=40):
+    r = arr[-w:]
+    if len(r) < 15: return 1.0
+    p1 = sum(r) / len(r)
+    if p1 in (0, 1): return 0.0
+    return max(0.0, 1.0 - (-(p1*math.log2(p1) + (1-p1)*math.log2(1-p1))))
+
+# ==================== ENGINES ====================
+def eng_pattern(arr):
+    n = len(arr)
+    if n < 15: return 0.5
+    sig = "".join("B" if x else "S" for x in arr)
+    res, wts = [], []
+    for L in [4, 6, 8, 10, 12, 14]:
+        if n < L + 3: continue
+        tail = sig[-L:]
+        b = s = 0
+        for i in range(n - L):
+            if sig[i:i+L] == tail:
+                if arr[i+L] == 1: b += 1
+                else: s += 1
+        tot = b + s
+        if tot >= 3:
+            p = (b + 1) / (tot + 2)
+            if abs(p - 0.5) < 0.10: continue
+            w = (L ** 1.5) * math.log(tot + 1) * min(2.0, tot / 3.0)
+            res.append(p); wts.append(w)
+    p14 = pattern_signature(arr, 14)
+    if p14 and p14 in STATE["pattern_memory"]:
+        pm = STATE["pattern_memory"][p14]
+        pb, ps = pm.get("next_big", 0), pm.get("next_small", 0)
+        if pb + ps >= 3:
+            p = (pb + 1) / (pb + ps + 2)
+            if abs(p - 0.5) >= 0.10:
+                res.append(p); wts.append(14 ** 1.5 * math.log(pb + ps + 1))
+    ss = short_sig(arr, 6)
+    if ss and ss in STATE["pattern_strength"]:
+        st = STATE["pattern_strength"][ss]
+        h, m = st.get("hits", 0), st.get("misses", 0)
+        t = h + m
+        if t >= 3:
+            acc = (h + 1) / (t + 2)
+            fq = min(1.0, t / 15.0)
+            acf = max(0.0, (acc - 0.50) * 3.0)
+            strength = fq * acf
+            if strength > 0.05:
+                boost = 1.0 + strength * 3.0
+                amp = max(0.05, min(0.95, 0.5 + (acc - 0.5) * (1.0 + strength)))
+                res.append(amp); wts.append(6 ** 1.7 * boost * math.log(t + 1))
+    if not res: return 0.5
+    return sum(p*w for p, w in zip(res, wts)) / sum(wts)
+
+def eng_trend(arr):
+    n = len(arr)
+    if n < 20: return 0.5
+    def ema(a, s):
+        k = 2 / (s + 1); e = a[0]
+        for x in a[1:]: e = k*x + (1-k)*e
+        return e
+    e3, e5 = ema(arr[-20:], 3), ema(arr[-20:], 5)
+    e13, e21 = ema(arr[-20:], 13), ema(arr[-20:], 21)
+    macd = (e3 - e13) + (e5 - e21)
+    ms = math.tanh(macd * 4.0)
+    vel = 0.0
+    if n >= 10:
+        l5 = sum(arr[-5:]) / 5; p5 = sum(arr[-10:-5]) / 5
+        vel = (l5 - p5) * 2.0
+    rec = arr[-6:]
+    burst = 0.0
+    if sum(rec[-3:]) == 3: burst = 0.7
+    elif sum(rec[-3:]) == 0: burst = -0.7
+    comb = ms*0.5 + vel*0.3 + burst*0.2
+    return max(0.15, min(0.85, 0.5 + 0.5*math.tanh(comb*2.0)))
+
+def eng_number_seq(history):
+    nums = [int(h["number"]) for h in history if h["number"] >= 0]
+    szs = [h["size"] for h in history if h["number"] >= 0]
+    if len(nums) < 20: return 0.5
+    ln = nums[-3:]
+    if len(ln) < 3: return 0.5
+    if ln[0] < ln[1] < ln[2]: pat = "ASC"
+    elif ln[0] > ln[1] > ln[2]: pat = "DESC"
+    elif ln[0] == ln[1] == ln[2]: pat = "SAME3"
+    elif ln[1] == ln[2]: pat = "SAME2"
+    elif abs(ln[0]-ln[1]) == 1 and abs(ln[1]-ln[2]) == 1: pat = "SEQ"
+    else: pat = "OTHER"
+    b = s = 0.0
+    for i in range(len(nums) - 3):
+        sq = nums[i:i+3]
+        m = False
+        if pat == "ASC" and sq[0] < sq[1] < sq[2]: m = True
+        elif pat == "DESC" and sq[0] > sq[1] > sq[2]: m = True
+        elif pat == "SAME3" and sq[0] == sq[1] == sq[2]: m = True
+        elif pat == "SAME2" and sq[1] == sq[2]: m = True
+        elif pat == "SEQ" and abs(sq[0]-sq[1]) == 1 and abs(sq[1]-sq[2]) == 1: m = True
+        if m and i + 3 < len(szs):
+            w = math.exp((i / len(nums)) * 3.0)
+            if szs[i+3] == 1: b += w
+            else: s += w
+    t = b + s
+    if t < 1.0: return 0.5
+    return (b + 0.5) / (t + 1.0)
+
+def eng_hot_number(history):
+    nums = [int(h["number"]) for h in history if h["number"] >= 0]
+    if len(nums) < 20: return 0.5
+    from collections import Counter
+    rec = nums[-20:]
+    freq = Counter(rec)
+    top = freq.most_common(3)
+    if not top: return 0.5
+    bw = sum(c for n, c in top if n >= 5)
+    sw = sum(c for n, c in top if n < 5)
+    mn, mc = top[0]
+    dom = mc / len(rec)
+    base = bw / (bw + sw) if (bw + sw) > 0 else 0.5
+    if dom >= 0.30:
+        base = max(0.1, min(0.9, base + (0.15 if mn >= 5 else -0.15)))
+    return base
+
+def eng_streak_break(arr):
+    if len(arr) < 6: return 0.5
+    rec = arr[-10:]
+    sl = 1; sv = rec[-1]
+    for i in range(len(rec) - 2, -1, -1):
+        if rec[i] == sv: sl += 1
+        else: break
+    if sl >= 6: return 0.15 if sv else 0.85
+    elif sl == 5: return 0.22 if sv else 0.78
+    elif sl == 4: return 0.32 if sv else 0.68
+    elif sl == 3: return 0.42 if sv else 0.58
+    return 0.5
+
+def eng_rhythm(arr):
+    n = len(arr)
+    if n < 20: return 0.5
+    rec = arr[-30:] if n >= 30 else arr
+    m = len(rec); mn = sum(rec)/m
+    bl = 0; bc = 0.0
+    for lag in range(2, 9):
+        if lag >= m - 2: continue
+        num = sum((rec[i]-mn)*(rec[i+lag]-mn) for i in range(m-lag))
+        d1 = sum((rec[i]-mn)**2 for i in range(m-lag))
+        d2 = sum((rec[i+lag]-mn)**2 for i in range(m-lag))
+        den = math.sqrt(d1*d2)
+        if den > 0:
+            c = num/den
+            if abs(c) > abs(bc): bc = c; bl = lag
+    if bl == 0 or abs(bc) < 0.20: return 0.5
+    tgt = rec[-bl] if bc > 0 else 1 - rec[-bl]
+    stg = min(0.35, abs(bc)*0.5)
+    return 0.5 + stg if tgt == 1 else 0.5 - stg
+
+def eng_hot_cold(arr):
+    form = STATE.get("bot_recent_form", [])
+    if len(form) < 3 or len(arr) < 3: return 0.5
+    mo = sum(arr[-3:]) / 3.0
+    hs = 0
+    for r in reversed(form):
+        if r == 1: hs += 1
+        else: break
+    cs = 0
+    for r in reversed(form):
+        if r == 0: cs += 1
+        else: break
+    if hs >= 3: p = 0.5 + (mo - 0.5) * 1.5
+    elif cs >= 3: p = 0.5 - (mo - 0.5) * 1.0
+    else: p = 0.5 + (mo - 0.5) * 0.5
+    return max(0.15, min(0.85, p))
+
+def eng_gambler(history):
+    nums = [int(h["number"]) for h in history if h["number"] >= 0]
+    szs = [h["size"] for h in history if h["number"] >= 0]
+    if len(nums) < 20 or len(szs) < 20: return 0.5
+    sigs = []; wts = []
+    psj = 20
+    for i in range(len(nums) - 1, -1, -1):
+        if nums[i] in (0, 5): psj = len(nums) - 1 - i; break
+    if psj >= 8:
+        jp = min(1.0, (psj - 5) / 10.0)
+        rj = [n for n in nums[-30:] if n in (0, 5)]
+        if rj:
+            lj = rj[-1]
+            jb = 0.5 + (0.15 * jp if lj == 0 else -0.15 * jp)
+            sigs.append(jb); wts.append(0.6)
+    rs = szs[-15:]
+    alt = sum(1 for i in range(len(rs)-1) if rs[i] != rs[i+1])
+    cr = alt / (len(rs) - 1)
+    if cr > 0.75:
+        np = 1 - rs[-1]
+        sigs.append(0.5 + (0.10 if np else -0.10)); wts.append(0.4)
+    tw = STATE.get("total_wins", 0); tl = STATE.get("total_losses", 0)
+    if tw + tl >= 10 and tw/(tw+tl) < 0.45:
+        last = szs[-1]; ctr = 1 - last
+        sigs.append(0.5 + (0.08 if ctr else -0.08)); wts.append(0.3)
+    if not sigs: return 0.5
+    tw_ = sum(wts)
+    return max(0.20, min(0.80, sum(s*w for s, w in zip(sigs, wts)) / tw_))
+
+# ==================== WEIGHTS ====================
+REGIME_W = {
+    "ALTERNATING": {"pattern": 0.22, "trend": 0.09, "number_seq": 0.14, "hot_number": 0.10, "streak_break": 0.17, "rhythm": 0.13, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "BIG_HEAVY":   {"pattern": 0.19, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "SMALL_HEAVY": {"pattern": 0.19, "trend": 0.17, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.07},
+    "LONG_STREAK": {"pattern": 0.16, "trend": 0.13, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.26, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.07},
+    "BALANCED":    {"pattern": 0.22, "trend": 0.12, "number_seq": 0.13, "hot_number": 0.11, "streak_break": 0.15, "rhythm": 0.11, "hot_cold": 0.09, "gambler_instinct": 0.07},
+}
+
+def get_weights(regime):
+    base = REGIME_W.get(regime, REGIME_W["BALANCED"]).copy()
+    b = {}
+    for e, w in base.items():
+        st = STATE["engine_stats"].get(e, _default_eng())
+        a, bb = st.get("alpha", 1.0), st.get("beta", 1.0)
+        pm = a / (a + bb)
+        ra = st["recent_hits"]/st["recent_total"] if st.get("recent_total", 0) >= 5 else pm
+        comb = pm*0.5 + ra*0.5
+        gw = st.get("gradient_weight", 1.0)
+        boost = max(0.3, min(2.5, comb/0.5)) * gw
+        b[e] = w * boost
+    t = sum(b.values()) or 1.0
+    return {k: v/t for k, v in b.items()}
+
+def combine(probs, wts):
+    tw = sum(wts.values()) or 1.0
+    return sum(probs[e]*wts[e] for e in probs) / tw
+
+def grad_update(probs, ab, lr=0.01):
+    for e, p in probs.items():
+        st = STATE["engine_stats"].setdefault(e, _default_eng())
+        g = (p - ab) * (p - 0.5) * 2.0
+        ow = st.get("gradient_weight", 1.0)
+        st["gradient_weight"] = max(0.3, min(3.0, ow - lr*g))
+
+# ==================== FLIP BLACKLIST ====================
+def check_pat_flip(arr, p):
+    sig = short_sig(arr, 6)
+    if not sig: return p, False, ""
+    if sig in STATE.get("flip_blacklist", []):
+        return p, False, f"BLACKLISTED({sig})"
+    st = STATE["pattern_strength"].get(sig)
+    if not st: return p, False, ""
+    h, m = st.get("hits", 0), st.get("misses", 0)
+    t = h + m
+    if t < 5: return p, False, ""
+    acc = (h + 1) / (t + 2)
+    if acc < 0.58:
+        return 1.0 - p, True, f"ACC{acc*100:.0f}%<58%(n={t})"
+    return p, False, ""
+
+def update_flip_stat(sig, won):
+    if not sig: return
+    st = STATE.setdefault("flip_stats", {}).setdefault(sig, {"flips": 0, "wins": 0})
+    st["flips"] += 1
+    if won: st["wins"] += 1
+    if st["flips"] >= FLIP_BLACKLIST_MIN:
+        wr = st["wins"] / st["flips"]
+        if wr < FLIP_BLACKLIST_MAX_WR:
+            bl = STATE.setdefault("flip_blacklist", [])
+            if sig not in bl:
+                bl.append(sig)
+                print(f"🚫 Blacklisted flip for {sig} (WR {wr*100:.0f}%)")
+
+# ==================== ANTI-ERROR ====================
+def check_ae(arr, p):
+    sig = pattern_signature(arr)
+    if not sig: return p, False, ""
+    err = STATE.get("error_patterns", {}).get(sig)
+    if err and err.get("fail_count", 0) >= 2:
+        if err["fail_count"] / max(1, err.get("total", 1)) >= 0.6:
+            return 1.0 - p, True, f"AE({err['fail_count']}x)"
+    return p, False, ""
+
+# ==================== SIGNAL LABEL ====================
+def sig_label(c):
+    d = c - 0.50
+    if d < 0.02: return "🟥 NONE"
+    if d < 0.05: return "🟧 WEAK"
+    if d < 0.10: return "🟨 MODERATE"
+    if d < 0.15: return "🟩 STRONG"
+    return "🟢 V.STRONG"
+
+# ==================== NUMBER PREDICTOR ====================
+def predict_number(history, direction):
+    from collections import Counter
+    nums = [int(h["number"]) for h in history if h["number"] >= 0]
+    sizes = [h["size"] for h in history if h["number"] >= 0]
+    if len(nums) < 40: return 8 if direction == 1 else 2
+    cands = [5, 6, 7, 8, 9] if direction == 1 else [0, 1, 2, 3, 4]
+    K = len(cands)
+    fa = Counter(nums); fr = Counter(nums[-50:])
+    tr = len(nums[-50:])
+    mk = [{n: 0.0 for n in cands} for _ in range(3)]
+    for o in range(1, 4):
+        if len(nums) < o + 2: continue
+        ls = tuple(nums[-o:]); c, t = Counter(), 0
+        for i in range(len(nums) - o):
+            if tuple(nums[i:i+o]) == ls:
+                nx = nums[i+o]
+                if nx in cands: c[nx] += 1; t += 1
+        for n in cands: mk[o-1][n] = (c.get(n, 0) + 1) / (t + K)
+    s2n = {0: Counter(), 1: Counter()}
+    for i in range(1, len(nums)):
+        if nums[i] in cands: s2n[sizes[i-1]][nums[i]] += 1
+    sc = {}
+    for n in cands:
+        s1 = (fa.get(n, 0) + 1) / (len(nums) + K)
+        s2 = (fr.get(n, 0) + 1) / (tr + K)
+        s6 = (s2n[sizes[-1]].get(n, 0) + 1) / (sum(s2n[sizes[-1]].values()) + K)
+        sc[n] = s1*0.10 + s2*0.12 + mk[0][n]*0.13 + mk[1][n]*0.13 + mk[2][n]*0.13 + s6*0.39
+    return max(sc, key=sc.get)
+
+# ==================== MAIN PREDICTOR ====================
+def predict_next(history):
+    arr = [h["size"] for h in history]
+    probs = {
+        "pattern": eng_pattern(arr),
+        "trend": eng_trend(arr),
+        "number_seq": eng_number_seq(history),
+        "hot_number": eng_hot_number(history),
+        "streak_break": eng_streak_break(arr),
+        "rhythm": eng_rhythm(arr),
+        "hot_cold": eng_hot_cold(arr),
+        "gambler_instinct": eng_gambler(history),
+    }
+    regime = detect_regime(arr)
+    wts = get_weights(regime)
+    p = combine(probs, wts)
+    pred = entropy(arr)
+    p = (0.5 + (p-0.5)*(0.5 + pred*0.5)) if p > 0.5 else (0.5 - (0.5-p)*(0.5 + pred*0.5))
+    p, ae_a, ae_r = check_ae(arr, p)
+    p, pf_a, pf_r = check_pat_flip(arr, p)
+    base = max(p, 1-p)
+    conf = max(0.50, min(0.95, base))
+    lab = sig_label(conf)
+    ps = 1 if p >= 0.5 else 0
+    nums = [h["number"] for h in history if h["number"] >= 0]
+    from collections import Counter
+    hot = Counter(nums[-20:]).most_common(1) if len(nums) >= 20 else None
+    p14 = pattern_signature(arr)
+    ss = short_sig(arr, 6) or "N/A"
+    snote = ""; slab = ""
+    if ss != "N/A" and ss in STATE["pattern_strength"]:
+        st = STATE["pattern_strength"][ss]
+        h, m = st.get("hits", 0), st.get("misses", 0)
+        t = h + m
+        if t >= 3:
+            acc = (h + 1) / (t + 2)
+            snote = f"Acc:{acc*100:.0f}%(n={t})"
+            acf = max(0.0, (acc - 0.50) * 3.0)
+            stg = min(1.0, t/15.0) * acf
+            if stg >= 0.6: slab = "🔥 SUPER"
+            elif stg >= 0.3: slab = "⭐ STRONG"
+            elif stg >= 0.1: slab = "○ WEAK"
+            else: slab = "💤 FLAT"
+    form = STATE.get("bot_recent_form", [])
+    if form:
+        r5 = form[-5:]
+        fs = f"{sum(r5)}/{len(r5)}"
+        hot_s = sum(1 for r in reversed(form) if r == 1)
+        cold_s = sum(1 for r in reversed(form) if r == 0)
+        if hot_s >= 3: fl = f"🔥 HOT ({fs})"
+        elif cold_s >= 3: fl = f"❄️ COLD ({fs})"
+        else: fl = f"😐 NEUTRAL ({fs})"
+    else: fl = "N/A"
+    return {"pred_size": ps, "conf": conf, "lab": lab,
+            "probs": probs, "wts": wts, "regime": regime, "entropy": pred,
+            "sig": p14, "ss": ss, "snote": snote, "slab": slab,
+            "form": fl, "hot": hot, "ae_a": ae_a, "ae_r": ae_r,
+            "pf_a": pf_a, "pf_r": pf_r,
+            "ae_flipped": ae_a, "pf_flipped": pf_a}
+
+# ==================== STATS ====================
+def upd_eng_stats(probs, ab, reg):
+    for e, p in probs.items():
+        st = STATE["engine_stats"].setdefault(e, _default_eng())
+        pb = p >= 0.5; hit = pb == ab
+        if hit: st["alpha"] += 1.0
+        else: st["beta"] += 1.0
+        st["total"] = st.get("total", 0) + 1
+        st["recent_total"] = st.get("recent_total", 0) + 1
+        if hit:
+            st["hits"] = st.get("hits", 0) + 1
+            st["recent_hits"] = st.get("recent_hits", 0) + 1
+        else: st["misses"] = st.get("misses", 0) + 1
+        if st["recent_total"] > 50:
+            st["recent_hits"] = int(st["recent_hits"] * 0.8)
+            st["recent_total"] = int(st["recent_total"] * 0.8)
+
+def upd_global(win):
+    if win:
+        STATE["total_wins"] = STATE.get("total_wins", 0) + 1
+        STATE["current_loss_streak"] = 0
+        STATE["current_level"] = 1
+    else:
+        STATE["total_losses"] = STATE.get("total_losses", 0) + 1
+        STATE["current_loss_streak"] = STATE.get("current_loss_streak", 0) + 1
+        STATE["max_b2b_loss"] = max(STATE.get("max_b2b_loss", 0), STATE["current_loss_streak"])
+        STATE["current_level"] = min(STATE.get("current_level", 1) + 1, MAX_LEVEL)
+    f = STATE.setdefault("bot_recent_form", [])
+    f.append(1 if win else 0)
+    STATE["bot_recent_form"] = f[-20:]
+
+def upd_pat_mem(sig, ab):
+    if not sig: return
+    pm = STATE.setdefault("pattern_memory", {}).setdefault(sig, {"next_big": 0, "next_small": 0})
+    if ab: pm["next_big"] += 1
+    else: pm["next_small"] += 1
+
+def upd_pat_strength(sig, ab, pred_big):
+    if not sig: return
+    st = STATE.setdefault("pattern_strength", {}).setdefault(sig, {"hits": 0, "misses": 0})
+    if ab == pred_big: st["hits"] += 1
+    else: st["misses"] += 1
+
+# ==================== FORMAT ====================
+def fmt_history(history):
+    out = ""
+    for item in history[-8:]:
+        i = item["issue"]; sp = str(i)[-3:]
+        ss = "BIGGG" if item["size"] == 1 else "SMALL"
+        num = item["number"]; nd = str(num) if num != -1 else "?"
+        p = STATE.get("prediction_memory", {}).get(str(i))
+        if p and p["size"] == ss and p.get("number") == num and num != -1: icon = "  ☠️☠️☠️"
+        elif p and p["size"] == ss: icon = "  ✅✅✅"
+        else: icon = ""
+        out += f"`{sp}` *{ss}* ({nd}){icon}\n"
+    return out
+
+def fmt_footer():
+    w = STATE.get("total_wins", 0); l = STATE.get("total_losses", 0)
+    mb = STATE.get("max_b2b_loss", 0); cs = STATE.get("current_loss_streak", 0)
+    lv = STATE.get("current_level", 1)
+    t = w + l; wr = (w/t*100) if t > 0 else 0.0
+    pats = len(STATE.get("pattern_memory", {}))
+    errs = len(STATE.get("error_patterns", {}))
+    nums_db = len(STATE.get("number_memory", {}))
+    strong = len(STATE.get("pattern_strength", {}))
+    pflips = STATE.get("pattern_flips", 0)
+    pw = STATE.get("pattern_flips_won", 0)
+    pa = (pw/pflips*100) if pflips > 0 else 0.0
+    bl = len(STATE.get("flip_blacklist", []))
+    lvl_s = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
+    return (f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 *LIFETIME*\n"
+            f"✅ *W:* `{w}` | ❌ *L:* `{l}`\n"
+            f"📉 *Max B2B:* `{mb}` | 🔥 *Streak:* `{cs}`\n"
+            f"🎯 *WR:* `{wr:.1f}%`\n"
+            f"💰 *Level:* `{lv}` ({lvl_s})\n"
+            f"🧠 *Pat:* `{pats}` | 💪 *Strong:* `{strong}`\n"
+            f"🔢 *Num:* `{nums_db}` | ⚠️ *Err:* `{errs}`\n"
+            f"🔄 *Flips:* `{pflips}` ({pa:.0f}% won)\n"
+            f"🚫 *Blacklisted:* `{bl}`")
+
+# ==================== TELEGRAM ====================
+async def tg_send(session, msg):
+    try:
+        async with session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"},
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-            await r.text()
-    except Exception as e:
-        print(f"Telegram error: {e}")
+            if r.status != 200: print(f"TG err: {await r.text()}")
+    except Exception as e: print(f"TG: {e}")
 
-async def send_sticker(session):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendSticker"
+async def tg_sticker(session):
     try:
-        async with session.post(url,
+        async with session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendSticker",
                                 json={"chat_id": CHAT_ID, "sticker": WIN_STICKER_ID},
                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
             await r.text()
-    except Exception as e:
-        print(f"Sticker error: {e}")
+    except Exception as e: print(f"Sticker: {e}")
 
-# ─────────────────────────────────────────────
-# DATA FETCH
-# ─────────────────────────────────────────────
+# ==================== API ====================
 async def fetch_data(session):
-    try:
-        async with session.get(API_URL,
-                               headers={"User-Agent": "Mozilla/5.0"},
-                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                data = await r.json()
-                lst = (data.get("data", {}) or {}).get("list") or data if isinstance(data, list) else None
-                if lst:
-                    return lst
-    except Exception as e:
-        print(f"Fetch error: {e}")
+    for att in range(1, 4):
+        try:
+            async with session.get(API_URL, headers={"User-Agent": "Mozilla/5.0"},
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    # 🔥 ROBUST FETCH — handles multiple response formats
+                    if isinstance(d, dict):
+                        if "data" in d and isinstance(d["data"], dict) and "list" in d["data"]:
+                            return d["data"]["list"]
+                        if "list" in d:
+                            return d["list"]
+                    elif isinstance(d, list):
+                        return d
+        except Exception as e:
+            print(f"API att {att}: {e}")
+        await asyncio.sleep(2 ** att)
     return None
 
-# ─────────────────────────────────────────────
-# MATH UTILS
-# ─────────────────────────────────────────────
-def logit(p):
-    p = max(1e-9, min(1 - 1e-9, p))
-    return math.log(p / (1 - p))
+# ==================== BOT LOOP ====================
+class Bot:
+    def __init__(self): self.pending = None
 
-def sigmoid(x):
-    return 1 / (1 + math.exp(-max(-15, min(15, x))))
+    async def run(self, session):
+        print("🚀 QUANTUM V28.5.1 BOT STARTED")
+        while True:
+            try: await self.step(session)
+            except Exception as e:
+                print(f"SM err: {e}")
+                import traceback; traceback.print_exc()
+            await asyncio.sleep(5)
 
-def acf(arr, lag):
-    n = len(arr)
-    if n < lag + 8: return 0.0
-    m = sum(arr) / n
-    v = sum((x - m) ** 2 for x in arr) / n
-    if v < 1e-9: return 0.0
-    cov = sum((arr[i] - m) * (arr[i - lag] - m) for i in range(lag, n)) / (n - lag)
-    return cov / v
+    async def step(self, session):
+        raw = await fetch_data(session)
+        if not raw: return
+        history = validate(raw)
+        if not history or len(history) < 30: return
+        last = history[-1]; li = last["issue"]
+        if li == STATE.get("last_processed_issue", 0): return
+        arr = [h["size"] for h in history]
+        regime = detect_regime(arr)
 
-def hurst_exp(arr):
-    if len(arr) < 20: return 0.5
-    n = len(arr)
-    m = sum(arr) / n
-    Z = []
-    s = 0
-    for v in arr:
-        s += v - m
-        Z.append(s)
-    R = max(Z) - min(Z)
-    S = math.sqrt(sum((x - m) ** 2 for x in arr) / n)
-    return math.log(R / S + 1e-9) / math.log(n) if S > 1e-9 else 0.5
+        # EVALUATE
+        if self.pending and self.pending["next_issue"] == li:
+            ab = last["size"] == 1
+            pred_big = self.pending["pred_size"] == "BIGGG"
+            upd_eng_stats(self.pending["probs"], ab, regime)
+            grad_update(self.pending["probs"], ab)
+            actual_s = "BIGGG" if ab else "SMALL"
+            win = actual_s == self.pending["pred_size"]
+            upd_global(win)
+            upd_pat_mem(self.pending.get("p14"), ab)
+            if self.pending.get("ss"):
+                upd_pat_strength(self.pending["ss"], ab, pred_big)
+            if self.pending.get("pf_flipped"):
+                STATE["pattern_flips"] = STATE.get("pattern_flips", 0) + 1
+                if win: STATE["pattern_flips_won"] = STATE.get("pattern_flips_won", 0) + 1
+                update_flip_stat(self.pending.get("ss"), win)
+            if self.pending.get("ae_flipped"):
+                STATE["learned_overrides"] = STATE.get("learned_overrides", 0) + 1
+            if win: asyncio.create_task(tg_sticker(session))
+            self.pending = None
 
-def cond_entropy(arr, order=1):
-    if len(arr) < order + 8: return 1.0
-    counts = defaultdict(lambda: {0: 0, 1: 0})
-    for i in range(order, len(arr)):
-        k = tuple(arr[i - order:i])
-        counts[k][arr[i]] += 1
-    H = 0.0
-    tot = 0
-    for k, d in counts.items():
-        n = d[0] + d[1]
-        tot += n
-        for c in d.values():
-            if c > 0:
-                p = c / n
-                H -= n * (p * math.log2(p))
-    return H / max(tot, 1)
+        # PREDICT
+        if not self.pending or self.pending["last_issue"] != li:
+            pred = predict_next(history)
+            ni = li + 1
+            pn = predict_number(history, pred["pred_size"])
+            self.pending = {
+                "last_issue": li, "next_issue": ni,
+                "pred_size": "BIGGG" if pred["pred_size"] == 1 else "SMALL",
+                "pred_number": pn, "probs": pred["probs"], "p14": pred["sig"],
+                "ss": pred["ss"], "ae_flipped": pred["ae_flipped"],
+                "pf_flipped": pred["pf_flipped"]
+            }
+            STATE.setdefault("prediction_memory", {})[str(ni)] = {"size": self.pending["pred_size"], "number": pn}
 
-# ═══════════════════════════════════════════════════════════
-# ENGINE 1 — KALMAN FILTER (tracks hidden probability state)
-# ═══════════════════════════════════════════════════════════
-def eng_kalman(arr):
-    if len(arr) < 15: return 0.5, 0.0
-    x, P = 0.5, 0.25
-    Q, R = 0.004, 0.25
-    for v in reversed(arr):
-        P += Q
-        K = P / (P + R)
-        x += K * (v - x)
-        P = (1 - K) * P
-    bias = abs(x - 0.5)
-    if bias < 0.04: return 0.5, 0.0
-    conf = min(bias * 5.0 + (1 - P) * 0.25, 0.92)
-    return max(0.05, min(0.95, x)), conf
+            hb = fmt_history(history)
+            ep = pred["probs"]
+            cons1 = f"PAT:{ep['pattern']:.2f} TRD:{ep['trend']:.2f} NSQ:{ep['number_seq']:.2f} HOT:{ep['hot_number']:.2f}"
+            cons2 = f"BRK:{ep['streak_break']:.2f} RHY:{ep['rhythm']:.2f} HCD:{ep['hot_cold']:.2f} GMB:{ep['gambler_instinct']:.2f}"
+            wstr = " ".join(f"{k[:3].upper()}:{v:.2f}" for k, v in pred["wts"].items())
 
-# ═══════════════════════════════════════════════════════════
-# ENGINE 2 — MARKOV (1st–4th order, recency-weighted, BIC)
-# ═══════════════════════════════════════════════════════════
-def bic_order(arr, max_o=4):
-    n = len(arr)
-    if n < 20: return 1
-    best, bo = float("inf"), 1
-    for o in range(1, max_o + 1):
-        if n < o + 8: break
-        cnt = defaultdict(lambda: {0: 0, 1: 0})
-        for i in range(o, n):
-            cnt[tuple(arr[i - o:i])][arr[i]] += 1
-        ll = 0.0
-        for k, d in cnt.items():
-            t = d[0] + d[1]
-            for c in d.values():
-                if c > 0: ll += c * math.log(c / t)
-        bic = -2 * ll + (2 ** o) * math.log(n)
-        if bic < best: best, bo = bic, o
-    return bo
+            ae = f"\n🚨 *AE-FLIP:* `{pred['ae_r']}`" if pred["ae_flipped"] else ""
+            pf = ""
+            if pred["pf_flipped"]: pf = f"\n🔄 *PAT-FLIP:* `{pred['pf_r']}`"
+            elif "BLACKLISTED" in (pred["pf_r"] or ""): pf = f"\n🚫 *FLIP SKIPPED:* `{pred['pf_r']}`"
+            hot = f"\n🔥 *Hot:* `{pred['hot'][0][0]}` ({pred['hot'][0][1]}x)" if pred["hot"] else ""
+            stg = f"\n💪 *Pattern:* `{pred['slab']}` {pred['snote']}" if pred["snote"] else ""
+            lv = STATE.get("current_level", 1)
+            fund = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
+            footer = fmt_footer()
 
-def eng_markov(arr):
-    if len(arr) < 15: return 0.5, 0.0
-    n = len(arr)
-    best_o = bic_order(arr)
-    results = []
-    for o in range(1, min(best_o + 3, 6)):
-        if n < o + 8: continue
-        tr = defaultdict(lambda: {0: 0.0, 1: 0.0})
-        for i in range(o, n):
-            state = tuple(arr[i - o:i])
-            age = n - 1 - i
-            w = math.exp(-age * 0.022)
-            tr[state][arr[i]] += w
-        cur = tuple(arr[-o:])
-        if cur not in tr: continue
-        c = tr[cur]
-        tot = c[0] + c[1]
-        if tot < 0.5: continue
-        prob = c[1] / tot
-        bias = abs(prob - 0.5)
-        if bias < 0.04: continue
-        ev = min(math.log(tot + 1) / 2.5, 1.0)
-        eb = 0.10 if o == best_o else 0.0
-        conf = min(bias * 5.2 + ev * 0.28 + eb, 0.92)
-        ow = math.exp(-abs(o - best_o) * 0.25) * (1 + min(tot, 10) * 0.04)
-        results.append((prob, conf, ow))
-    if not results: return 0.5, 0.0
-    tw = sum(ow for _, _, ow in results)
-    prob = sum(p * ow for p, _, ow in results) / tw
-    conf = sum(c * ow for _, c, ow in results) / tw
-    if abs(prob - 0.5) < 0.04: return 0.5, 0.0
-    return max(0.05, min(0.95, prob)), min(conf, 0.92)
+            msg = (f"🎯 *QUANTUM V28.5.1 ADAPTIVE* 🎯\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                   f"📌 *Period:* `{ni}`\n"
+                   f"🎲 *Number:* `{pn}`\n"
+                   f"🔥 *Target:* *{'BIGGG 🟢' if pred['pred_size'] == 1 else 'SMALL 🔴'}*\n"
+                   f"📊 *Conf:* `{pred['conf']*100:.1f}%` | {pred['lab']}\n"
+                   f"🎰 *Form:* {pred['form']}\n"
+                   f"📈 *Regime:* `{pred['regime']}` | *Ent:* `{pred['entropy']:.2f}`\n"
+                   f"💰 *Fund:* `{fund}` (Level {lv})"
+                   f"{ae}{pf}\n"
+                   f"🧩 *Size Sig:* `{pred['sig'] or 'N/A'}`\n"
+                   f"🎯 *Short Sig:* `{pred['ss']}`{stg}\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                   f"🧠 *8-Engine:*\n`{cons1}`\n`{cons2}`\n"
+                   f"⚖️ *Weights:* `{wstr}`\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                   f"📜 *TREND (8):*\n{hb}"
+                   f"{footer}")
+            asyncio.create_task(tg_send(session, msg))
 
-# ═══════════════════════════════════════════════════════════
-# ENGINE 3 — AUTOCORRELATION (lag 1–6)
-# ═══════════════════════════════════════════════════════════
-def eng_autocorr(arr):
-    if len(arr) < 25: return 0.5, 0.0
-    w = arr[:min(100, len(arr))]
-    sigs = []
-    for lag in range(1, 7):
-        ac = acf(w, lag)
-        if abs(ac) < 0.09: continue
-        last_k = w[-lag]
-        prob = (0.5 + abs(ac) * 0.45 if last_k else 0.5 - abs(ac) * 0.45) if ac > 0 else \
-               (0.5 - abs(ac) * 0.45 if last_k else 0.5 + abs(ac) * 0.45)
-        lag_w = math.exp(-lag * 0.28)
-        conf = min(abs(ac) * 3.2 * lag_w, 0.85)
-        if abs(prob - 0.5) > 0.04:
-            sigs.append((prob, conf, abs(ac) * lag_w))
-    if not sigs: return 0.5, 0.0
-    tw = sum(ow for _, _, ow in sigs)
-    prob = sum(p * ow for p, _, ow in sigs) / tw
-    conf = sum(c * ow for _, c, ow in sigs) / tw
-    if abs(prob - 0.5) < 0.04: return 0.5, 0.0
-    return max(0.05, min(0.95, prob)), min(conf, 0.85)
+        STATE["last_processed_issue"] = li
+        save_state()
 
-# ═══════════════════════════════════════════════════════════
-# ENGINE 4 — BAYESIAN FREQUENCY (Beta-Binomial multi-window)
-# ═══════════════════════════════════════════════════════════
-def eng_bayes(arr):
-    if len(arr) < 10: return 0.5, 0.0
-    n = len(arr)
-    sigs = []
-    for ws, wt in [(10, 0.40), (20, 0.28), (40, 0.18), (80, 0.10), (120, 0.04)]:
-        if n < ws: continue
-        w = arr[:ws]
-        k = sum(w)
-        a, b = k + 1.0, (ws - k) + 1.0
-        pm = a / (a + b)
-        ps = math.sqrt(a * b / ((a + b) ** 2 * (a + b + 1)))
-        bias = abs(pm - 0.5)
-        if bias < 0.07: continue
-        conf = min(bias * 3.5 * (1 - min(ps * 5, 0.9)), 0.80) * wt * 5
-        if conf < 0.05: continue
-        sigs.append((pm, conf, wt * math.exp(-(n - ws) * 0.005)))
-    if not sigs: return 0.5, 0.0
-    tw = sum(wt for _, _, wt in sigs)
-    prob = sum(p * wt for p, _, wt in sigs) / tw
-    conf = sum(c for _, c, _ in sigs) / len(sigs)
-    if abs(prob - 0.5) < 0.05: return 0.5, 0.0
-    return max(0.05, min(0.95, prob)), min(conf, 0.82)
-
-# ═══════════════════════════════════════════════════════════
-# ENGINE 5 — REGIME + STREAK ANALYZER
-# ═══════════════════════════════════════════════════════════
-def eng_regime_streak(arr):
-    if len(arr) < 20: return 0.5, 0.0
-    w = arr[:min(40, len(arr))]
-    n = len(w)
-    h = hurst_exp(w)
-    alt = sum(1 for i in range(1, n) if w[i] != w[i - 1]) / (n - 1)
-    rl, cr = [], 1
-    for i in range(1, n):
-        if w[i] == w[i - 1]: cr += 1
-        else: rl.append(cr); cr = 1
-    rl.append(cr)
-    avg_run = sum(rl) / len(rl)
-    last = w[0]
-    cs = 0
-    for v in arr:
-        if v == last: cs += 1
-        else: break
-
-    sigs = []
-    # Regime signal
-    if h > 0.58 and alt < 0.44:
-        prob = float(last)
-        conf = min((h - 0.50) * 3.0 + (avg_run - 2.0) * 0.15, 0.82)
-        if abs(prob - 0.5) > 0.04: sigs.append((prob, conf, 1.2))
-    elif h < 0.42 and alt > 0.62:
-        prob = 1.0 - float(last)
-        conf = min((0.50 - h) * 3.0 + (alt - 0.50) * 1.5, 0.80)
-        if abs(prob - 0.5) > 0.04: sigs.append((prob, conf, 1.2))
-
-    # Streak empirical
-    fn = len(arr)
-    if cs >= 3 and fn > cs + 5:
-        cont, rev = 0, 0
-        for i in range(1, fn - cs):
-            if all(arr[i + j] == arr[i] for j in range(cs)):
-                if i + cs < fn:
-                    if arr[i + cs] == arr[i]: cont += 1
-                    else: rev += 1
-        tot = cont + rev
-        if tot >= 4:
-            cr2 = cont / tot
-            bias = abs(cr2 - 0.5)
-            if bias > 0.10:
-                prob = (0.5 + bias * 0.7) if (last and cr2 > 0.5) or (not last and cr2 < 0.5) else (0.5 - bias * 0.7)
-                conf = min(bias * 3.5 * min(tot / 10, 1.0), 0.80)
-                if abs(prob - 0.5) > 0.04: sigs.append((prob, conf, 1.0))
-
-    if not sigs: return 0.5, 0.0
-    tw = sum(ow for _, _, ow in sigs)
-    prob = sum(p * ow for p, _, ow in sigs) / tw
-    conf = sum(c * ow for _, c, ow in sigs) / tw
-    return max(0.05, min(0.95, prob)), min(conf, 0.85)
-
-# ═══════════════════════════════════════════════════════════
-# ENGINE 6 — DEEP PATTERN MINER (upgraded, recency-weighted)
-# ═══════════════════════════════════════════════════════════
-def eng_pattern_miner(arr):
-    n = len(arr)
-    if n < 20: return 0.5, 0.0
-    best_prob, best_conf, best_len = 0.5, 0.0, 0
-    for L in range(10, 2, -1):
-        if n <= L: continue
-        tail = tuple(arr[-L:])
-        big_w, sml_w = 0.0, 0.0
-        for i in range(n - L):
-            if tuple(arr[i:i + L]) == tail:
-                age = n - L - i
-                w = math.exp(-age * 0.025)
-                if arr[i + L] == 1: big_w += w
-                else: sml_w += w
-        if big_w + sml_w > 0.3:
-            prob = big_w / (big_w + sml_w)
-            bias = abs(prob - 0.5)
-            if bias < 0.06: continue
-            ev = min(math.log(big_w + sml_w + 1) / 2.0, 1.0)
-            conf = min(bias * 5.0 + ev * 0.30, 0.92)
-            if conf > best_conf:
-                best_prob, best_conf, best_len = prob, conf, L
-    if best_conf < 0.05: return 0.5, 0.0
-    return max(0.05, min(0.95, best_prob)), best_conf
-
-# ═══════════════════════════════════════════════════════════
-# REGIME-CONDITIONAL WEIGHTS
-# ═══════════════════════════════════════════════════════════
-REGIME_BONUS = {
-    "TREND": {"KALMAN": 1.1, "MARKOV": 1.0, "AUTOCORR": 1.4, "BAYES": 0.7, "REGIME": 1.5, "PATTERN": 0.9},
-    "ANTI":  {"KALMAN": 1.0, "MARKOV": 1.0, "AUTOCORR": 1.5, "BAYES": 0.8, "REGIME": 1.3, "PATTERN": 1.0},
-    "RAND":  {"KALMAN": 1.2, "MARKOV": 1.3, "AUTOCORR": 0.9, "BAYES": 1.4, "REGIME": 0.9, "PATTERN": 1.2},
-}
-
-def detect_regime(arr):
-    if len(arr) < 15: return "RAND"
-    w = arr[:min(40, len(arr))]
-    h = hurst_exp(w)
-    alt = sum(1 for i in range(1, len(w)) if w[i] != w[i - 1]) / (len(w) - 1)
-    if h > 0.58 and alt < 0.44: return "TREND"
-    if h < 0.42 and alt > 0.62: return "ANTI"
-    return "RAND"
-
-# ═══════════════════════════════════════════════════════════
-# META FUSION (entropy-gated log-odds combination)
-# ═══════════════════════════════════════════════════════════
-def meta_fuse(engines, regime, entropy):
-    rb = REGIME_BONUS.get(regime, REGIME_BONUS["RAND"])
-    gate = max(0.4, 1 - entropy * 0.5)
-    lo_sum, wt_sum = 0.0, 0.0
-    votes = []
-    for name, (prob, conf) in engines.items():
-        if conf < 0.04 or prob == 0.5: continue
-        cw = conf * rb.get(name, 1.0) * gate
-        lo_sum += logit(prob) * cw
-        wt_sum += cw
-        votes.append((name, prob, conf, "BIG" if prob > 0.5 else "SMALL"))
-    if wt_sum < 0.01: return 0.5, 0.0, votes
-    fused = sigmoid(lo_sum / wt_sum)
-    bv = sum(1 for _, _, _, d in votes if d == "BIG")
-    sv = len(votes) - bv
-    agree = max(bv, sv) / len(votes) if votes else 0.5
-    return fused, agree, votes
-
-# ═══════════════════════════════════════════════════════════
-# NUMBER PREDICTOR (Gap + EMA + Markov + Pattern next-num)
-# ═══════════════════════════════════════════════════════════
-def predict_number(history_list, direction):
-    rang = [5, 6, 7, 8, 9] if direction == "BIGGG" else [0, 1, 2, 3, 4]
-    nums = [int(item.get("number", -1)) for item in history_list if str(item.get("number","")).isdigit()]
-    if len(nums) < 8:
-        return rang[0], {v: 1 for v in rang}
-    scores = {v: 0.0 for v in rang}
-    n = len(nums)
-
-    # 1. GAP — overdue numbers score higher
-    last_seen = {}
-    for i, v in enumerate(nums):
-        if v not in last_seen: last_seen[v] = i
-    max_gap = max((last_seen.get(v, n) for v in rang), default=n)
-    for v in rang:
-        scores[v] += (last_seen.get(v, n) / max_gap) * 30
-
-    # 2. EMA — cold numbers preferred
-    ema = {i: 0.1 for i in range(10)}
-    for v in reversed(nums[:80]):
-        for k in range(10):
-            ema[k] = ema[k] * 0.88 + (0.12 if v == k else 0)
-    mx_ema = max(ema[v] for v in rang) or 0.1
-    for v in rang:
-        scores[v] += (1 - ema[v] / mx_ema) * 22
-
-    # 3. Markov pair (what number follows last number)
-    pair = defaultdict(lambda: defaultdict(float))
-    for i in range(1, min(n, 100)):
-        age = min(n, 100) - 1 - i
-        w = math.exp(-age * 0.04)
-        pair[nums[i - 1]][nums[i]] += w
-    if nums[0] in pair:
-        tot = sum(pair[nums[0]].values()) or 1
-        for v in rang:
-            scores[v] += pair[nums[0]][v] / tot * 55
-
-    # 4. Tri-gram
-    if n >= 2 and nums[1] in pair and nums[0] in pair.get(nums[1], {}):
-        # Use bigram lookback
-        tri = defaultdict(lambda: defaultdict(float))
-        for i in range(2, min(n, 80)):
-            age = min(n, 80) - 1 - i
-            w = math.exp(-age * 0.04)
-            tri[(nums[i - 2], nums[i - 1])][nums[i]] += w
-        k3 = (nums[1], nums[0])
-        if k3 in tri:
-            tot3 = sum(tri[k3].values()) or 1
-            for v in rang:
-                scores[v] += tri[k3][v] / tot3 * 35
-
-    # 5. Recency — number appeared in last 5 → penalise
-    recent5 = nums[:5]
-    for v in rang:
-        if v in recent5: scores[v] -= 60
-
-    sorted_nums = sorted(rang, key=lambda v: -scores[v])
-    return sorted_nums[0], scores
-
-# ═══════════════════════════════════════════════════════════
-# MAIN PREDICTION ENGINE
-# ═══════════════════════════════════════════════════════════
-def v22_engine(history_list, current_level):
-    # Parse outcomes
-    arr = []
-    for item in history_list:
-        s = str(item.get("size", "")).upper()
-        arr.append(1 if s in ["BIG", "BIGGG"] else 0)
-    if len(arr) < 20: return None
-
-    # Reverse so arr[0] = latest
-    arr = list(reversed(arr))
-
-    # Entropy + regime
-    entropy = cond_entropy(arr[:40], order=1)
-    regime  = detect_regime(arr)
-
-    # Run all engines
-    eK  = eng_kalman(arr)
-    eMk = eng_markov(arr)
-    eAC = eng_autocorr(arr)
-    eBay= eng_bayes(arr)
-    eRS = eng_regime_streak(arr)
-    ePM = eng_pattern_miner(arr)
-
-    engines = {
-        "KALMAN":  eK,
-        "MARKOV":  eMk,
-        "AUTOCORR":eAC,
-        "BAYES":   eBay,
-        "REGIME":  eRS,
-        "PATTERN": ePM,
-    }
-
-    fused_prob, agree, votes = meta_fuse(engines, regime, entropy)
-
-    if fused_prob >= 0.50:
-        direction = "BIGGG"
-        raw_conf  = fused_prob
-    else:
-        direction = "SMALL"
-        raw_conf  = 1.0 - fused_prob
-
-    # Honest confidence (not fake 95%)
-    # Base 55–80 range, scaled by signal strength
-    dom = abs(fused_prob - 0.5)
-    base_conf = 55 + dom * 60 + agree * 8
-    # Entropy adjustment: high entropy = less predictable
-    base_conf -= entropy * 6
-    display_conf = round(max(54, min(80, base_conf)), 1)
-
-    # Predict number
-    best_num, num_scores = predict_number(history_list, direction)
-
-    # Bet advice
-    bet_map = {1: "1.0X 🎯", 2: "2.5X 🔥", 3: "6.0X ⚡", 4: "12.0X 🛡"}
-    bet_advice = bet_map.get(current_level, "1.0X 🎯")
-
-    # Engine vote summary (top 3 active)
-    active_votes = [(n, d) for n, _, _, d in votes]
-    vote_str = " | ".join(f"{n}:{d}" for n, d in active_votes[:4]) if active_votes else "LEARNING"
-
-    last_issue = int(history_list[-1]["issueNumber"])
-
-    return {
-        "last_issue":   last_issue,
-        "next_issue":   last_issue + 1,
-        "direction":    direction,
-        "number":       best_num,
-        "confidence":   display_conf,
-        "bet_advice":   bet_advice,
-        "regime":       regime,
-        "entropy":      round(entropy, 3),
-        "vote_str":     vote_str,
-        "active_eng":   len(votes),
-        "current_level":current_level,
-    }
-
-# ─────────────────────────────────────────────
-# HISTORY FORMATTER (with proper emojis)
-# WIN = ✅✅✅  |  JACKPOT = ☠️☠️☠️  |  LOSS = (blank)
-# ─────────────────────────────────────────────
-def format_history(server_list, pred_log):
-    """
-    pred_log: list of {issue, direction, number} for tracking results
-    """
-    lines = ""
-    shown = server_list[:8] if len(server_list) >= 8 else server_list
-    for item in shown:
-        issue_short = str(item["issueNumber"])[-3:]
-        size = str(item.get("size", "")).upper()
-        size_str = "BIGGG" if size in ["BIG", "BIGGG"] else "SMALL"
-        num = item.get("number", "?")
-
-        # Find matching prediction
-        matched = next((p for p in pred_log if str(p["issue"]) == str(item["issueNumber"])), None)
-        if matched:
-            hit_size = (matched["direction"] == size_str)
-            hit_num  = (str(matched["number"]) == str(num))
-            if hit_num:
-                emoji = "☠️☠️☠️"   # JACKPOT
-            elif hit_size:
-                emoji = "✅✅✅"    # WIN
-            else:
-                emoji = ""          # LOSS — blank
-        else:
-            emoji = ""  # no prediction recorded
-
-        lines += f"`{issue_short}` *{size_str}* `{num}` {emoji}\n"
-    return lines
-
-# ─────────────────────────────────────────────
-# BOT MAIN LOOP
-# ─────────────────────────────────────────────
-async def bot_loop(session):
-    current_level = 1
-    pending_pred  = None
-    pred_log      = []  # [{issue, direction, number}, ...]
-    print("🚀 QUANTUM V22 STARTED")
-
-    while True:
+# ==================== WARMUP ====================
+async def warmup(session):
+    print("Warmup V28.5.1...")
+    raw = await fetch_data(session)
+    if not raw: return
+    history = validate(raw)
+    if len(history) < 100: return
+    for i in range(14, len(history) - 1):
+        part = history[:i]; a = [h["size"] for h in part]
+        sg = pattern_signature(a, 14)
+        if sg:
+            nb = history[i]["size"] == 1
+            pm = STATE.setdefault("pattern_memory", {}).setdefault(sg, {"next_big": 0, "next_small": 0})
+            if nb: pm["next_big"] += 1
+            else: pm["next_small"] += 1
+    for i in range(6, len(history) - 1):
+        part = history[:i]; a = [h["size"] for h in part]
+        ss = short_sig(a, 6)
+        if not ss: continue
         try:
-            raw_list = await fetch_data(session)
-            if raw_list:
-                history = list(reversed(raw_list))
-                last_item   = history[-1]
-                last_issue  = int(last_item["issueNumber"])
-                actual_size = "BIGGG" if str(last_item.get("size","")).upper() in ["BIG","BIGGG"] else "SMALL"
-                actual_num  = str(last_item.get("number",""))
+            pr = predict_next(part)
+            ab = history[i]["size"] == 1
+            upd_pat_strength(ss, ab, pr["pred_size"] == 1)
+        except: continue
+    for i in range(50, len(history) - 1):
+        part = history[:i]; a = [h["size"] for h in part]
+        reg = detect_regime(a)
+        try:
+            pr = predict_next(part)
+            ab = history[i]["size"] == 1
+            upd_eng_stats(pr["probs"], ab, reg)
+            grad_update(pr["probs"], ab)
+        except: continue
+    save_state()
+    print(f"Warmup done. Pat:{len(STATE.get('pattern_memory', {}))} Strong:{len(STATE.get('pattern_strength', {}))}")
 
-                # ── RESULT CHECK ──────────────────────────────
-                if pending_pred and str(pending_pred["next_issue"]) == str(last_issue):
-                    hit_size = (actual_size == pending_pred["direction"])
-                    hit_num  = (str(pending_pred["number"]) == actual_num)
+# ==================== MAIN ====================
+async def health(r): return web.Response(text="V28.5.1 ADAPTIVE ACTIVE", status=200)
 
-                    if hit_num:
-                        # JACKPOT
-                        current_level = 1
-                        asyncio.create_task(send_sticker(session))
-                        result_msg = (
-                            f"☠️☠️☠️ *JACKPOT!* `{actual_num}` ☠️☠️☠️\n"
-                            f"Period `{last_issue}` → *{actual_size}* `{actual_num}`"
-                        )
-                        asyncio.create_task(send_telegram(session, result_msg))
-                    elif hit_size:
-                        # WIN
-                        current_level = 1
-                        asyncio.create_task(send_sticker(session))
-                        result_msg = (
-                            f"✅✅✅ *WIN!* ✅✅✅\n"
-                            f"Period `{last_issue}` → *{actual_size}* `{actual_num}`"
-                        )
-                        asyncio.create_task(send_telegram(session, result_msg))
-                    else:
-                        # LOSS — no emoji, just info
-                        current_level = min(current_level + 1, 4)
-
-                    # Log result
-                    pred_log.append({
-                        "issue":     last_issue,
-                        "direction": pending_pred["direction"],
-                        "number":    pending_pred["number"],
-                    })
-                    if len(pred_log) > 100: pred_log = pred_log[-100:]
-                    pending_pred = None
-
-                # ── NEW PREDICTION ────────────────────────────
-                if not pending_pred or pending_pred["last_issue"] != last_issue:
-                    p = v22_engine(history, current_level)
-                    if p:
-                        pending_pred = p
-                        hist_block   = format_history(history, pred_log)
-                        dir_emoji    = "🟢" if p["direction"] == "BIGGG" else "🔴"
-
-                        msg = (
-                            f"🎯 *QUANTUM V22 — DEEP STRIKE* 🎯\n\n"
-                            f"📌 *Period:* `{p['next_issue']}`\n"
-                            f"🔥 *Size:* *{p['direction']}* {dir_emoji}\n"
-                            f"🎰 *Number:* `{p['number']}`\n"
-                            f"📊 *Confidence:* `{p['confidence']:.1f}%`\n"
-                            f"💰 *Bet:* `{p['bet_advice']}`\n\n"
-                            f"🚩 *Level:* `{p['current_level']}`  "
-                            f"🌐 *Regime:* `{p['regime']}`\n"
-                            f"⚙️ *Engines ({p['active_eng']}):* `{p['vote_str']}`\n"
-                            f"📉 *Entropy:* `{p['entropy']}`\n"
-                            f"───────────────────────\n"
-                            f"📜 *RECENT (8):*\n"
-                            f"{hist_block}"
-                        )
-                        asyncio.create_task(send_telegram(session, msg))
-
-        except Exception as e:
-            print(f"Loop error: {e}")
-
-        await asyncio.sleep(5)
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
 async def main():
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    app = web.Application(); app.router.add_get("/", health)
+    runner = web.AppRunner(app); await runner.setup()
     port = int(os.environ.get("PORT", 10000))
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"✅ Web server on port {port}")
     async with aiohttp.ClientSession() as session:
-        await bot_loop(session)
+        await warmup(session)
+        await Bot().run(session)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
