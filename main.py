@@ -13,21 +13,26 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8611789455:AAFcnSZ7nlrCIPsQUKLQwdmTf2aw
 CHAT_ID = os.environ.get("CHAT_ID", "1264164655")
 WIN_STICKER_ID = os.environ.get("STICKER_ID", "CAACAgIAAxkBAAEK941l-2E5L8X8u3X8g9X8g9X8g9X8gAACSAADw2m4HEX8_X3I1_34MAQ")
 
-BET_LEVELS = [1.0, 2.5]
-MAX_LEVEL = 2
-SHORT_LENGTHS = [5, 6, 7, 8, 9, 10, 11, 12]
+# 🔥 LEVELS — Level 4 back (12X) with safeguards
+BET_LEVELS = [1.0, 2.5, 6.0, 12.0]
+MAX_LEVEL = 4
 
-# 🔥 PATTERN RULES
+# 🔥 SHORT SIG LENGTHS — Reduced for statistical viability
+SHORT_LENGTHS = [5, 6, 7]           # Prediction lengths
+SHORT_DISPLAY_LENGTHS = [5, 6, 7, 8] # Display lengths
+
+# 🔥 PATTERN RULES (relaxed)
 TOP_ACC_THRESHOLD = 0.67
-TOP_MIN_SAMPLES = 30
+TOP_MIN_SAMPLES = 25
 STRONG_ACC_THRESHOLD = 0.59
 FLIP_MAX_ACC = 0.45
-FLIP_MIN_SAMPLES = 20
-PATTERN_MIN_SAMPLES = 20         # Prediction floor
-PATTERN_DISPLAY_MIN = 3          # 🔥 Display floor (show even small n)
+FLIP_MIN_SAMPLES = 15
+PATTERN_MIN_SAMPLES = 15
+PATTERN_DISPLAY_MIN = 3
 
 PATTERN_BLACKLIST_LOSSES = 3
 MAX_LOSS_STREAK_HARD = 5
+LEVEL4_COOLDOWN = 900  # 15 min after Level 4 loss
 
 # ==================== STATE ====================
 def _default_eng():
@@ -35,9 +40,10 @@ def _default_eng():
             "recent_hits": 0, "recent_total": 0, "gradient_weight": 1.0}
 
 ENGINES = ["pattern", "trend", "number_seq", "hot_number", "streak_break",
-           "rhythm", "hot_cold", "gambler_instinct"]
+           "rhythm", "hot_cold", "gambler_instinct",
+           "jack_pressure", "number_flow", "trend_fatigue"]
 
-STATE_FILE = "engine_state_v28_5_7.json"
+STATE_FILE = "engine_state_v28_5_8.json"
 STATE = {
     "engine_stats": {e: _default_eng() for e in ENGINES},
     "number_memory": {}, "pattern_accuracy": {}, "pattern_recent": {},
@@ -46,6 +52,7 @@ STATE = {
     "current_level": 1, "current_loss_streak": 0, "max_b2b_loss": 0,
     "bot_recent_form": [], "prediction_memory": {},
     "last_processed_issue": 0, "calibration_offset": 0.0, "cooldown_until": 0,
+    "level4_hits": 0, "level4_losses": 0,
 }
 
 def load_state():
@@ -116,20 +123,28 @@ def entropy(arr, w=40):
     if p1 in (0, 1): return 0.0
     return max(0.0, 1.0 - (-(p1*math.log2(p1) + (1-p1)*math.log2(1-p1))))
 
-# ==================== PATTERN ACCURACY ====================
+# ==================== PATTERN ACCURACY (Time-Decay) ====================
 def update_pattern_accuracy(arr_before, actual_next):
-    for L in SHORT_LENGTHS:
+    for L in SHORT_DISPLAY_LENGTHS:
         if len(arr_before) < L: continue
         sig = make_sig(arr_before, L)
         if not sig: continue
-        pa = STATE.setdefault("pattern_accuracy", {}).setdefault(sig, {"big": 0, "small": 0})
-        if actual_next == 1: pa["big"] += 1
-        else: pa["small"] += 1
+        pa = STATE.setdefault("pattern_accuracy", {}).setdefault(sig, {"big": 0, "small": 0, "weighted_big": 0.0, "weighted_small": 0.0})
+        if actual_next == 1:
+            pa["big"] += 1
+            pa["weighted_big"] = pa.get("weighted_big", 0.0) + 1.0
+        else:
+            pa["small"] += 1
+            pa["weighted_small"] = pa.get("weighted_small", 0.0) + 1.0
+        # Decay old weights
+        pa["weighted_big"] = pa.get("weighted_big", 0.0) * 0.98
+        pa["weighted_small"] = pa.get("weighted_small", 0.0) * 0.98
         pr = STATE.setdefault("pattern_recent", {}).setdefault(sig, [])
         pr.append(actual_next)
         if len(pr) > 20: STATE["pattern_recent"][sig] = pr[-20:]
 
 def get_sig_probability(arr, L):
+    """Combined: raw + time-decayed weight"""
     if len(arr) < L: return 0.5, 0
     sig = make_sig(arr, L)
     if not sig: return 0.5, 0
@@ -138,7 +153,19 @@ def get_sig_probability(arr, L):
     b, s = pa.get("big", 0), pa.get("small", 0)
     t = b + s
     if t == 0: return 0.5, 0
-    return (b + 1) / (t + 2), t
+    # Raw probability with Laplace
+    raw_p = (b + 1) / (t + 2)
+    # Weighted probability (recent matters more)
+    wb = pa.get("weighted_big", 0.0)
+    ws = pa.get("weighted_small", 0.0)
+    wtotal = wb + ws
+    if wtotal > 0.5:
+        weighted_p = (wb + 0.5) / (wtotal + 1.0)
+        # Blend: 50% raw, 50% weighted
+        p = raw_p * 0.5 + weighted_p * 0.5
+    else:
+        p = raw_p
+    return p, t
 
 def get_sig_recent_prob(arr, L, window=10):
     if len(arr) < L: return 0.5, 0
@@ -164,15 +191,13 @@ def apply_pattern_rules(p_raw, n):
     return p_raw, False, "NORMAL"
 
 def get_best_pattern(arr, for_display=False):
-    """
-    for_display=True → show n>=3 (used for message display)
-    for_display=False → require n>=20 (used for prediction engine)
-    """
+    """for_display=True → show n>=3; else → n>=15"""
     best = None
     best_score = -1
     min_n = PATTERN_DISPLAY_MIN if for_display else PATTERN_MIN_SAMPLES
+    lengths = SHORT_DISPLAY_LENGTHS if for_display else SHORT_LENGTHS
 
-    for L in SHORT_LENGTHS:
+    for L in lengths:
         if len(arr) < L: continue
         sig = make_sig(arr, L)
         if not sig: continue
@@ -183,10 +208,12 @@ def get_best_pattern(arr, for_display=False):
         p, was_flipped, tag = apply_pattern_rules(p_raw, n)
 
         deviation = abs(p - 0.5)
-        score = (L * 0.05) + (deviation * 3) + min(1.0, n / 15) * 0.3
+        # 🔥 Shorter patterns get more weight now (since 8-12 statistically dead)
+        length_weight = 1.0 if L <= 6 else (0.9 if L == 7 else 0.7)
+        score = (deviation * 3.5) + min(1.0, n / 15) * 0.5 + length_weight * 0.3
         if tag == "TOP": score += 1.5
         elif tag == "STRONG": score += 0.5
-        elif tag == "FLIP": score += 0.3
+        elif tag == "FLIP": score += 0.4
 
         if score > best_score:
             rp_raw, rn = get_sig_recent_prob(arr, L, 10)
@@ -216,12 +243,12 @@ def eng_pattern(arr):
     deviation = abs(p_combined - 0.5)
     if deviation < 0.03: return 0.5
 
-    length_boost = min(1.0, (L - 4) / 8)
-    sample_boost = min(1.0, samples / 20)
+    length_boost = 1.0 if L <= 6 else 0.8
+    sample_boost = min(1.0, samples / 15)
 
-    if tag == "TOP": boost = 1.5
-    elif tag == "STRONG": boost = 1.2
-    elif tag == "FLIP": boost = 1.2
+    if tag == "TOP": boost = 1.6
+    elif tag == "STRONG": boost = 1.25
+    elif tag == "FLIP": boost = 1.3
     else: boost = 1.0
 
     amplified = 0.5 + (p_combined - 0.5) * (1.0 + length_boost * 0.5 + sample_boost * 0.5) * boost
@@ -373,13 +400,94 @@ def eng_gambler(history):
     tw_ = sum(wts)
     return max(0.20, min(0.80, sum(s*w for s, w in zip(sigs, wts)) / tw_))
 
+# 🔥 NEW ENGINE 9: JACK PRESSURE
+def eng_jack_pressure(history):
+    """
+    Wingo Mindset: Players track when 0 or 5 will appear.
+    Analyze jack patterns and predict side based on timing.
+    """
+    nums = [int(h["number"]) for h in history if h["number"] >= 0]
+    szs = [h["size"] for h in history if h["number"] >= 0]
+    if len(nums) < 30: return 0.5
+
+    # Recent jack distribution
+    recent_30 = nums[-30:]
+    jacks_0 = recent_30.count(0)
+    jacks_5 = recent_30.count(5)
+    total_jacks = jacks_0 + jacks_5
+
+    # Expected: ~6 jacks in 30 rounds (20%)
+    # If < 3, jack is "due"
+    if total_jacks >= 4: return 0.5
+
+    # Which side is next jack likely?
+    last_jack = None
+    for n in reversed(nums):
+        if n in (0, 5): last_jack = n; break
+
+    if last_jack == 0:
+        # Last was SMALL jack → next likely BIG jack (5)
+        return 0.58
+    elif last_jack == 5:
+        # Last was BIG jack → next likely SMALL jack (0)
+        return 0.42
+    return 0.5
+
+# 🔥 NEW ENGINE 10: NUMBER FLOW
+def eng_number_flow(history):
+    """
+    Wingo Mindset: Consecutive number patterns (7→8→9 or 5→4→3).
+    Players bet on momentum continuation.
+    """
+    nums = [int(h["number"]) for h in history if h["number"] >= 0]
+    if len(nums) < 15: return 0.5
+
+    last3 = nums[-3:]
+    if len(last3) < 3: return 0.5
+
+    # Ascending momentum
+    if last3[0] < last3[1] < last3[2]:
+        # Continuation likely
+        return 0.62
+    # Descending momentum
+    if last3[0] > last3[1] > last3[2]:
+        return 0.38
+
+    # Check 2-step flow
+    if abs(nums[-1] - nums[-2]) == 1:
+        if nums[-1] > nums[-2]:
+            return 0.55
+        else:
+            return 0.45
+    return 0.5
+
+# 🔥 NEW ENGINE 11: TREND FATIGUE
+def eng_trend_fatigue(arr):
+    """
+    Wingo Mindset: Long trends exhaust — mean reversion expected.
+    When a side dominates for too long, reversal is due.
+    """
+    if len(arr) < 20: return 0.5
+    recent = arr[-20:]
+    big_count = sum(recent)
+    big_rate = big_count / 20
+
+    # If side is very dominant, fatigue expected
+    if big_rate >= 0.75:
+        # BIG exhausted → SMALL due
+        return 0.30
+    elif big_rate <= 0.25:
+        # SMALL exhausted → BIG due
+        return 0.70
+    return 0.5
+
 # ==================== WEIGHTS ====================
 REGIME_W = {
-    "ALTERNATING": {"pattern": 0.28, "trend": 0.08, "number_seq": 0.12, "hot_number": 0.10, "streak_break": 0.14, "rhythm": 0.11, "hot_cold": 0.10, "gambler_instinct": 0.07},
-    "BIG_HEAVY":   {"pattern": 0.25, "trend": 0.15, "number_seq": 0.12, "hot_number": 0.11, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.06},
-    "SMALL_HEAVY": {"pattern": 0.25, "trend": 0.15, "number_seq": 0.12, "hot_number": 0.11, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.06},
-    "LONG_STREAK": {"pattern": 0.22, "trend": 0.12, "number_seq": 0.09, "hot_number": 0.09, "streak_break": 0.24, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.05},
-    "BALANCED":    {"pattern": 0.28, "trend": 0.11, "number_seq": 0.12, "hot_number": 0.10, "streak_break": 0.13, "rhythm": 0.10, "hot_cold": 0.09, "gambler_instinct": 0.07},
+    "ALTERNATING": {"pattern": 0.24, "trend": 0.06, "number_seq": 0.10, "hot_number": 0.08, "streak_break": 0.12, "rhythm": 0.10, "hot_cold": 0.08, "gambler_instinct": 0.06, "jack_pressure": 0.06, "number_flow": 0.06, "trend_fatigue": 0.04},
+    "BIG_HEAVY":   {"pattern": 0.20, "trend": 0.12, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.10, "rhythm": 0.09, "hot_cold": 0.07, "gambler_instinct": 0.06, "jack_pressure": 0.06, "number_flow": 0.06, "trend_fatigue": 0.05},
+    "SMALL_HEAVY": {"pattern": 0.20, "trend": 0.12, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.10, "rhythm": 0.09, "hot_cold": 0.07, "gambler_instinct": 0.06, "jack_pressure": 0.06, "number_flow": 0.06, "trend_fatigue": 0.05},
+    "LONG_STREAK": {"pattern": 0.18, "trend": 0.10, "number_seq": 0.08, "hot_number": 0.08, "streak_break": 0.20, "rhythm": 0.09, "hot_cold": 0.08, "gambler_instinct": 0.05, "jack_pressure": 0.05, "number_flow": 0.04, "trend_fatigue": 0.05},
+    "BALANCED":    {"pattern": 0.24, "trend": 0.10, "number_seq": 0.10, "hot_number": 0.09, "streak_break": 0.11, "rhythm": 0.09, "hot_cold": 0.08, "gambler_instinct": 0.06, "jack_pressure": 0.05, "number_flow": 0.05, "trend_fatigue": 0.03},
 }
 
 def get_weights(regime):
@@ -496,6 +604,9 @@ def predict_next(history):
         "rhythm": eng_rhythm(arr),
         "hot_cold": eng_hot_cold(arr),
         "gambler_instinct": eng_gambler(history),
+        "jack_pressure": eng_jack_pressure(history),
+        "number_flow": eng_number_flow(history),
+        "trend_fatigue": eng_trend_fatigue(arr),
     }
     regime = detect_regime(arr)
     wts = get_weights(regime)
@@ -517,7 +628,6 @@ def predict_next(history):
     nums = [h["number"] for h in history if h["number"] >= 0]
     hot = Counter(nums[-20:]).most_common(1) if len(nums) >= 20 else None
 
-    # 🔥 Display pattern (n>=3), Prediction uses n>=20
     disp_best = get_best_pattern(arr, for_display=True)
     best_sig = "N/A"; best_note = ""; best_label = ""
     if disp_best:
@@ -525,7 +635,7 @@ def predict_next(history):
         best_sig = f"{L}-{sig}"
         if tag == "FLAT":
             best_label = "📚 LEARNING"
-            best_note = f"Acc:{p_raw*100:.0f}% (n={samples}/20 needed)"
+            best_note = f"Acc:{p_raw*100:.0f}% (n={samples}/15 needed)"
         elif tag == "TOP":
             best_label = "🏆 TOP PRIORITY"
             best_note = f"H:{p_hist*100:.0f}%(n={samples}) R:{p_recent*100:.0f}%(n={rn})"
@@ -566,7 +676,7 @@ def upd_eng_stats(probs, ab, reg):
             st["recent_hits"] = int(st["recent_hits"] * 0.8)
             st["recent_total"] = int(st["recent_total"] * 0.8)
 
-def upd_global(win):
+def upd_global(win, current_level):
     if win:
         STATE["total_wins"] = STATE.get("total_wins", 0) + 1
         STATE["current_loss_streak"] = 0
@@ -575,12 +685,23 @@ def upd_global(win):
         STATE["total_losses"] = STATE.get("total_losses", 0) + 1
         STATE["current_loss_streak"] = STATE.get("current_loss_streak", 0) + 1
         STATE["max_b2b_loss"] = max(STATE.get("max_b2b_loss", 0), STATE["current_loss_streak"])
-        STATE["current_level"] = min(STATE.get("current_level", 1) + 1, MAX_LEVEL)
-        if STATE["current_loss_streak"] >= MAX_LOSS_STREAK_HARD:
-            STATE["cooldown_until"] = time.time() + 300
+
+        # 🔥 Level 4 safeguard: cooldown after Level 4 loss
+        if current_level == 4:
+            STATE["level4_losses"] = STATE.get("level4_losses", 0) + 1
+            STATE["cooldown_until"] = time.time() + LEVEL4_COOLDOWN
             STATE["current_level"] = 1
             STATE["current_loss_streak"] = 0
-            print("🛑 Hard reset after 5 losses")
+            print("🛑 Level 4 loss → 15 min cooldown")
+        else:
+            STATE["current_level"] = min(STATE.get("current_level", 1) + 1, MAX_LEVEL)
+            # Hard reset after 5 consecutive losses
+            if STATE["current_loss_streak"] >= MAX_LOSS_STREAK_HARD:
+                STATE["cooldown_until"] = time.time() + 300
+                STATE["current_level"] = 1
+                STATE["current_loss_streak"] = 0
+                print("🛑 Hard reset after 5 losses")
+
     f = STATE.setdefault("bot_recent_form", [])
     f.append(1 if win else 0)
     STATE["bot_recent_form"] = f[-20:]
@@ -606,6 +727,8 @@ def fmt_footer():
     t = w + l; wr = (w/t*100) if t > 0 else 0.0
     pacc = len(STATE.get("pattern_accuracy", {}))
     pbl = len(STATE.get("pattern_blacklist", []))
+    l4h = STATE.get("level4_hits", 0)
+    l4l = STATE.get("level4_losses", 0)
     lvl_s = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
     return (f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 *LIFETIME*\n"
@@ -613,7 +736,8 @@ def fmt_footer():
             f"📉 *Max B2B:* `{mb}` | 🔥 *Streak:* `{cs}`\n"
             f"🎯 *WR:* `{wr:.1f}%`\n"
             f"💰 *Level:* `{lv}` ({lvl_s})\n"
-            f"🧬 *Sig-DB:* `{pacc}` | 🚫 *BL:* `{pbl}`")
+            f"🧬 *Sig-DB:* `{pacc}` | 🚫 *BL:* `{pbl}`\n"
+            f"⚡ *L4 Stats:* `{l4h}W/{l4l}L`")
 
 # ==================== TELEGRAM ====================
 async def tg_send(session, msg):
@@ -654,7 +778,7 @@ class Bot:
     def __init__(self): self.pending = None
 
     async def run(self, session):
-        print("🚀 QUANTUM V28.5.7 STARTED")
+        print("🚀 QUANTUM V28.5.8 STARTED")
         while True:
             try: await self.step(session)
             except Exception as e:
@@ -683,7 +807,11 @@ class Bot:
             grad_update(self.pending["probs"], ab)
             actual_s = "BIGGG" if ab else "SMALL"
             win = actual_s == self.pending["pred_size"]
-            upd_global(win)
+
+            current_lv = STATE.get("current_level", 1)
+            if current_lv == 4 and win:
+                STATE["level4_hits"] = STATE.get("level4_hits", 0) + 1
+            upd_global(win, current_lv)
 
             if len(arr) >= 2:
                 arr_before = arr[:-1]
@@ -712,6 +840,7 @@ class Bot:
             ep = pred["probs"]
             cons1 = f"PAT:{ep['pattern']:.2f} TRD:{ep['trend']:.2f} NSQ:{ep['number_seq']:.2f} HOT:{ep['hot_number']:.2f}"
             cons2 = f"BRK:{ep['streak_break']:.2f} RHY:{ep['rhythm']:.2f} HCD:{ep['hot_cold']:.2f} GMB:{ep['gambler_instinct']:.2f}"
+            cons3 = f"JCK:{ep['jack_pressure']:.2f} FLW:{ep['number_flow']:.2f} FTG:{ep['trend_fatigue']:.2f}"
             wstr = " ".join(f"{k[:3].upper()}:{v:.2f}" for k, v in pred["wts"].items())
 
             hot = f"\n🔥 *Hot:* `{pred['hot'][0][0]}` ({pred['hot'][0][1]}x)" if pred["hot"] else ""
@@ -727,20 +856,20 @@ class Bot:
             fund = f"{BET_LEVELS[min(lv-1, len(BET_LEVELS)-1)]}X"
             footer = fmt_footer()
 
-            msg = (f"🎯 *QUANTUM V28.5.7 SMART* 🎯\n"
+            msg = (f"🎯 *QUANTUM V28.5.8 WINGO MIND* 🎯\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                    f"📌 *Period:* `{ni}`\n"
                    f"🎲 *Number:* `{pn}`\n"
                    f"🔥 *Target:* *{'BIGGG 🟢' if pred['pred_size'] == 1 else 'SMALL 🔴'}*\n"
                    f"📊 *Conf:* `{pred['conf']*100:.1f}%` | {pred['lab']}\n"
                    f"🎰 *Form:* {pred['form']}\n"
-                   f"🎯 *Agreement:* `{pred['agree']}/8`\n"
+                   f"🎯 *Agreement:* `{pred['agree']}/11`\n"
                    f"📈 *Regime:* `{pred['regime']}` | *Ent:* `{pred['entropy']:.2f}`\n"
                    f"💰 *Fund:* `{fund}` (Level {lv})"
                    f"{pat_display}"
                    f"{hot}\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                   f"🧠 *8-Engine:*\n`{cons1}`\n`{cons2}`\n"
+                   f"🧠 *11-Engine:*\n`{cons1}`\n`{cons2}`\n`{cons3}`\n"
                    f"⚖️ *Weights:* `{wstr}`\n"
                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                    f"📜 *TREND (8):*\n{hb}"
@@ -752,7 +881,7 @@ class Bot:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    print("Warmup V28.5.7...")
+    print("Warmup V28.5.8...")
     raw = await fetch_data(session)
     if not raw: return
     history = validate(raw)
@@ -775,7 +904,7 @@ async def warmup(session):
     print(f"Warmup done. Sig-DB:{len(STATE.get('pattern_accuracy', {}))}")
 
 # ==================== MAIN ====================
-async def health(r): return web.Response(text="V28.5.7 SMART ACTIVE", status=200)
+async def health(r): return web.Response(text="V28.5.8 WINGO MIND ACTIVE", status=200)
 
 async def main():
     app = web.Application(); app.router.add_get("/", health)
