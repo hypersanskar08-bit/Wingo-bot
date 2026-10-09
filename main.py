@@ -19,15 +19,14 @@ BLACKLIST_LOSSES   = 3
 MAX_LOSS_STREAK    = 5
 LEVEL4_COOLDOWN    = 900
 
-# FIXED hyperparams (was too aggressive)
 OBS_ETA            = 0.02
 OBS_L2             = 0.0005
 OBS_MIN_W          = 1e-4
-OBS_MAX_W          = 0.20     # NEW: cap individual engine weight
+OBS_MAX_W          = 0.20
 MS_SCALES          = [0.999, 0.99, 0.95]
-DIV_STRENGTH       = 0.20     # reduced from 0.30
-CONTRARIAN_MIN_N   = 15       # NEW: recent predictions window
-CONTRARIAN_THRESH  = 0.38     # NEW: flip if accuracy below this
+DIV_STRENGTH       = 0.20
+CONTRARIAN_MIN_N   = 15
+CONTRARIAN_THRESH  = 0.38
 
 # ==================== MATH UTILS ====================
 def logit(p):
@@ -100,9 +99,8 @@ def _dft(arr):
     next_pred = m+best_amp*math.cos(2*math.pi*best_k*n/n+phase)
     return {'amp': best_amp, 'prob': max(0.05, min(0.95, next_pred+0.5-m))}
 
-# ==================== ONLINE BAYESIAN STACKING (FIXED) ====================
+# ==================== OBS ====================
 class OnlineBayesianStacking:
-    """Conservative online stacking with weight cap."""
     def __init__(self, engines, eta=OBS_ETA, l2=OBS_L2):
         self.engines = list(engines)
         n = len(self.engines)
@@ -136,7 +134,7 @@ class OnlineBayesianStacking:
     def _project(self):
         for e in self.engines:
             if self.w[e] < OBS_MIN_W: self.w[e] = OBS_MIN_W
-            if self.w[e] > OBS_MAX_W: self.w[e] = OBS_MAX_W  # cap
+            if self.w[e] > OBS_MAX_W: self.w[e] = OBS_MAX_W
         s = sum(self.w.values()) or 1.0
         for e in self.engines:
             self.w[e] /= s
@@ -248,7 +246,6 @@ def blend_regime_weights(regime_probs):
     s = sum(out.values()) or 1.0
     return {k: v/s for k, v in out.items()}
 
-# ==================== DIVERSITY BOOST ====================
 def diversity_boost(probs, base_weights, strength=DIV_STRENGTH):
     if not probs: return base_weights
     vals = list(probs.values())
@@ -281,7 +278,7 @@ STATE = {
     "last_processed_issue":0, "cooldown_until":0,
     "level4_hits":0, "level4_losses":0,
     "obs_state": {}, "ms_state": {},
-    "recent_pred_dir": [], "recent_actual_dir": [],  # NEW: contrarian tracking
+    "recent_pred_dir": [], "recent_actual_dir": [],
 }
 
 def load_state():
@@ -363,10 +360,7 @@ def entropy(arr, w=40):
     if p in (0,1): return 0.0
     return max(0.0, 1.0 - (-(p*math.log2(p)+(1-p)*math.log2(1-p))))
 
-# ==================== CONTRARIAN CHECK (NEW) ====================
 def contrarian_flip(pred_dir):
-    """If recent accuracy is very poor, flip the prediction.
-    Returns (direction, is_flipped)"""
     preds = STATE.get("recent_pred_dir", [])
     actuals = STATE.get("recent_actual_dir", [])
     n = min(len(preds), len(actuals))
@@ -385,7 +379,7 @@ def contrarian_flip(pred_dir):
         return 1 - pred_dir, True
     return pred_dir, False
 
-# ==================== BAYESIAN PATTERN MEMORY ====================
+# ==================== PATTERN MEMORY ====================
 def _get_bpm(sig):
     pa = STATE.get("pattern_accuracy",{}).get(sig)
     if not pa: return 1.0, 1.0
@@ -440,9 +434,9 @@ def _best_pattern(arr, for_display=False):
         dev = abs(p-0.5)
         len_w = 1.0 if L <= 6 else (0.9 if L == 7 else 0.75)
         score = (dev/max(std,0.1))*0.6 + min(1.0,n/15)*0.3 + len_w*0.1
-        if tag == "TOP":    score += 1.2   # reduced from 1.5
+        if tag == "TOP":    score += 1.2
         elif tag == "STRONG":score += 0.4
-        elif tag == "FLIP": score += 0.2   # reduced from 0.4
+        elif tag == "FLIP": score += 0.2
         if score > best_score:
             pr_raw = STATE.get("pattern_recent",{}).get(sig,[])
             rn = len(pr_raw[-10:])
@@ -451,7 +445,7 @@ def _best_pattern(arr, for_display=False):
             best = (sig, L, p, n, p_rec, rn, flipped, tag, p_bay, std)
     return best
 
-# ==================== ENGINES (recent-window fixes) ====================
+# ==================== ENGINES ====================
 def eng_bayes_pattern(arr):
     if len(arr) < 15: return 0.5
     bp = _best_pattern(arr, for_display=False)
@@ -499,7 +493,6 @@ def eng_kalman_trend(arr):
     if len(arr) < 15: return 0.5
     x, P = 0.5, 0.25
     Q, R = 0.004, 0.25
-    # FIX: use recent 60 in chronological order (no reverse)
     for v in arr[-min(60,len(arr)):]:
         P += Q
         K  = P/(P+R)
@@ -527,7 +520,6 @@ def eng_kalman_trend(arr):
 
 def eng_acf(arr):
     if len(arr) < 25: return 0.5
-    # FIX: recent window
     w = arr[-min(100,len(arr)):]
     sigs = []
     for lag in range(1, 7):
@@ -547,12 +539,10 @@ def eng_acf(arr):
 
 def eng_spectral(arr):
     if len(arr) < 32: return 0.5
-    # FIX: recent window
     w = arr[-min(128,len(arr)):]
     res = _dft(w)
     prob = 0.5
     if res: prob = res['prob']
-    # FIX: period matching on recent
     for period in [8, 16, 32]:
         if len(w) < period*2: continue
         recent = w[-period*2:]
@@ -710,7 +700,6 @@ def eng_bayes_freq(arr):
     n=len(arr); sigs=[]
     for ws,wt in [(10,0.40),(20,0.28),(40,0.18),(80,0.10),(120,0.04)]:
         if n<ws: continue
-        # FIX: recent window
         w=arr[-ws:]; k=sum(w)
         a,b=k+1.0,(ws-k)+1.0
         pm=a/(a+b)
@@ -870,7 +859,6 @@ def predict_next(history):
     regime_p = soft_regime_probs(arr)
     ent     = entropy(arr)
     h_val   = _hurst(arr[-min(40,len(arr)):])
-    # FIX: recent window
     ce      = _cond_entropy(arr[-40:], order=1)
 
     probs = {
@@ -894,7 +882,7 @@ def predict_next(history):
     wts_div = diversity_boost(probs, wts_hybrid, strength=DIV_STRENGTH)
 
     obs_w = OBS.weights()
-    blend_alpha = min(0.50, OBS.updates / 300.0)  # OBS gains trust slower
+    blend_alpha = min(0.50, OBS.updates / 300.0)
     wts = {}
     for e in ENGINES:
         wts[e] = (1.0 - blend_alpha) * wts_div.get(e, 0.0) + blend_alpha * obs_w.get(e, 0.0)
@@ -904,13 +892,11 @@ def predict_next(history):
     ent_gate = max(0.45, 1.0 - ce*0.45)
     p = _log_odds_fuse(probs, wts, ent_gate)
 
-    # Base direction
     direction = 1 if p >= 0.5 else 0
 
-    # NEW: Contrarian check
     direction, was_flipped = contrarian_flip(direction)
     if was_flipped:
-        p = 1.0 - p   # reflect probability too
+        p = 1.0 - p
 
     agree = sum(1 for e,prob in probs.items()
                 if (prob>0.52 and p>=0.5) or (prob<0.48 and p<0.5))
@@ -1016,8 +1002,12 @@ async def tg_send(session, msg):
         async with session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                                 json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"Markdown"},
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status!=200: print(f"TG: {await r.text()}")
-    except Exception as e: print(f"TG: {e}")
+            if r.status != 200:
+                print(f"❌ TG ERR: {await r.text()}")
+            else:
+                print("✅ TG SENT OK")
+    except Exception as e: 
+        print(f"❌ TG EX: {e}")
 
 async def tg_sticker(session):
     try:
@@ -1072,7 +1062,6 @@ class Bot:
             lv=STATE.get("current_level",1)
             if lv==4 and win: STATE["level4_hits"]=STATE.get("level4_hits",0)+1
 
-            # Track direction history for contrarian
             pred_dir = 1 if self.pending["pred_size"]=="BIGGG" else 0
             STATE.setdefault("recent_pred_dir",[]).append(pred_dir)
             STATE.setdefault("recent_actual_dir",[]).append(1 if ab else 0)
@@ -1149,6 +1138,8 @@ class Bot:
                  f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                  f"📜 *TREND (8):*\n{hb}"
                  f"{fmt_footer()}")
+            
+            print(f"[{time.strftime('%H:%M:%S')}] PREDICTION for {ni}: {self.pending['pred_size']} (Conf: {pred['conf']*100:.1f}%)")
             asyncio.create_task(tg_send(session, msg))
 
         STATE["last_processed_issue"]=li
@@ -1156,20 +1147,32 @@ class Bot:
 
 # ==================== WARMUP ====================
 async def warmup(session):
-    print("Warmup V31...")
-    raw=await fetch_data(session)
-    if not raw: return
-    history=validate(raw)
-    if not history or len(history)<50: return
-    arr=[h["size"] for h in history]
+    print("🔄 Warmup V31 starting...")
+    raw = await fetch_data(session)
+    if not raw: 
+        print("⚠️ Warmup failed: No API data")
+        return
+    history = validate(raw)
+    if not history or len(history) < 50: 
+        print(f"⚠️ Warmup failed: history length {len(history) if history else 0}")
+        return
+
+    arr = [h["size"] for h in history]
     for i in range(5, len(arr)):
         update_pattern_accuracy(arr[:i], arr[i])
+        if i % 20 == 0:
+            await asyncio.sleep(0.01)
 
-    for i in range(40, len(history)-1):
-        part=history[:i]; a=[h["size"] for h in part]
+    # Only warmup on last 150 points to save time
+    start_idx = max(40, len(history) - 150)
+    print(f"⚙️ Warming up from index {start_idx} to {len(history)-1}...")
+
+    for i in range(start_idx, len(history)-1):
+        part = history[:i]
+        a = [h["size"] for h in part]
         try:
-            pr=predict_next(part)
-            ab = history[i]["size"]==1
+            pr = predict_next(part)
+            ab = history[i]["size"] == 1
             upd_eng_stats(pr["probs"], ab, detect_regime(a))
             grad_update(pr["probs"], ab)
             MS.update(pr["probs"], ab)
@@ -1177,6 +1180,9 @@ async def warmup(session):
         except Exception as ex:
             print(f"Warmup step {i}: {ex}")
             continue
+        if i % 5 == 0:
+            await asyncio.sleep(0.01)
+
     save_state()
     print(f"✅ Warmup done. Sig-DB:{len(STATE.get('pattern_accuracy',{}))} OBS-updates:{OBS.updates}")
 
@@ -1189,8 +1195,12 @@ async def main():
     port=int(os.environ.get("PORT",10000))
     await web.TCPSite(runner,"0.0.0.0",port).start()
     print(f"✅ Port {port}")
+    
     async with aiohttp.ClientSession() as session:
+        # Send startup confirmation
+        await tg_send(session, "🤖 *QUANTUM V31* Booting up...\nWarmup starting (takes ~30-60s)")
         await warmup(session)
+        await tg_send(session, "✅ *QUANTUM V31* Online! Waiting for next prediction...")
         await Bot().run(session)
 
 if __name__=="__main__":
