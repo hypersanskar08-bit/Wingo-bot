@@ -998,15 +998,26 @@ def fmt_footer():
 
 # ==================== TELEGRAM ====================
 async def tg_send(session, msg):
+    # Try Markdown first
     try:
         async with session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                                 json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"Markdown"},
                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                print(f"❌ TG ERR: {await r.text()}")
-            else:
+            if r.status == 200:
                 print("✅ TG SENT OK")
-    except Exception as e: 
+                return
+            err = await r.text()
+            print(f"❌ TG MD ERR: {err[:200]}")
+            # Fallback: send as plain text (remove markdown)
+            clean = msg.replace("*","").replace("`","")
+            async with session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                    json={"chat_id":CHAT_ID,"text":clean},
+                                    timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                if r2.status == 200:
+                    print("✅ TG SENT (plain fallback)")
+                else:
+                    print(f"❌ TG PLAIN ERR: {(await r2.text())[:200]}")
+    except Exception as e:
         print(f"❌ TG EX: {e}")
 
 async def tg_sticker(session):
@@ -1038,7 +1049,7 @@ class Bot:
     def __init__(self): self.pending=None
 
     async def run(self, session):
-        print("🚀 QUANTUM V31 STARTED (Fixed OBS + Contrarian + Recent-Window)")
+        print("🚀 QUANTUM V31 STARTED")
         while True:
             try: await self.step(session)
             except Exception as e: print(f"Loop: {e}"); import traceback; traceback.print_exc()
@@ -1102,7 +1113,7 @@ class Bot:
             cons4=f"FLW:{ep['number_flow']:.2f} BYF:{ep['bayes_freq']:.2f}"
 
             tw_sorted = sorted(pred["wts"].items(), key=lambda kv: -kv[1])[:4]
-            top_w_str = " | ".join(f"`{e[:4]}:{w:.2f}`" for e,w in tw_sorted)
+            top_w_str = " | ".join(f"{e[:4]}:{w:.2f}" for e,w in tw_sorted)
             obs_a = pred["obs_alpha"]
 
             pat_display=""
@@ -1134,12 +1145,12 @@ class Bot:
                  f"{hot}\n"
                  f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                  f"🧠 *14-Engine:*\n`{cons1}`\n`{cons2}`\n`{cons3}`\n`{cons4}`\n"
-                 f"⚖️ *Top Adaptive:* `{top_w_str}`\n"
+                 f"⚖️ *Top Adaptive:* {top_w_str}\n"
                  f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                  f"📜 *TREND (8):*\n{hb}"
                  f"{fmt_footer()}")
             
-            print(f"[{time.strftime('%H:%M:%S')}] PREDICTION for {ni}: {self.pending['pred_size']} (Conf: {pred['conf']*100:.1f}%)")
+            print(f"[{time.strftime('%H:%M:%S')}] PRED for {ni}: {self.pending['pred_size']} (Conf: {pred['conf']*100:.1f}%)")
             asyncio.create_task(tg_send(session, msg))
 
         STATE["last_processed_issue"]=li
@@ -1163,7 +1174,6 @@ async def warmup(session):
         if i % 20 == 0:
             await asyncio.sleep(0.01)
 
-    # Only warmup on last 150 points to save time
     start_idx = max(40, len(history) - 150)
     print(f"⚙️ Warming up from index {start_idx} to {len(history)-1}...")
 
@@ -1197,7 +1207,6 @@ async def main():
     print(f"✅ Port {port}")
     
     async with aiohttp.ClientSession() as session:
-        # Send startup confirmation
         await tg_send(session, "🤖 *QUANTUM V31* Booting up...\nWarmup starting (takes ~30-60s)")
         await warmup(session)
         await tg_send(session, "✅ *QUANTUM V31* Online! Waiting for next prediction...")
