@@ -138,7 +138,8 @@ class HMM2:
     def __init__(self):
         self.trans = [[0.9, 0.1], [0.1, 0.9]]
         self.emit = [[0.42, 0.58], [0.58, 0.42]]
-        self.alpha = [0.5, 0.5](self.lr) = 0.02
+        self.alpha = [0.5, 0.5]
+        self.lr = 0.02
 
     def predict(self):
         s0 = self.alpha[0] * self.trans[0][0] + self.alpha[1] * self.trans[1][0]
