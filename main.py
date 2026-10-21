@@ -12,24 +12,14 @@ CHAT_ID = "1264164655"
 API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
 
 # ==========================================
-# 2. V66 ULTIMATE ADAPTIVE ENGINE (Learning)
+# 2. V68 DEEP SEQUENCE ENGINE (4 to 12 Length)
 # ==========================================
-class UltimateAdaptivePredictor:
+class DeepSequencePredictor:
     def __init__(self):
         self.history = []
         self.logs = []
         self.last_predicted_issue = None
-        
-        # LEARNING FEATURE 1: Mistake Book
-        # Format: { 'pattern_key': {'wins': X, 'losses': Y} }
         self.mistake_book = defaultdict(lambda: {'wins': 0, 'losses': 0})
-        
-        # LEARNING FEATURE 2: Engine Adaptive Weights
-        self.engine_stats = {
-            'pattern': {'wins': 0, 'losses': 0},
-            'trend': {'wins': 0, 'losses': 0},
-            'markov': {'wins': 0, 'losses': 0}
-        }
 
     async def fetch_data(self):
         try:
@@ -51,18 +41,15 @@ class UltimateAdaptivePredictor:
             pass
         return False
 
-    def get_engine_weight(self, engine_name):
-        """Khud ko update karta hai based on recent performance"""
-        stats = self.engine_stats[engine_name]
-        total = stats['wins'] + stats['losses']
-        if total < 3: return 1.5 # Default weight for new engines
-        acc = stats['wins'] / total
-        # Agar accuracy 50% se kam hai, weight kam karo (min 0.5)
-        return max(0.5, acc * 2)
+    def detect_regime(self, sizes):
+        last_20 = sizes[-20:]
+        alternations = sum(1 for i in range(1, len(last_20)) if last_20[i] != last_20[i-1])
+        if alternations >= 13: return "ZIGZAG"
+        elif alternations <= 7: return "TREND"
+        else: return "MIXED"
 
     def predict(self):
-        if len(self.history) < 50:
-            return None
+        if len(self.history) < 50: return None
 
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
@@ -70,97 +57,100 @@ class UltimateAdaptivePredictor:
         big_votes, small_votes = 0.0, 0.0
         logic_used = []
 
-        # --- ENGINE 1: DEEP PATTERN MATCHING (With Mistake Book) ---
-        pattern_found = False
-        for k in range(7, 2, -1):
+        # --- ENGINE 1: DEEP PATTERN MATCHING (Length 12 to 4) ---
+        for k in range(12, 3, -1):
             if len(sizes) < k + 1: continue
             pattern = tuple(sizes[-k:])
-            pattern_key = "".join(str(x) for x in pattern)
             
-            big_follow, small_follow = 0, 0
+            big_f, small_f = 0, 0
+            # History me exact pattern dhoondho
             for i in range(len(sizes) - k):
                 if tuple(sizes[i:i+k]) == pattern:
-                    if sizes[i+k] == 1: big_follow += 1
-                    else: small_follow += 1
+                    if sizes[i+k] == 1: big_f += 1
+                    else: small_f += 1
                     
-            total = big_follow + small_follow
-            if total >= 2:
-                weight = k * 1.5 * self.get_engine_weight('pattern')
-                
-                # Check Mistake Book (Learning from past mistakes)
-                mb = self.mistake_book[pattern_key]
-                if mb['losses'] > mb['wins']:
-                    # Agar is pattern par loss khaya hai, toh is baar opposite karo
-                    big_votes += small_follow * weight
-                    small_votes += big_follow * weight
-                    logic_used.append(f"Pat-{k}(Flipped)")
-                else:
-                    big_votes += big_follow * weight
-                    small_votes += small_follow * weight
-                    logic_used.append(f"Pat-{k}({big_follow}B/{small_follow}S)")
-                pattern_found = True
-                break
-                
-        # --- ENGINE 2: TREND SEQUENCE ---
+            total = big_f + small_f
+            
+            # Smart Threshold: Agar pattern 8 se lamba hai, toh 1 match bhi kaafi hai
+            min_occurrence = 1 if k >= 8 else 2
+            
+            if total >= min_occurrence:
+                weight = k * 1.5  # Lamba pattern = Zyada weight
+                big_votes += big_f * weight
+                small_votes += small_f * weight
+                logic_used.append(f"P{k}({big_f}B/{small_f}S)")
+
+        # --- ENGINE 2: REGIME / TREND ---
+        regime = self.detect_regime(sizes)
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
             else: break
-            
-        if streak >= 3:
-            trend_w = self.get_engine_weight('trend')
-            if sizes[-1] == 1: big_votes += streak * trend_w
-            else: small_votes += streak * trend_w
-            logic_used.append(f"Trend{streak}x")
 
-        # --- ENGINE 3: ORDER-2 MARKOV CHAIN ---
-        if len(sizes) > 2:
-            w2 = (sizes[-2], sizes[-1])
+        if regime == "TREND" or streak >= 4:
+            if sizes[-1] == 1: big_votes += 3.5
+            else: small_votes += 3.5
+            logic_used.append(f"Trend{streak}x")
+        elif regime == "ZIGZAG":
+            if sizes[-1] == 1: small_votes += 2.5
+            else: big_votes += 2.5
+            logic_used.append("Zigzag")
+
+        # --- ENGINE 3: ORDER-3 MARKOV CHAIN ---
+        if len(sizes) > 3:
+            w3 = (sizes[-3], sizes[-2], sizes[-1])
             trans = Counter()
-            for i in range(len(sizes)-2):
-                if (sizes[i], sizes[i+1]) == w2: trans[sizes[i+2]] += 1
+            for i in range(len(sizes)-3):
+                if (sizes[i], sizes[i+1], sizes[i+2]) == w3:
+                    trans[sizes[i+3]] += 1
             if trans:
-                mc_w = self.get_engine_weight('markov')
                 mc_res = trans.most_common(1)[0][0]
-                if mc_res == 1: big_votes += 2.0 * mc_w
-                else: small_votes += 2.0 * mc_w
-                logic_used.append("Markov")
+                if mc_res == 1: big_votes += 2.0
+                else: small_votes += 2.0
+                logic_used.append("Markov-3")
+
+        # --- MISTAKE BOOK CHECK ---
+        p_key = "".join(str(x) for x in sizes[-5:]) # 5 length key for mistake book
+        if p_key in self.mistake_book and self.mistake_book[p_key]['losses'] > self.mistake_book[p_key]['wins']:
+            if big_votes > small_votes: small_votes += 3.0
+            else: big_votes += 3.0
+            logic_used.append("Flipped")
 
         # --- FINAL SIZE DECISION ---
         if big_votes == small_votes:
-            pred_size = sizes[-1] # Fallback
+            pred_size = sizes[-1]
         else:
             pred_size = 1 if big_votes > small_votes else 0
             
         total_votes = big_votes + small_votes
         confidence = int((max(big_votes, small_votes) / total_votes) * 100) if total_votes > 0 else 50
-        confidence = min(92, max(51, confidence))
+        confidence = min(92, max(52, confidence))
 
-        # --- DEEP NUMBER PATTERN MATCHING ---
+        # --- NUMBER PREDICTION (Exact Numbers 4 to 8 Length) ---
         num_votes = Counter()
-        for k in range(5, 1, -1):
+        for k in range(8, 3, -1): # 8 to 4 length for numbers
             if len(nums) < k + 1: continue
-            num_pattern = tuple(nums[-k:])
+            n_pattern = tuple(nums[-k:])
             for i in range(len(nums) - k):
-                if tuple(nums[i:i+k]) == num_pattern:
+                if tuple(nums[i:i+k]) == n_pattern:
                     num_votes[nums[i+k]] += k * 2.0
-                    
+
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
-        
         last_seen = {i: 1000 for i in range(10)}
         for i in range(len(nums)-1, -1, -1):
             if last_seen[nums[i]] == 1000: last_seen[nums[i]] = len(nums) - i
 
         best_num = pool[0]
         best_score = -1
-        
         for n in pool:
             score = num_votes.get(n, 0) + (last_seen[n] * 0.1)
             if score > best_score:
                 best_score = score
                 best_num = n
-                
-        logic_str = " + ".join(logic_used) if logic_used else "Majority"
+
+        logic_str = " + ".join(logic_used[:3]) 
+        if len(logic_used) > 3: logic_str += ".."
+        
         next_issue = str(int(self.history[-1]["issue"]) + 1)
 
         return {
@@ -169,39 +159,22 @@ class UltimateAdaptivePredictor:
             "num": best_num,
             "confidence": confidence,
             "logic": logic_str,
-            "pattern_key": "".join(str(x) for x in sizes[-4:]), # Track k=4 for mistake book
+            "pattern_key": p_key,
             "status": "PENDING"
         }
 
     def check_results(self):
-        """Ye function bot ko sikhata hai (Learning Phase)"""
         new_results = []
         history_dict = {x["issue"]: x for x in self.history}
-        
         for log in self.logs:
             if log["status"] == "PENDING" and log["issue"] in history_dict:
                 res = history_dict[log["issue"]]
                 size_win = (res["size"] == (1 if log["size"] == "BIG" else 0))
                 
-                # --- LEARNING UPDATE START ---
                 p_key = log.get("pattern_key")
                 if p_key:
-                    if size_win:
-                        self.mistake_book[p_key]['wins'] += 1
-                    else:
-                        self.mistake_book[p_key]['losses'] += 1
-                
-                # Engine Weight Update
-                if "Pat" in log["logic"]:
-                    if size_win: self.engine_stats['pattern']['wins'] += 1
-                    else: self.engine_stats['pattern']['losses'] += 1
-                if "Trend" in log["logic"]:
-                    if size_win: self.engine_stats['trend']['wins'] += 1
-                    else: self.engine_stats['trend']['losses'] += 1
-                if "Markov" in log["logic"]:
-                    if size_win: self.engine_stats['markov']['wins'] += 1
-                    else: self.engine_stats['markov']['losses'] += 1
-                # --- LEARNING UPDATE END ---
+                    if size_win: self.mistake_book[p_key]['wins'] += 1
+                    else: self.mistake_book[p_key]['losses'] += 1
                 
                 if size_win:
                     log["status"] = "JACK 🎰" if res["num"] == log["num"] else "WIN ✅"
@@ -213,11 +186,8 @@ class UltimateAdaptivePredictor:
                 new_results.append(log)
         return new_results
 
-engine = UltimateAdaptivePredictor()
+engine = DeepSequencePredictor()
 
-# ==========================================
-# 3. FORMATTING
-# ==========================================
 def format_message(pred):
     recent_text = ""
     valid_logs = [l for l in engine.logs if l["status"] != "PENDING"]
@@ -237,14 +207,14 @@ def format_message(pred):
 🕒 **Recent Outcomes**:
 {recent_text}
 ━━━━━━━━━━━━━━━━━━
-🧬 *V66 ULTIMATE ADAPTIVE (Self-Learning)*
+🔥 *V68 DEEP SEQUENCE (4-12 Length)*
 """
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧬 V66 ULTIMATE ADAPTIVE Active! Ye bot galtiyon se seekhta hai.")
+    await update.message.reply_text("🔥 V68 DEEP SEQUENCE Active!")
 
 async def background_loop(app):
-    print("🚀 V66 Engine Started...")
+    print("🚀 V68 Engine Started...")
     while True:
         try:
             if await engine.fetch_data():
@@ -261,9 +231,7 @@ async def background_loop(app):
                         if pred:
                             engine.logs.append(pred)
                             if len(engine.logs) > 50: engine.logs.pop(0)
-                            
                             engine.last_predicted_issue = latest_issue 
-                            
                             await app.bot.send_message(chat_id=CHAT_ID, text=format_message(pred), parse_mode="Markdown")
                             print(f"⚡ Predicted for {pred['issue']}")
 
