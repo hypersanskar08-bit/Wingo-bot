@@ -5,7 +5,6 @@ import html
 import logging
 import math
 import os
-import signal
 import sqlite3
 import time
 from collections import Counter
@@ -32,7 +31,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 1.5
     request_timeout: float = 6
-    bot_name: str = "V106 DEEP VENGEANCE"
+    bot_name: str = "V107 HYPER-REGIME"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +53,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v106_vengeance")
+log = logging.getLogger("v107_regime")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -84,8 +83,8 @@ class Storage:
     def resolve_pending(self, history_dict):
         resolved = []
         with self._conn() as c:
-            rows = c.execute("SELECT issue, size, num, logic FROM predictions WHERE status='PENDING'").fetchall()
-        for issue, p_size, p_num, logic in rows:
+            rows = c.execute("SELECT issue, size, num FROM predictions WHERE status='PENDING'").fetchall()
+        for issue, p_size, p_num in rows:
             if issue in history_dict:
                 act = history_dict[issue]
                 act_size_str = "BIG" if act['size'] == 1 else "SMALL"
@@ -94,7 +93,7 @@ class Storage:
                 with self._conn() as c:
                     c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?", 
                               (status, act['num'], act_size_str, issue))
-                resolved.append({"issue": issue, "size": p_size, "num": p_num, "actual_num": act['num'], "actual_size": act_size_str, "status": status, "logic": logic})
+                resolved.append({"issue": issue, "size": p_size, "num": p_num, "actual_num": act['num'], "actual_size": act_size_str, "status": status})
         return resolved
 
     def recent_outcomes(self, limit=12):
@@ -105,14 +104,12 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V106 VENGEANCE PREDICTOR
+# V107 REGIME PREDICTOR
 # =========================
-class VengeancePredictor:
+class RegimePredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
-        self.is_vengeance_mode = False
-        self.last_lost_logic = ""
 
     async def fetch_data(self, session):
         try:
@@ -137,9 +134,15 @@ class VengeancePredictor:
         except Exception:
             return False
 
-    # Normal Engines
-    def engine_pattern(self, sizes, k_max=10):
-        for k in range(k_max, 3, -1):
+    def calculate_entropy(self, sizes, window=20):
+        """0.0 = Pure Trend, 1.0 = Pure Chaos"""
+        if len(sizes) < window: return 0.5
+        w = sizes[-window:]
+        switches = sum(1 for i in range(1, len(w)) if w[i] != w[i-1])
+        return switches / (window - 1)
+
+    def engine_ngram(self, sizes):
+        for k in range(15, 3, -1):
             if len(sizes) < k + 1: continue
             pat = tuple(sizes[-k:])
             big_f, small_f = 0, 0
@@ -169,71 +172,67 @@ class VengeancePredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        p_big, p_small = 0.5, 0.5
+        p_big = 0.5
         logic = []
+        
+        # 1. Detect Market Regime
+        entropy = self.calculate_entropy(sizes)
+        
+        if entropy <= 0.35:
+            regime = "TREND"
+            logic.append("Regime:TREND")
+        elif entropy >= 0.65:
+            regime = "CHAOS"
+            logic.append("Regime:CHAOS")
+        else:
+            regime = "MIXED"
+            logic.append("Regime:MIXED")
 
-        # ==========================================
-        # 🚨 VENGEANCE MODE (Activated after 1 LOSS)
-        # ==========================================
-        if self.is_vengeance_mode:
-            logic.append("VENGEANCE")
-            
-            # Agar pichli baar Pattern galat tha, toh Pattern ko veto karo
-            if "P" in self.last_lost_logic:
-                p_big, logic_tag = self.engine_markov(sizes, order=4) # Deep Markov 4
-                logic.append(logic_tag)
-                # Invert pattern completely
-                p_pat, _ = self.engine_pattern(sizes, k_max=15)
-                p_big = 1.0 - p_pat # ULTA
-                
-            # Agar pichli baar Markov galat tha, toh 15-Length N-Gram chalao
-            elif "M" in self.last_lost_logic:
-                p_pat, logic_tag = self.engine_pattern(sizes, k_max=15)
-                logic.append(logic_tag)
-                p_mark, _ = self.engine_markov(sizes, order=3)
-                p_big = 1.0 - p_mark # ULTA
-                
-            # Agar Trend galat tha, toh Mean Reversion maaro
-            elif "Trend" in self.last_lost_logic:
+        # 2. Base Prediction Engines
+        p_ngram, l_ngram = self.engine_ngram(sizes)
+        p_markov, l_markov = self.engine_markov(sizes, order=4)
+
+        # 3. Live Streak
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == sizes[-1]: streak += 1
+            else: break
+
+        # 4. Smart Recovery & Weighting Logic
+        if self.loss_streak >= 1:
+            logic.append("RECOVERY")
+            if regime == "TREND" or streak >= 3:
+                # Trend ke sath jao
+                p_big = 1.0 if sizes[-1] == 1 else 0.0
+                logic.append(f"TrendRide_{streak}x")
+            elif regime == "CHAOS":
+                # Market bhatak raha hai, toh Mean Reversion maaro
                 big_count = sizes[-20:].count(1)
                 if big_count >= 12: p_big = 0.2 # Expect SMALL
                 else: p_big = 0.8 # Expect BIG
-                logic.append("Reversion")
-            
-            # Default Recovery: Agar kuch samajh na aaye, toh last result ka ulta
+                logic.append("MeanReversion")
             else:
-                p_big = 0.0 if sizes[-1] == 1 else 1.0
-                logic.append("Flip")
-                
-        # ==========================================
-        # 🧠 NORMAL MODE
-        # ==========================================
+                # Mixed market, use deep engines but invert if last logic failed
+                p_big = (p_ngram * 0.6) + (p_markov * 0.4)
+                logic.append(f"{l_ngram}+{l_markov}")
         else:
-            p1, l1 = self.engine_pattern(sizes, k_max=12)
-            p2, l2 = self.engine_markov(sizes, order=3)
-            
-            # Trend Engine
-            streak = 1
-            for i in range(len(sizes)-2, -1, -1):
-                if sizes[i] == sizes[-1]: streak += 1
-                else: break
-            if streak >= 4:
-                p3 = 1.0 if sizes[-1] == 1 else 0.0
-                l3 = f"T{streak}"
+            # Normal mode
+            if regime == "TREND":
+                p_big = 1.0 if sizes[-1] == 1 else 0.0
+                logic.append("TrendFollow")
+            elif regime == "CHAOS":
+                # Chop market: Play zigzag
+                p_big = 0.0 if sizes[-1] == 1 else 1.0
+                logic.append("ZigzagFlip")
             else:
-                p3 = 0.5; l3 = "T_None"
-                
-            p_big = (p1 * 0.4) + (p2 * 0.4) + (p3 * 0.2)
-            logic = [l1, l2, l3]
+                p_big = (p_ngram * 0.5) + (p_markov * 0.5)
+                logic.append(f"{l_ngram}+{l_markov}")
 
-        # Final Decision
         pred_size = 1 if p_big >= 0.5 else 0
         confidence = int(abs(p_big - 0.5) * 2 * 100)
         
-        if self.is_vengeance_mode:
-            confidence = min(85, max(60, confidence + 15)) # Recovery me confidence boost
-        else:
-            confidence = min(80, max(52, confidence))
+        if regime == "CHAOS": confidence = min(65, confidence)
+        else: confidence = min(88, max(52, confidence))
 
         # ==========================================
         # DEEP NUMBER SELECTION
@@ -252,7 +251,7 @@ class VengeancePredictor:
         best_num = pool[0]
         best_score = -1
         for n in pool:
-            score = (trans.get(n, 0) * 0.6) + (gaps[n] * 0.1)
+            score = (trans.get(n, 0) * 0.7) + (gaps[n] * 0.1)
             if score > best_score:
                 best_score = score
                 best_num = n
@@ -265,10 +264,10 @@ class VengeancePredictor:
             "logic": " + ".join(logic)
         }
 
-PREDICTOR = VengeancePredictor()
+PREDICTOR = RegimePredictor()
 
 # =========================
-# FORMATTING & SENDING
+# FORMATTING
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = ""
@@ -279,7 +278,7 @@ def format_prediction(p, recent_rows):
         status = r[3]
         recent_text += f"➜ <code>{h(issue)}</code> Actual: {h(act_size)} {h(act_num)} → <b>{h(status)}</b>\n"
 
-    mode = "🚨 VENGEANCE" if PREDICTOR.is_vengeance_mode else "🧠 NORMAL"
+    mode = "🚨 RECOVERY" if PREDICTOR.loss_streak > 0 else "🧠 NORMAL"
 
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
@@ -293,7 +292,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V106 DEEP VENGEANCE</i>
+⚡ <i>V107 HYPER-REGIME</i>
 """
 
 async def send_msg(app, text):
@@ -303,13 +302,13 @@ async def send_msg(app, text):
         log.error(f"Send error: {e}")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 V106 Vengeance Active!\nAfter 1 loss, bot enters Ultra-Deep Recovery Mode.")
+    await update.message.reply_text("🤖 V107 Hyper-Regime Active!\nChaos and Trend detection is ON.")
 
 # =========================
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V106 Worker loop started...")
+    log.info("V107 Worker loop started...")
     while True:
         try:
             if await PREDICTOR.fetch_data(session):
@@ -317,14 +316,8 @@ async def worker_loop(app, session):
                 
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
-                    if "LOSS" in res['status']:
-                        PREDICTOR.loss_streak += 1
-                        PREDICTOR.is_vengeance_mode = True
-                        PREDICTOR.last_lost_logic = res.get('logic', '')
-                    else:
-                        PREDICTOR.loss_streak = 0
-                        PREDICTOR.is_vengeance_mode = False
-                        PREDICTOR.last_lost_logic = ""
+                    if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
+                    else: PREDICTOR.loss_streak = 0
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -338,7 +331,6 @@ async def worker_loop(app, session):
                         STORE.save_prediction(p['issue'], p['size'], p['num'], p['logic'])
                         recent = STORE.recent_outcomes(12)
                         await send_msg(app, format_prediction(p, recent))
-                        log.info(f"Pred {p['issue']} | Mode: {PREDICTOR.is_vengeance_mode} | {p['logic']}")
             
             gc.collect() 
             await asyncio.sleep(CFG.fetch_every)
@@ -352,7 +344,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V106 is running!")
+    return web.Response(text="V107 is running!")
 
 async def main():
     CFG.validate()
