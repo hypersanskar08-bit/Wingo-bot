@@ -32,7 +32,7 @@ except ImportError:
 
 @dataclass
 class Config:
-    telegram_token: str = os.getenv("8611789455:AAFexWc48dhJKgcUK-hkCpRQowbGTm_Bwx0", "").strip()
+    telegram_token: str = "8611789455:AAFexWc48dhJKgcUK-hkCpRQowbGTm_Bwx0"
     chat_id_raw: str = os.getenv("1264164655", "").strip()
     admin_ids_raw: str = os.getenv("1264164655", "").strip()
     source_api_url: str = os.getenv("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000", "").strip()
