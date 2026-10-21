@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
+from aiohttp import web # 🔥 NEW: Dummy Web Server ke liye
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -168,7 +169,6 @@ class Storage:
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=20)
-        # RAM bachane ke liye WAL mode hata kar TRUNCATE use kiya hai
         c.execute("PRAGMA journal_mode=TRUNCATE")
         c.execute("PRAGMA synchronous=NORMAL")
         return c
@@ -353,9 +353,7 @@ async def fetch_sequence_data(session: aiohttp.ClientSession):
         if r.status != 200: raise RuntimeError(f"bad status {r.status}")
         data = await r.json()
         items = data.get("data", {}).get("list", [])
-        
-        # 🔥 MEMORY FIX: Sirf last 200 items process karo, 1000 nahi
-        items = items[-200:] 
+        items = items[-200:] # Last 200 only
         out = []
 
         for item in items:
@@ -505,10 +503,7 @@ async def worker_loop(app: Application):
                 STATE.fetch_ok += 1
                 STATE.last_fetch_at = time.time()
                 backoff = 2.0
-                
-                # 🔥 MEMORY FIX: Garbage Collector chalao taaki RAM free ho
-                gc.collect()
-                
+                gc.collect() # RAM Free
                 await asyncio.sleep(CFG.fetch_every)
             except asyncio.CancelledError:
                 raise
@@ -518,6 +513,20 @@ async def worker_loop(app: Application):
                 log.exception("worker error: %s", e)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.8, 30.0)
+
+# 🔥 NEW: Render Web Server Dummy Route
+async def handle_ping(request):
+    return web.Response(text="Bot is running perfectly!")
+
+async def start_dummy_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Dummy web server running on port {port} to keep Render happy.")
 
 # =========================
 # MAIN
@@ -540,6 +549,9 @@ async def main():
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGINT, _stop_signal)
         loop.add_signal_handler(signal.SIGTERM, _stop_signal)
+
+    # 🔥 Start Dummy Web Server First
+    await start_dummy_web_server()
 
     async with app:
         await app.start()
