@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from collections import Counter
+from collections import Counter, defaultdict
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -12,13 +12,24 @@ CHAT_ID = "1264164655"
 API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
 
 # ==========================================
-# 2. V65 PATTERN HUNTER ENGINE
+# 2. V66 ULTIMATE ADAPTIVE ENGINE (Learning)
 # ==========================================
-class PatternHunterPredictor:
+class UltimateAdaptivePredictor:
     def __init__(self):
         self.history = []
         self.logs = []
         self.last_predicted_issue = None
+        
+        # LEARNING FEATURE 1: Mistake Book
+        # Format: { 'pattern_key': {'wins': X, 'losses': Y} }
+        self.mistake_book = defaultdict(lambda: {'wins': 0, 'losses': 0})
+        
+        # LEARNING FEATURE 2: Engine Adaptive Weights
+        self.engine_stats = {
+            'pattern': {'wins': 0, 'losses': 0},
+            'trend': {'wins': 0, 'losses': 0},
+            'markov': {'wins': 0, 'losses': 0}
+        }
 
     async def fetch_data(self):
         try:
@@ -40,6 +51,15 @@ class PatternHunterPredictor:
             pass
         return False
 
+    def get_engine_weight(self, engine_name):
+        """Khud ko update karta hai based on recent performance"""
+        stats = self.engine_stats[engine_name]
+        total = stats['wins'] + stats['losses']
+        if total < 3: return 1.5 # Default weight for new engines
+        acc = stats['wins'] / total
+        # Agar accuracy 50% se kam hai, weight kam karo (min 0.5)
+        return max(0.5, acc * 2)
+
     def predict(self):
         if len(self.history) < 50:
             return None
@@ -50,26 +70,36 @@ class PatternHunterPredictor:
         big_votes, small_votes = 0.0, 0.0
         logic_used = []
 
-        # --- ENGINE 1: DEEP SIZE PATTERN MATCHING (N-Gram) ---
-        # 7 se 3 length tak ke patterns dhoondho
+        # --- ENGINE 1: DEEP PATTERN MATCHING (With Mistake Book) ---
+        pattern_found = False
         for k in range(7, 2, -1):
             if len(sizes) < k + 1: continue
             pattern = tuple(sizes[-k:])
+            pattern_key = "".join(str(x) for x in pattern)
             
             big_follow, small_follow = 0, 0
-            # Pichle 1000 results me exact pattern search karo
             for i in range(len(sizes) - k):
                 if tuple(sizes[i:i+k]) == pattern:
                     if sizes[i+k] == 1: big_follow += 1
                     else: small_follow += 1
                     
             total = big_follow + small_follow
-            if total >= 2: # Kam se kam 2 baar repeat hona chahiye
-                weight = k * 1.5  # Lamba pattern = zyada weight
-                big_votes += big_follow * weight
-                small_votes += small_follow * weight
-                logic_used.append(f"Pat-{k}({big_follow}B/{small_follow}S)")
-                break # Longest match milte hi ruk jao
+            if total >= 2:
+                weight = k * 1.5 * self.get_engine_weight('pattern')
+                
+                # Check Mistake Book (Learning from past mistakes)
+                mb = self.mistake_book[pattern_key]
+                if mb['losses'] > mb['wins']:
+                    # Agar is pattern par loss khaya hai, toh is baar opposite karo
+                    big_votes += small_follow * weight
+                    small_votes += big_follow * weight
+                    logic_used.append(f"Pat-{k}(Flipped)")
+                else:
+                    big_votes += big_follow * weight
+                    small_votes += small_follow * weight
+                    logic_used.append(f"Pat-{k}({big_follow}B/{small_follow}S)")
+                pattern_found = True
+                break
                 
         # --- ENGINE 2: TREND SEQUENCE ---
         streak = 1
@@ -78,8 +108,9 @@ class PatternHunterPredictor:
             else: break
             
         if streak >= 3:
-            if sizes[-1] == 1: big_votes += streak * 1.5
-            else: small_votes += streak * 1.5
+            trend_w = self.get_engine_weight('trend')
+            if sizes[-1] == 1: big_votes += streak * trend_w
+            else: small_votes += streak * trend_w
             logic_used.append(f"Trend{streak}x")
 
         # --- ENGINE 3: ORDER-2 MARKOV CHAIN ---
@@ -89,14 +120,15 @@ class PatternHunterPredictor:
             for i in range(len(sizes)-2):
                 if (sizes[i], sizes[i+1]) == w2: trans[sizes[i+2]] += 1
             if trans:
+                mc_w = self.get_engine_weight('markov')
                 mc_res = trans.most_common(1)[0][0]
-                if mc_res == 1: big_votes += 2.0
-                else: small_votes += 2.0
+                if mc_res == 1: big_votes += 2.0 * mc_w
+                else: small_votes += 2.0 * mc_w
                 logic_used.append("Markov")
 
         # --- FINAL SIZE DECISION ---
         if big_votes == small_votes:
-            pred_size = sizes[-1]
+            pred_size = sizes[-1] # Fallback
         else:
             pred_size = 1 if big_votes > small_votes else 0
             
@@ -106,19 +138,15 @@ class PatternHunterPredictor:
 
         # --- DEEP NUMBER PATTERN MATCHING ---
         num_votes = Counter()
-        # 5 se 2 length tak exact numbers ka sequence dhoondho
         for k in range(5, 1, -1):
             if len(nums) < k + 1: continue
             num_pattern = tuple(nums[-k:])
-            
             for i in range(len(nums) - k):
                 if tuple(nums[i:i+k]) == num_pattern:
                     num_votes[nums[i+k]] += k * 2.0
                     
-        # Sirf wahi numbers consider karo jo predicted size me aate hain
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         
-        # Overdue Gap Fallback
         last_seen = {i: 1000 for i in range(10)}
         for i in range(len(nums)-1, -1, -1):
             if last_seen[nums[i]] == 1000: last_seen[nums[i]] = len(nums) - i
@@ -127,7 +155,6 @@ class PatternHunterPredictor:
         best_score = -1
         
         for n in pool:
-            # Number pattern score + Gap score
             score = num_votes.get(n, 0) + (last_seen[n] * 0.1)
             if score > best_score:
                 best_score = score
@@ -142,10 +169,12 @@ class PatternHunterPredictor:
             "num": best_num,
             "confidence": confidence,
             "logic": logic_str,
+            "pattern_key": "".join(str(x) for x in sizes[-4:]), # Track k=4 for mistake book
             "status": "PENDING"
         }
 
     def check_results(self):
+        """Ye function bot ko sikhata hai (Learning Phase)"""
         new_results = []
         history_dict = {x["issue"]: x for x in self.history}
         
@@ -153,6 +182,26 @@ class PatternHunterPredictor:
             if log["status"] == "PENDING" and log["issue"] in history_dict:
                 res = history_dict[log["issue"]]
                 size_win = (res["size"] == (1 if log["size"] == "BIG" else 0))
+                
+                # --- LEARNING UPDATE START ---
+                p_key = log.get("pattern_key")
+                if p_key:
+                    if size_win:
+                        self.mistake_book[p_key]['wins'] += 1
+                    else:
+                        self.mistake_book[p_key]['losses'] += 1
+                
+                # Engine Weight Update
+                if "Pat" in log["logic"]:
+                    if size_win: self.engine_stats['pattern']['wins'] += 1
+                    else: self.engine_stats['pattern']['losses'] += 1
+                if "Trend" in log["logic"]:
+                    if size_win: self.engine_stats['trend']['wins'] += 1
+                    else: self.engine_stats['trend']['losses'] += 1
+                if "Markov" in log["logic"]:
+                    if size_win: self.engine_stats['markov']['wins'] += 1
+                    else: self.engine_stats['markov']['losses'] += 1
+                # --- LEARNING UPDATE END ---
                 
                 if size_win:
                     log["status"] = "JACK 🎰" if res["num"] == log["num"] else "WIN ✅"
@@ -164,16 +213,15 @@ class PatternHunterPredictor:
                 new_results.append(log)
         return new_results
 
-engine = PatternHunterPredictor()
+engine = UltimateAdaptivePredictor()
 
 # ==========================================
-# 3. FORMATTING (With 12 Recent Outcomes)
+# 3. FORMATTING
 # ==========================================
 def format_message(pred):
     recent_text = ""
     valid_logs = [l for l in engine.logs if l["status"] != "PENDING"]
     
-    # Show last 12 results (Max 12, Min 5)
     for log in valid_logs[-12:]:
         recent_text += f"➜ `{log['issue'][-4:]}` {log['actual_size']} {log['actual_num']} → **{log['status']}**\n"
 
@@ -189,14 +237,14 @@ def format_message(pred):
 🕒 **Recent Outcomes**:
 {recent_text}
 ━━━━━━━━━━━━━━━━━━
-🎯 *V65 PATTERN HUNTER (1000 Result Match)*
+🧬 *V66 ULTIMATE ADAPTIVE (Self-Learning)*
 """
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎯 V65 PATTERN HUNTER Active!")
+    await update.message.reply_text("🧬 V66 ULTIMATE ADAPTIVE Active! Ye bot galtiyon se seekhta hai.")
 
 async def background_loop(app):
-    print("🚀 V65 Pattern Hunter Started...")
+    print("🚀 V66 Engine Started...")
     while True:
         try:
             if await engine.fetch_data():
