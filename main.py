@@ -1,278 +1,355 @@
 import asyncio
 import aiohttp
+import json
+import os
+import contextlib
+import logging
 from collections import Counter
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ==========================================
-# 1. CONFIGURATION
-# ==========================================
-TELEGRAM_TOKEN = "8611789455:AAEQb9B7N565qGDp--AR6Z1v_4lhzUIu-PQ" 
-CHAT_ID = "1264164655"
-API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
+# ============================================================
+# CONFIG — secrets env vars se lo, code mein mat likho
+# ============================================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PASTE_TOKEN_HERE")
+CHAT_ID        = os.getenv("CHAT_ID", "PASTE_CHAT_ID")
+API_URL        = os.getenv("API_URL", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000")
 
-# ==========================================
-# 2. V72 UNIFIED PROBABILITY ENGINE
-# ==========================================
-class UnifiedPredictor:
-    def __init__(self):
+STATE_FILE  = os.getenv("STATE_FILE", "predictor_state.json")
+FETCH_EVERY = float(os.getenv("FETCH_EVERY", "1.5"))
+MAX_LOGS    = 200
+BOT_NAME    = "V80 UNIFIED HEURISTIC ENGINE"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("predictor")
+
+
+# ============================================================
+# PERSISTENT STATE
+# ============================================================
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"logs": [], "last_predicted_issue": None}
+
+
+def save_state(state):
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log.warning(f"save_state failed: {e}")
+
+
+# ============================================================
+# HEURISTIC PREDICTOR  (entertainment / logging only)
+# ------------------------------------------------------------
+# Wingo draws are RNG-based and independent. No engine here can
+# produce a real edge. Signals are transparent, bundled, and
+# labelled — treat them as a filter, not a money-making tool.
+# ============================================================
+class HeuristicPredictor:
+    def __init__(self, state):
         self.history = []
-        self.logs = []
-        self.last_predicted_issue = None
+        self.logs = state.get("logs", [])
+        self.last_predicted_issue = state.get("last_predicted_issue")
 
-    async def fetch_data(self):
+    def snapshot(self):
+        return {"logs": self.logs, "last_predicted_issue": self.last_predicted_issue}
+
+    async def fetch_data(self, session):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(API_URL, timeout=4) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        lst = data.get("data", {}).get("list", [])
-                        cleaned = []
-                        for item in lst:
-                            issue = str(item["issueNumber"])
-                            num = int(item["number"])
-                            size = 1 if num >= 5 else 0
-                            cleaned.append({"issue": issue, "num": num, "size": size})
-                        cleaned.sort(key=lambda x: int(x["issue"]))
-                        self.history = cleaned
-                        return True
+            async with session.get(API_URL, timeout=aiohttp.ClientTimeout(total=4)) as r:
+                if r.status != 200:
+                    return False
+                data = await r.json()
+                raw = data.get("data", {}).get("list", [])
+                cleaned = []
+                for item in raw:
+                    try:
+                        issue = str(item["issueNumber"])
+                        num = int(item["number"])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    cleaned.append({"issue": issue, "num": num, "size": 1 if num >= 5 else 0})
+                cleaned.sort(key=lambda x: int(x["issue"]))
+                self.history = cleaned
+                return True
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            pass
-        return False
+            log.debug(f"fetch failed: {e}")
+            return False
+
+    # ---------------- signal engines ----------------
+    def _engines(self):
+        sized = [h["size"] for h in self.history]
+        out = []  # (p_big, weight, tag)
+
+        # 1) Longest matching pattern
+        for k in range(12, 3, -1):
+            if len(sized) < k + 1:
+                continue
+            pat = tuple(sized[-k:])
+            big = small = 0
+            for i in range(len(sized) - k):
+                if tuple(sized[i:i + k]) == pat:
+                    if sized[i + k] == 1:
+                        big += 1
+                    else:
+                        small += 1
+            total = big + small
+            need = 1 if k >= 8 else 2
+            if total >= need:
+                p = (big + 1) / (total + 2)
+                out.append((p, min(0.35, k * 0.035), f"P{k}({big}B/{small}S)"))
+                break
+
+        # 2) Streak persistence
+        last = sized[-1]
+        streak = 1
+        for i in range(len(sized) - 2, -1, -1):
+            if sized[i] == last:
+                streak += 1
+            else:
+                break
+        if streak == 2:
+            out.append((0.58 if last else 0.42, 0.10, f"Streak{streak}"))
+        elif streak == 3:
+            out.append((0.70 if last else 0.30, 0.18, f"Streak{streak}"))
+        elif streak >= 4:
+            out.append((0.82 if last else 0.18, 0.28, f"Streak{streak}"))
+
+        # 3) Mean reversion (20-window)
+        w20 = sized[-20:]
+        bc = sum(w20)
+        if bc >= 14:
+            out.append((0.28, 0.15, "MeanRev20"))
+        elif bc <= 6:
+            out.append((0.72, 0.15, "MeanRev20"))
+
+        # 4) Markov order-2
+        if len(sized) > 3:
+            key = (sized[-2], sized[-1])
+            trans = Counter()
+            for i in range(len(sized) - 2):
+                if (sized[i], sized[i + 1]) == key:
+                    trans[sized[i + 2]] += 1
+            if trans:
+                t = sum(trans.values())
+                out.append(((trans.get(1, 0) + 1) / (t + 2), 0.15, "Markov"))
+
+        # 5) Global frequency bias (50-window)
+        w50 = sized[-50:]
+        ratio = sum(w50) / len(w50) if w50 else 0.5
+        p = 0.5 + max(-0.15, min(0.15, (0.5 - ratio) * 0.5))
+        out.append((p, 0.10, "Freq50"))
+
+        return out
 
     def predict(self):
-        if len(self.history) < 50: return None
+        if len(self.history) < 50:
+            return None
 
-        sizes = [x["size"] for x in self.history]
-        nums = [x["num"] for x in self.history]
-        last_size = sizes[-1]
-        
-        logic_tags = []
-        
-        # ---------------------------------------------
-        # ENGINE 1: LONGEST PATTERN (Probability)
-        # ---------------------------------------------
-        p_pattern = 0.5 # Neutral base
-        w_pattern = 0.0
-        pat_info = ""
-        
-        for k in range(12, 3, -1):
-            if len(sizes) < k + 1: continue
-            pattern = tuple(sizes[-k:])
-            big_f, small_f = 0, 0
-            
-            for i in range(len(sizes) - k):
-                if tuple(sizes[i:i+k]) == pattern:
-                    if sizes[i+k] == 1: big_f += 1
-                    else: small_f += 1
-                    
-            total = big_f + small_f
-            min_occur = 1 if k >= 8 else 2
-            
-            if total >= min_occur:
-                # Bayesian Smoothing
-                p_pattern = (big_f + 1) / (total + 2)
-                w_pattern = min(0.4, k * 0.04) # Longer pattern = higher weight
-                pat_info = f"P{k}({big_f}B/{small_f}S)"
-                break # Stop at longest pattern
+        engines = self._engines()
+        if engines:
+            wsum = sum(w for _, w, _ in engines)
+            p_big = sum(p * w for p, w, _ in engines) / wsum
+            tags = [t for _, _, t in engines]
+        else:
+            p_big, tags = 0.5, ["Neutral"]
 
-        # ---------------------------------------------
-        # ENGINE 2: LIVE TREND (Probability)
-        # ---------------------------------------------
-        p_trend = 0.5
-        w_trend = 0.1
-        
-        streak = 1
-        for i in range(len(sizes)-2, -1, -1):
-            if sizes[i] == last_size: streak += 1
-            else: break
-            
-        if streak >= 4:
-            p_trend = 0.9 if last_size == 1 else 0.1
-            w_trend = 0.4 # Trend is very strong
-        elif streak == 3:
-            p_trend = 0.75 if last_size == 1 else 0.25
-            w_trend = 0.3
-        elif streak == 2:
-            p_trend = 0.6 if last_size == 1 else 0.4
-            w_trend = 0.2
-            
-        if streak >= 2: logic_tags.append(f"Trend{streak}x")
+        pred_size = 1 if p_big >= 0.5 else 0
+        confidence = int(min(90, max(51, round(max(p_big, 1 - p_big) * 100))))
 
-        # ---------------------------------------------
-        # ENGINE 3: MEAN REVERSION (Probability)
-        # ---------------------------------------------
-        p_mr = 0.5
-        w_mr = 0.1
-        
-        last_20 = sizes[-20:]
-        big_count = last_20.count(1)
-        if big_count >= 15:
-            p_mr = 0.2 # Too many BIG, expect SMALL
-            w_mr = 0.25
-            logic_tags.append("MeanRev")
-        elif big_count <= 5:
-            p_mr = 0.8 # Too many SMALL, expect BIG
-            w_mr = 0.25
-            logic_tags.append("MeanRev")
-
-        # ---------------------------------------------
-        # ENGINE 4: MARKOV CHAIN (Probability)
-        # ---------------------------------------------
-        p_markov = 0.5
-        w_markov = 0.15
-        
-        if len(sizes) > 2:
-            w2 = (sizes[-2], sizes[-1])
-            trans = Counter()
-            for i in range(len(sizes)-2):
-                if (sizes[i], sizes[i+1]) == w2: trans[sizes[i+2]] += 1
-            if trans:
-                total_t = sum(trans.values())
-                p_markov = (trans.get(1, 0) + 1) / (total_t + 2)
-                w_markov = 0.2
-                logic_tags.append("Markov")
-
-        # ---------------------------------------------
-        # COMBINE ALL PROBABILITIES (Weighted Average)
-        # ---------------------------------------------
-        total_weight = w_pattern + w_trend + w_mr + w_markov
-        
-        if total_weight == 0: total_weight = 1 # Fallback
-            
-        final_p_big = (
-            (p_pattern * w_pattern) + 
-            (p_trend * w_trend) + 
-            (p_mr * w_mr) + 
-            (p_markov * w_markov)
-        ) / total_weight
-        
-        # If no pattern found, add small base weight to trend
-        if w_pattern == 0:
-             final_p_big = (p_trend * 0.5 + p_mr * 0.2 + p_markov * 0.3)
-             
-        if w_pattern > 0: logic_tags.insert(0, pat_info)
-
-        # Final Decision
-        pred_size = 1 if final_p_big >= 0.5 else 0
-        confidence = int(max(final_p_big, 1 - final_p_big) * 100)
-        
-        # Cap confidence
-        confidence = min(90, max(51, confidence))
-
-        # ---------------------------------------------
-        # DEEP NUMBER SELECTION
-        # ---------------------------------------------
-        pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
-        
-        last_seen = {i: 1000 for i in range(10)}
-        for i in range(len(nums)-1, -1, -1):
-            if last_seen[nums[i]] == 1000: last_seen[nums[i]] = len(nums) - i
-
+        # number pick inside the predicted bucket (coldest + least frequent)
+        nums = [h["num"] for h in self.history]
+        pool = list(range(5, 10)) if pred_size == 1 else list(range(0, 5))
+        last_seen = {n: len(nums) for n in range(10)}
+        for idx in range(len(nums) - 1, -1, -1):
+            n = nums[idx]
+            if last_seen[n] == len(nums):
+                last_seen[n] = len(nums) - idx
         freq = Counter(nums[-50:])
-
-        best_num = pool[0]
-        best_score = -1
-        for n in pool:
-            score = (last_seen[n] * 0.2) + (freq.get(n, 0) * 1.5)
-            if score > best_score:
-                best_score = score
-                best_num = n
-
-        logic_str = " + ".join(logic_tags[:3])
-        next_issue = str(int(self.history[-1]["issue"]) + 1)
+        best_num = max(pool, key=lambda n: (last_seen[n], -freq.get(n, 0)))
 
         return {
-            "issue": next_issue,
+            "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "logic": logic_str,
-            "status": "PENDING"
+            "logic": " + ".join(tags[:3]),
+            "status": "PENDING",
         }
 
     def check_results(self):
-        new_results = []
-        history_dict = {x["issue"]: x for x in self.history}
-        for log in self.logs:
-            if log["status"] == "PENDING" and log["issue"] in history_dict:
-                res = history_dict[log["issue"]]
-                size_win = (res["size"] == (1 if log["size"] == "BIG" else 0))
-                
-                if size_win:
-                    log["status"] = "JACK 🎰" if res["num"] == log["num"] else "WIN ✅"
+        resolved = []
+        hist = {h["issue"]: h for h in self.history}
+        for log_ in self.logs:
+            if log_["status"] == "PENDING" and log_["issue"] in hist:
+                res = hist[log_["issue"]]
+                win = res["size"] == (1 if log_["size"] == "BIG" else 0)
+                if win:
+                    log_["status"] = "JACK 🎰" if res["num"] == log_["num"] else "WIN ✅"
                 else:
-                    log["status"] = "LOSS ❌"
-                
-                log["actual_num"] = res["num"]
-                log["actual_size"] = "BIG" if res["size"] == 1 else "SMALL"
-                new_results.append(log)
-        return new_results
+                    log_["status"] = "LOSS ❌"
+                log_["actual_num"] = res["num"]
+                log_["actual_size"] = "BIG" if res["size"] == 1 else "SMALL"
+                resolved.append(log_)
+        return resolved
 
-engine = UnifiedPredictor()
+    def stats(self):
+        done = [l for l in self.logs if l["status"] != "PENDING"]
+        if not done:
+            return None
+        wins = sum(1 for l in done if "WIN" in l["status"] or "JACK" in l["status"])
+        return {
+            "total": len(done),
+            "wins": wins,
+            "loss": len(done) - wins,
+            "rate": round(100 * wins / len(done), 1),
+        }
 
-def format_message(pred):
-    recent_text = ""
-    valid_logs = [l for l in engine.logs if l["status"] != "PENDING"]
-    
-    for log in valid_logs[-12:]:
-        recent_text += f"➜ `{log['issue'][-4:]}` {log['actual_size']} {log['actual_num']} → **{log['status']}**\n"
 
-    return f"""
-📌 **Period No**: `{pred['issue'][-4:]}`
-🎯 **Target No**: `{pred['num']}`
-📊 **Size**: **{pred['size']}**
+engine = HeuristicPredictor(load_state())
 
-📈 **Confidence**: {pred['confidence']}%
-🧮 **Math Logic**: {pred['logic']}
 
-━━━━━━━━━━━━━━━━━━
-🕒 **Recent Outcomes**:
-{recent_text}
-━━━━━━━━━━━━━━━━━━
-🧬 *V72 UNIFIED PROBABILITY (Combined)*
-"""
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧬 V72 UNIFIED ENGINE Active!")
-
-async def background_loop(app):
-    print("🚀 V72 Engine Started...")
-    while True:
+# ============================================================
+# TELEGRAM HELPERS
+# ============================================================
+async def safe_send(app, text, retries=3):
+    for attempt in range(retries):
         try:
-            if await engine.fetch_data():
-                resolved = engine.check_results()
-                for res in resolved:
-                    text = f"🎯 **Result Out**\nPeriod: `{res['issue'][-4:]}`\nPred: {res['size']} {res['num']}\nAct: {res['actual_size']} {res['actual_num']}\nStatus: **{res['status']}**"
-                    await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
-
-                if engine.history:
-                    latest_issue = str(int(engine.history[-1]["issue"]) + 1)
-                    
-                    if engine.last_predicted_issue != latest_issue:
-                        pred = engine.predict()
-                        if pred:
-                            engine.logs.append(pred)
-                            if len(engine.logs) > 50: engine.logs.pop(0)
-                            engine.last_predicted_issue = latest_issue 
-                            await app.bot.send_message(chat_id=CHAT_ID, text=format_message(pred), parse_mode="Markdown")
-                            print(f"⚡ Predicted for {pred['issue']}")
-
-            await asyncio.sleep(1)
+            await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+            return True
         except Exception as e:
-            print(f"Loop Error: {e}")
+            log.warning(f"send failed ({attempt + 1}/{retries}): {e}")
             await asyncio.sleep(2)
+    return False
+
+
+def fmt_pred(p):
+    resolved = [l for l in engine.logs if l["status"] != "PENDING"][-10:]
+    recent = "".join(
+        f"➜ <code>{l['issue'][-4:]}</code> {l.get('actual_size', '?')} "
+        f"{l.get('actual_num', '?')} → <b>{l['status']}</b>\n"
+        for l in resolved
+    )
+    return (
+        f"📌 <b>Period</b>: <code>{p['issue'][-4:]}</code>\n"
+        f"🎯 <b>Target</b>: <code>{p['num']}</code>\n"
+        f"📊 <b>Size</b>: <b>{p['size']}</b>\n\n"
+        f"📈 <b>Confidence</b>: {p['confidence']}% <i>(heuristic)</i>\n"
+        f"🧮 <b>Signals</b>: {p['logic']}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🕒 <b>Recent</b>:\n{recent}"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🧬 <i>{BOT_NAME}</i>"
+    )
+
+
+# ============================================================
+# COMMANDS
+# ============================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🧬 {BOT_NAME} active.\n"
+        "Heuristic prediction + result tracking.\n"
+        "⚠️ Draws are RNG — no real edge. Entertainment only.",
+        parse_mode="HTML",
+    )
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = engine.stats()
+    if not s:
+        await update.message.reply_text("📊 Abhi koi resolved result nahi hai.")
+        return
+    await update.message.reply_text(
+        f"📊 <b>Stats</b>\n"
+        f"Total: {s['total']}\n"
+        f"Wins: {s['wins']} | Loss: {s['loss']}\n"
+        f"Win rate: <b>{s['rate']}%</b>",
+        parse_mode="HTML",
+    )
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    resolved = [l for l in engine.logs if l["status"] != "PENDING"][-15:]
+    if not resolved:
+        await update.message.reply_text("🗂 History khaali hai.")
+        return
+    lines = [
+        f"<code>{l['issue'][-4:]}</code> {l.get('actual_size', '?')} "
+        f"{l.get('actual_num', '?')} → {l['status']}"
+        for l in resolved
+    ]
+    await update.message.reply_text("🗂 <b>Last Results</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+
+# ============================================================
+# BACKGROUND LOOP
+# ============================================================
+async def background_loop(app):
+    log.info("Background loop started")
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                if await engine.fetch_data(session):
+                    for res in engine.check_results():
+                        await safe_send(
+                            app,
+                            f"🎯 <b>Result</b>\nPeriod: <code>{res['issue'][-4:]}</code>\n"
+                            f"Pred: {res['size']} {res['num']}\n"
+                            f"Actual: {res['actual_size']} {res['actual_num']}\n"
+                            f"Status: <b>{res['status']}</b>",
+                        )
+                        save_state(engine.snapshot())
+
+                    if engine.history:
+                        latest = str(int(engine.history[-1]["issue"]) + 1)
+                        if engine.last_predicted_issue != latest:
+                            pred = engine.predict()
+                            if pred:
+                                engine.logs.append(pred)
+                                if len(engine.logs) > MAX_LOGS:
+                                    del engine.logs[: len(engine.logs) - MAX_LOGS]
+                                engine.last_predicted_issue = latest
+                                save_state(engine.snapshot())
+                                await safe_send(app, fmt_pred(pred))
+                                log.info(f"Predicted for {pred['issue']}")
+                await asyncio.sleep(FETCH_EVERY)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception(f"loop error: {e}")
+                await asyncio.sleep(3)
+
 
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    
-    asyncio.create_task(background_loop(app))
-    
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+
     async with app:
         await app.start()
         await app.updater.start_polling()
-        await asyncio.Event().wait()
+        bg = asyncio.create_task(background_loop(app))
+        try:
+            await asyncio.Event().wait()
+        finally:
+            bg.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await bg
+            await app.updater.stop()
+            await app.stop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
+
