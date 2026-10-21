@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 1.5
     request_timeout: float = 6
-    bot_name: str = "V108 SKYNET HYPER-QUANTUM"
+    bot_name: str = "V109 TITAN-QUANTUM"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v108_skynet")
+log = logging.getLogger("v109_titan")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -90,7 +90,8 @@ class Storage:
                 act = history_dict[issue]
                 act_size_str = "BIG" if act['size'] == 1 else "SMALL"
                 win = (p_size == act_size_str)
-                status = ("JACK 🎰" if p_num == act['num'] else "WIN ✅") if win else "LOSS ❌"
+                # 🏆 TROPHY EMOJI FOR JACK
+                status = ("JACK 🏆" if p_num == act['num'] else "WIN ✅") if win else "LOSS ❌"
                 with self._conn() as c:
                     c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?", 
                               (status, act['num'], act_size_str, issue))
@@ -105,13 +106,12 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V108 SKYNET QUANTUM ENGINE
+# V109 TITAN QUANTUM ENGINE
 # =========================
-class SkynetPredictor:
+class TitanPredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
-        self.failed_logic = ""
 
     async def fetch_data(self, session):
         try:
@@ -136,10 +136,16 @@ class SkynetPredictor:
         except Exception:
             return False
 
-    # --- LAYER 1: 20-DEEP N-GRAM ---
-    def layer_ngram(self, sizes):
-        best_prob, best_k = 0.5, 0
-        for k in range(20, 3, -1):
+    def get_volatility(self, sizes):
+        """Calculates Chop Index. High = Choppy, Low = Trend"""
+        if len(sizes) < 20: return 0.5
+        w = sizes[-20:]
+        switches = sum(1 for i in range(1, len(w)) if w[i] != w[i-1])
+        return switches / 19.0
+
+    def engine_ngram(self, sizes, max_k=15):
+        probs = []
+        for k in range(max_k, 3, -1):
             if len(sizes) < k + 1: continue
             pat = tuple(sizes[-k:])
             big_f, small_f = 0, 0
@@ -148,14 +154,18 @@ class SkynetPredictor:
                     if sizes[i+k] == 1: big_f += 1
                     else: small_f += 1
             t = big_f + small_f
-            if t >= 2: 
-                return (big_f + 1) / (t + 2), f"P{k}"
-        return 0.5, "P_None"
+            if t >= 2:
+                probs.append(((big_f + 1) / (t + 2), k))
+                if len(probs) >= 3: break # Top 3 longest patterns
+        if not probs: return 0.5, "P_None"
+        # Weighted average of top 3 patterns
+        total_w = sum(k for _, k in probs)
+        p = sum(prob * k for prob, k in probs) / total_w
+        return p, f"P{probs[0][1]}"
 
-    # --- LAYER 2: MULTI-ORDER MARKOV (1 to 5) ---
-    def layer_markov(self, sizes):
-        total_p, total_w = 0.0, 0.0
-        for o in [1, 2, 3, 4, 5]:
+    def engine_markov(self, sizes):
+        probs = []
+        for o in [2, 3, 4]:
             if len(sizes) < o + 1: continue
             state = tuple(sizes[-o:])
             big_f, small_f = 0, 0
@@ -164,30 +174,11 @@ class SkynetPredictor:
                     if sizes[i+o] == 1: big_f += 1
                     else: small_f += 1
             t = big_f + small_f
-            if t >= 2:
-                total_p += ((big_f + 1) / (t + 2)) * o
-                total_w += o
-        if total_w == 0: return 0.5, "M_None"
-        return total_p / total_w, "M(1-5)"
-
-    # --- LAYER 3: SHANNON ENTROPY (CHAOS DETECTOR) ---
-    def layer_entropy(self, sizes):
-        if len(sizes) < 15: return 0.5
-        w = sizes[-15:]
-        switches = sum(1 for i in range(1, len(w)) if w[i] != w[i-1])
-        return switches / 14.0 
-
-    # --- LAYER 4: Z-SCORE (BALANCE) ---
-    def layer_zscore(self, sizes):
-        if len(sizes) < 30: return 0.5
-        w = sizes[-30:]
-        mean = statistics.mean(w)
-        stdev = statistics.pstdev(w)
-        if stdev == 0: return 0.5
-        z = (w[-1] - mean) / stdev
-        if z > 1.5: return 0.1 # Too many BIG, expect SMALL
-        if z < -1.5: return 0.9 # Too many SMALL, expect BIG
-        return 0.5
+            if t >= 1:
+                probs.append(((big_f + 1) / (t + 2), o))
+        if not probs: return 0.5, "M_None"
+        total_w = sum(o for _, o in probs)
+        return sum(prob * o for prob, o in probs) / total_w, "M-Deep"
 
     def generate_prediction(self):
         if len(self.history) < 100: return None
@@ -195,79 +186,68 @@ class SkynetPredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        entropy = self.layer_entropy(sizes)
-        p_ngram, l_ngram = self.layer_ngram(sizes)
-        p_markov, l_markov = self.layer_markov(sizes)
-        p_zscore = self.layer_zscore(sizes)
+        volatility = self.get_volatility(sizes)
+        p_ngram, l_ngram = self.engine_ngram(sizes)
+        p_markov, l_markov = self.engine_markov(sizes)
 
-        # Calculate Current Streak
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
             else: break
 
-        final_p_big = 0.5
+        p_big = 0.5
         logic = []
 
         # ==========================================
-        # 🚨 EXTREME VENGEANCE PROTOCOL (Post-Loss)
+        # 🧠 VETO & RECOVERY LOGIC
         # ==========================================
         if self.loss_streak >= 1:
-            logic.append("U_VENGEANCE")
-            
-            # Agar entropy HIGH hai (bhatak raha hai) -> Zigzag / Z-Score Play
-            if entropy >= 0.6:
-                # Mean Reversion / Z-score Par bharosa karo, pattern par nahi
-                if p_zscore > 0.5: 
-                    final_p_big = 0.85
-                    logic.append("DeepRevert(B)")
-                else: 
-                    final_p_big = 0.15
-                    logic.append("DeepRevert(S)")
-                    
-            # Agar entropy LOW hai (Trend hai) -> Ride the wave (No fighting)
-            elif entropy <= 0.3 or streak >= 3:
-                final_p_big = 1.0 if sizes[-1] == 1 else 0.0
-                logic.append(f"TrendRide({streak})")
-                
-            # Agar MIXED hai -> Throw away failed logic, use the exact opposite
+            logic.append("VENGEANCE")
+            if volatility > 0.6: # Market is Choppy
+                # Play Zigzag (Opposite of last result)
+                p_big = 0.0 if sizes[-1] == 1 else 1.0
+                logic.append("ChopFlip")
+            elif streak >= 3: # Strong Trend
+                p_big = 1.0 if sizes[-1] == 1 else 0.0
+                logic.append(f"RideTrend{streak}")
             else:
-                if "P" in self.failed_logic and "M" not in self.failed_logic:
-                    # P failed, M is king
-                    final_p_big = 0.9 if p_markov > 0.5 else 0.1
-                    logic.append(f"VetoPat_UseM")
+                # If N-Gram and Markov agree, use them. Else invert the weaker one.
+                if (p_ngram > 0.5 and p_markov > 0.5) or (p_ngram < 0.5 and p_markov < 0.5):
+                    p_big = (p_ngram * 0.6) + (p_markov * 0.4)
+                    logic.append("Consensus")
                 else:
-                    # M failed, P is king
-                    final_p_big = 0.9 if p_ngram > 0.5 else 0.1
-                    logic.append(f"VetoM_UseP")
+                    # Disagreement: Reject Pattern (usually fake)
+                    p_big = 1.0 - p_ngram
+                    logic.append("VetoPattern")
 
-        # ==========================================
-        # 🧠 NORMAL MODE (Einstein Pipeline)
-        # ==========================================
         else:
-            logic.append(f"E:{entropy:.2f}")
-            
-            # Weight distribution based on Market Regime
-            if entropy >= 0.6: # Chaos
-                final_p_big = (p_zscore * 0.6) + (p_markov * 0.4)
-                logic.append("ChaosMode")
-            elif entropy <= 0.3: # Trend
-                final_p_big = (p_ngram * 0.4) + (p_markov * 0.4) + ((1.0 if sizes[-1]==1 else 0.0) * 0.2)
-                logic.append("TrendMode")
-            else: # Mixed
-                final_p_big = (p_ngram * 0.5) + (p_markov * 0.3) + (p_zscore * 0.2)
-                logic.append("HybridMode")
-                if p_ngram > 0.5 and p_markov > 0.5: logic.append("Consensus_B")
-                elif p_ngram < 0.5 and p_markov < 0.5: logic.append("Consensus_S")
+            # Normal Mode
+            if volatility > 0.65:
+                p_big = 0.0 if sizes[-1] == 1 else 1.0
+                logic.append("ChopZigzag")
+            elif volatility < 0.35 or streak >= 3:
+                p_big = 1.0 if sizes[-1] == 1 else 0.0
+                logic.append(f"TrendFollow")
+            else:
+                # Combine with Volatility weight
+                p_big = (p_ngram * 0.45) + (p_markov * 0.35) + (0.2 if sizes[-1] == 1 else 0.0)
+                logic.append(f"{l_ngram}+{l_markov}")
 
-        pred_size = 1 if final_p_big >= 0.5 else 0
+        pred_size = 1 if p_big >= 0.5 else 0
         
-        # Confidence Calculation
-        confidence = int(abs(final_p_big - 0.5) * 2 * 100)
-        if self.loss_streak >= 1: 
-            confidence = min(92, max(70, confidence + 20)) # Boost in recovery
-        else:
-            confidence = min(85, max(52, confidence))
+        # ==========================================
+        # 🔥 DYNAMIC CONFIDENCE (No Fake 92%)
+        # ==========================================
+        base_conf = int(abs(p_big - 0.5) * 2 * 100)
+        
+        # Penalize if volatility is high (Choppy)
+        if volatility > 0.6: base_conf -= 10
+        
+        # Boost if engines strongly agree in normal mode
+        if self.loss_streak == 0 and abs(p_ngram - p_markov) < 0.2:
+            base_conf += 5
+            
+        confidence = min(82, max(51, base_conf)) # HARD CAP at 82%
 
         # ==========================================
         # DEEP NUMBER SELECTION (Target No)
@@ -275,12 +255,10 @@ class SkynetPredictor:
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         last_num = nums[-1]
         
-        # 1. Transition Matrix
         trans = Counter()
         for i in range(len(nums)-1):
             if nums[i] == last_num: trans[nums[i+1]] += 1
             
-        # 2. Gap Analysis (Overdue)
         gaps = {i: 1000 for i in range(10)}
         for i in range(len(nums)-1, -1, -1):
             if gaps[nums[i]] == 1000: gaps[nums[i]] = len(nums) - i
@@ -288,8 +266,7 @@ class SkynetPredictor:
         best_num = pool[0]
         best_score = -1
         for n in pool:
-            # Einstein logic: Highest transition + highest gap + recent frequency
-            score = (trans.get(n, 0) * 2.0) + (gaps[n] * 0.1)
+            score = (trans.get(n, 0) * 1.5) + (gaps[n] * 0.2)
             if score > best_score:
                 best_score = score
                 best_num = n
@@ -299,10 +276,11 @@ class SkynetPredictor:
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "logic": " + ".join(logic)
+            "logic": " + ".join(logic),
+            "volatility": volatility
         }
 
-PREDICTOR = SkynetPredictor()
+PREDICTOR = TitanPredictor()
 
 # =========================
 # FORMATTING
@@ -316,21 +294,23 @@ def format_prediction(p, recent_rows):
         status = r[3]
         recent_text += f"➜ <code>{h(issue)}</code> Actual: {h(act_size)} {h(act_num)} → <b>{h(status)}</b>\n"
 
-    mode = "🚨 EXTREME RECOVERY" if PREDICTOR.loss_streak > 0 else "🧠 QUANTUM NORMAL"
+    mode = "🚨 RECOVERY" if PREDICTOR.loss_streak > 0 else "🧠 TITAN NORMAL"
+    vol_str = f"{p['volatility']*100:.1f}%"
 
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
-📈 <b>Confidence</b>: {p['confidence']}%
-🧠 <b>Quantum Logic</b>: {h(p['logic'])}
+📈 <b>Confidence</b>: {p['confidence']}% <i>(Real)</i>
+📉 <b>Volatility</b>: {vol_str}
+🧠 <b>Logic</b>: {h(p['logic'])}
 ⚖️ <b>Mode</b>: {mode}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V108 SKYNET HYPER-QUANTUM</i>
+⚡ <i>V109 TITAN-QUANTUM</i>
 """
 
 async def send_msg(app, text):
@@ -340,13 +320,13 @@ async def send_msg(app, text):
         log.error(f"Send error: {e}")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 V108 Skynet Active!\n250-Layer Pipeline initialized.")
+    await update.message.reply_text("🤖 V109 TITAN-QUANTUM Active!\nDynamic Volatility & Veto logic engaged.")
 
 # =========================
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V108 Worker loop started...")
+    log.info("V109 Worker loop started...")
     while True:
         try:
             if await PREDICTOR.fetch_data(session):
@@ -354,14 +334,8 @@ async def worker_loop(app, session):
                 
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
-                    if "LOSS" in res['status']: 
-                        PREDICTOR.loss_streak += 1
-                        # Store the failed logic to use as Veto
-                        pred_record = STORE.recent_outcomes(1) 
-                        PREDICTOR.failed_logic = "" 
-                    else: 
-                        PREDICTOR.loss_streak = 0
-                        PREDICTOR.failed_logic = ""
+                    if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
+                    else: PREDICTOR.loss_streak = 0
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -388,7 +362,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V108 is running!")
+    return web.Response(text="V109 is running!")
 
 async def main():
     CFG.validate()
