@@ -1,11 +1,9 @@
 import asyncio
-import aiohttp
 import contextlib
 import csv
 import html
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import math
 import os
 import random
@@ -14,14 +12,20 @@ import sqlite3
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Any
 
-from dotenv import load_dotenv
+import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 # ============================================================
 # CONFIG
@@ -29,24 +33,24 @@ load_dotenv()
 
 @dataclass
 class Config:
-    # Fallbacks me tumhara Token aur Chat ID daal diya hai
-    telegram_token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAEQb9B7N565qGDp--AR6Z1v_4lhzUIu-PQ")
-    chat_id_raw: str = os.getenv("CHAT_ID", "1264164655")
-    admin_ids_raw: str = os.getenv("ADMIN_IDS", "1264164655")
+    telegram_token: str = os.getenv("8611789455:AAEQb9B7N565qGDp--AR6Z1v_4lhzUIu-PQ", "").strip()
+    chat_id_raw: str = os.getenv("1264164655", "").strip()
+    admin_ids_raw: str = os.getenv("1264164655", "").strip()
     api_url: str = os.getenv(
         "API_URL",
-        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000",
-    )
-    db_path: str = os.getenv("DB_PATH", "predictor.db")
-    export_dir: str = os.getenv("EXPORT_DIR", "exports")
-    log_dir: str = os.getenv("LOG_DIR", "logs")
-    fetch_every: float = float(os.getenv("FETCH_EVERY", "1.5"))
-    request_timeout: float = float(os.getenv("REQUEST_TIMEOUT", "4"))
-    bot_name: str = os.getenv("BOT_NAME", "V98 ADVANCED")
-    log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
-    send_cooldown: float = float(os.getenv("SEND_COOLDOWN", "0.8"))
+        "https://example.com/api/history"
+    ).strip()
+
+    db_path: str = os.getenv("DB_PATH", "predictor.db").strip() or "predictor.db"
+    export_dir: str = os.getenv("EXPORT_DIR", "exports").strip() or "exports"
+    log_dir: str = os.getenv("LOG_DIR", "logs").strip() or "logs"
+    fetch_every: float = float(os.getenv("FETCH_EVERY", "2"))
+    request_timeout: float = float(os.getenv("REQUEST_TIMEOUT", "8"))
+    bot_name: str = os.getenv("BOT_NAME", "V98 FIXED").strip() or "V98 FIXED"
+    log_level: str = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+    send_cooldown: float = float(os.getenv("SEND_COOLDOWN", "1.0"))
     backtest_min_history: int = int(os.getenv("BACKTEST_MIN_HISTORY", "100"))
-    min_size_history: int = int(os.getenv("MIN_SIZE_HISTORY", "60"))
+    min_size_history: int = int(os.getenv("MIN_SIZE_HISTORY", "40"))
     resolve_limit: int = int(os.getenv("RESOLVE_LIMIT", "250"))
     max_recent_lines: int = int(os.getenv("MAX_RECENT_LINES", "10"))
     paused_default: bool = os.getenv("PAUSED_DEFAULT", "0") == "1"
@@ -59,55 +63,54 @@ class Config:
     min_confidence_floor: int = int(os.getenv("MIN_CONFIDENCE_FLOOR", "50"))
 
     def parse_chat_id(self):
-        if self.chat_id_raw in ("", "PASTE_CHAT_ID", None):
+        if not self.chat_id_raw:
             raise RuntimeError("CHAT_ID missing.")
         try:
             return int(self.chat_id_raw)
-        except (TypeError, ValueError):
+        except ValueError:
             return self.chat_id_raw
 
     def admin_ids(self):
-        out = set()
+        ids = set()
         for x in self.admin_ids_raw.split(","):
             x = x.strip()
             if not x:
                 continue
             try:
-                out.add(int(x))
+                ids.add(int(x))
             except ValueError:
                 pass
-        return out
+        return ids
 
-    def validate(self):
-        if not self.telegram_token or self.telegram_token == "PASTE_TOKEN_HERE":
-            raise RuntimeError("TELEGRAM_TOKEN missing.")
-        if not self.api_url:
-            raise RuntimeError("API_URL missing.")
-        if self.fetch_every <= 0:
-            raise RuntimeError("FETCH_EVERY must be > 0.")
-        if self.request_timeout <= 0:
-            raise RuntimeError("REQUEST_TIMEOUT must be > 0.")
-        if self.min_size_history < 30:
-            raise RuntimeError("MIN_SIZE_HISTORY too low.")
-        self.parse_chat_id()
+    def ensure_dirs(self):
         Path(self.export_dir).mkdir(parents=True, exist_ok=True)
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+
+    def validate(self):
+        if not self.telegram_token:
+            raise RuntimeError("TELEGRAM_TOKEN missing.")
+        self.ensure_dirs()
+        self.parse_chat_id()
 
 
 CFG = Config()
 
 
+# ============================================================
+# LOGGING
+# ============================================================
+
 def setup_logging():
-    # 🔥 FIX: Folder create karo pehle, warna Render crash karega
-    os.makedirs(CFG.log_dir, exist_ok=True)
-    
+    CFG.ensure_dirs()
+
     root = logging.getLogger()
     root.setLevel(getattr(logging, CFG.log_level, logging.INFO))
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
+    root.handlers.clear()
+
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
-    root.handlers.clear()
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
@@ -121,44 +124,32 @@ def setup_logging():
 
 
 setup_logging()
-log = logging.getLogger("predictor")
+log = logging.getLogger("v98_fixed")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 STATUS_EMOJI = {"WIN": "✅", "LOSS": "❌", "JACK": "🏆"}
 
 
-def h(s: Any) -> str:
-    return html.escape(str(s))
-
-
-def status_emoji(s):
-    s = (s or "").upper()
-    for k, e in STATUS_EMOJI.items():
-        if k in s:
-            return e
-    return s or "?"
+def h(x: Any) -> str:
+    return html.escape(str(x))
 
 
 def size_label(v):
-    if v is None:
-        return "?"
     if isinstance(v, str):
         u = v.upper()
         if u in ("BIG", "SMALL"):
             return u
-        return "BIG" if v == "1" else "SMALL"
+        return "BIG" if u in ("1", "BIG") else "SMALL"
     return "BIG" if int(v) == 1 else "SMALL"
 
 
-def two_sided_p(z):
-    return 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
-
-
-def binomial_z(hits, total, p=0.5):
-    if total == 0:
-        return 0.0
-    mu = total * p
-    sd = math.sqrt(total * p * (1 - p)) or 1e-9
-    return (hits - mu) / sd
+def status_emoji(s: str) -> str:
+    s = (s or "").upper()
+    return STATUS_EMOJI.get(s, s or "?")
 
 
 def confidence_tier(conf: int) -> str:
@@ -169,8 +160,20 @@ def confidence_tier(conf: int) -> str:
     return "LOW"
 
 
+def binomial_z(hits, total, p=0.5):
+    if total <= 0:
+        return 0.0
+    mu = total * p
+    sd = math.sqrt(total * p * (1 - p)) or 1e-9
+    return (hits - mu) / sd
+
+
+def two_sided_p(z):
+    return 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
+
+
 # ============================================================
-# RUNTIME STATE
+# STATE
 # ============================================================
 
 @dataclass
@@ -189,6 +192,7 @@ class RuntimeState:
     sent_messages: int = 0
     dedupe_issue: Optional[str] = None
     recalibration_runs: int = 0
+    resolved_since_recalibration: int = 0
 
     def uptime(self):
         sec = int(time.time() - self.started_at)
@@ -206,7 +210,7 @@ STATE = RuntimeState()
 # ============================================================
 
 class Storage:
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = path
         self._init()
 
@@ -242,33 +246,20 @@ class Storage:
                     updated_at REAL
                 )
             """)
-            c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_predictions_status_created
-                ON predictions(status, created_at)
-            """)
-            c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_predictions_created
-                ON predictions(created_at)
-            """)
 
-    def save(self, p):
+    def save(self, p: dict):
         with self._conn() as c:
             c.execute("""
                 INSERT OR REPLACE INTO predictions
                 (issue,size,num,confidence,calibrated,tier,logic,details,signals,status,created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (
-                p["issue"], p["size"], p["num"], p["confidence"],
-                p.get("calibrated", p["confidence"]),
-                p.get("tier", confidence_tier(p["confidence"])),
-                p.get("logic", ""),
-                p.get("details", ""),
-                json.dumps(p.get("signals", {})),
-                p["status"],
-                time.time(),
+                p["issue"], p["size"], p["num"], p["confidence"], p["calibrated"],
+                p["tier"], p.get("logic", ""), p.get("details", ""),
+                json.dumps(p.get("signals", {})), p.get("status", "PENDING"), time.time()
             ))
 
-    def exists(self, issue):
+    def exists(self, issue: str) -> bool:
         with self._conn() as c:
             row = c.execute("SELECT 1 FROM predictions WHERE issue=? LIMIT 1", (issue,)).fetchone()
         return row is not None
@@ -280,8 +271,7 @@ class Storage:
                 FROM predictions ORDER BY created_at DESC LIMIT 1
             """).fetchone()
 
-    def resolve(self, hist, limit=200):
-        resolved = []
+    def resolve(self, hist: dict, limit=250):
         with self._conn() as c:
             rows = c.execute("""
                 SELECT issue,size,num FROM predictions
@@ -289,26 +279,29 @@ class Storage:
                 ORDER BY created_at DESC LIMIT ?
             """, (limit,)).fetchall()
 
+        resolved = []
         for issue, size, num in rows:
             if issue not in hist:
                 continue
             r = hist[issue]
-            win = size == ("BIG" if r["size"] else "SMALL")
-            status = ("JACK" if r["num"] == num else "WIN") if win else "LOSS"
             actual_size = "BIG" if r["size"] else "SMALL"
+            win = size == actual_size
+            status = ("JACK" if r["num"] == num else "WIN") if win else "LOSS"
+
             with self._conn() as c:
                 c.execute("""
                     UPDATE predictions
                     SET status=?, actual_num=?, actual_size=?
                     WHERE issue=?
                 """, (status, r["num"], actual_size, issue))
+
             resolved.append({
                 "issue": issue,
                 "size": size,
                 "num": num,
-                "status": status,
                 "actual_num": r["num"],
                 "actual_size": actual_size,
+                "status": status,
             })
         return resolved
 
@@ -318,8 +311,10 @@ class Storage:
                 SELECT COUNT(*),
                        SUM(CASE WHEN status IN ('WIN','JACK') THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status='JACK' THEN 1 ELSE 0 END)
-                FROM predictions WHERE status != 'PENDING'
+                FROM predictions
+                WHERE status != 'PENDING'
             """).fetchone()
+
         if not total:
             return None
         wins = wins or 0
@@ -365,6 +360,25 @@ class Storage:
             """, (n,)).fetchall()
         return [r[0] for r in rows][::-1]
 
+    def rolling_outcomes(self, limit=80):
+        with self._conn() as c:
+            rows = c.execute("""
+                SELECT status, confidence, tier
+                FROM predictions
+                WHERE status != 'PENDING'
+                ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+        return rows
+
+    def recent_pred_bias(self, n=20):
+        with self._conn() as c:
+            rows = c.execute("""
+                SELECT size FROM predictions
+                ORDER BY created_at DESC LIMIT ?
+            """, (n,)).fetchall()
+        big = sum(1 for r in rows if size_label(r[0]) == "BIG")
+        return big, len(rows) - big
+
     def signal_accuracy(self):
         acc = defaultdict(lambda: [0, 0])
         with self._conn() as c:
@@ -372,17 +386,18 @@ class Storage:
                 SELECT signals, actual_size FROM predictions
                 WHERE status != 'PENDING' AND signals IS NOT NULL
             """).fetchall()
+
         for sig_json, actual in rows:
-            if actual is None:
+            if not actual:
                 continue
-            act_int = 1 if size_label(actual) == "BIG" else 0
+            act = 1 if size_label(actual) == "BIG" else 0
             try:
                 sig = json.loads(sig_json)
             except Exception:
                 continue
             for name, p in sig.items():
                 acc[name][1] += 1
-                if (1 if p >= 0.5 else 0) == act_int:
+                if (1 if p >= 0.5 else 0) == act:
                     acc[name][0] += 1
         return {k: tuple(v) for k, v in acc.items()}
 
@@ -394,19 +409,35 @@ class Storage:
                 WHERE status != 'PENDING' AND signals IS NOT NULL
                 ORDER BY created_at DESC LIMIT ?
             """, (limit,)).fetchall()
+
         for sig_json, actual in rows:
-            if actual is None:
+            if not actual:
                 continue
-            act_int = 1 if size_label(actual) == "BIG" else 0
+            act = 1 if size_label(actual) == "BIG" else 0
             try:
                 sig = json.loads(sig_json)
             except Exception:
                 continue
             for name, p in sig.items():
                 acc[name][1] += 1
-                if (1 if p >= 0.5 else 0) == act_int:
+                if (1 if p >= 0.5 else 0) == act:
                     acc[name][0] += 1
         return {k: tuple(v) for k, v in acc.items()}
+
+    def save_signal_weights(self, weights: dict):
+        with self._conn() as c:
+            now = time.time()
+            for name, weight in weights.items():
+                c.execute("""
+                    INSERT INTO signal_weights(name, weight, updated_at)
+                    VALUES(?,?,?)
+                    ON CONFLICT(name) DO UPDATE SET weight=excluded.weight, updated_at=excluded.updated_at
+                """, (name, float(weight), now))
+
+    def load_signal_weights(self):
+        with self._conn() as c:
+            rows = c.execute("SELECT name, weight FROM signal_weights").fetchall()
+        return {name: weight for name, weight in rows}
 
     def calibration_buckets(self):
         buckets = defaultdict(lambda: [0, 0])
@@ -415,28 +446,13 @@ class Storage:
                 SELECT confidence, status FROM predictions
                 WHERE status != 'PENDING' AND confidence IS NOT NULL
             """).fetchall()
+
         for conf, status in rows:
             b = (conf // 10) * 10
             buckets[b][1] += 1
             if status in ("WIN", "JACK"):
                 buckets[b][0] += 1
         return {k: tuple(v) for k, v in buckets.items()}
-
-    def recent_pred_bias(self, n=20):
-        with self._conn() as c:
-            rows = c.execute("SELECT size FROM predictions ORDER BY created_at DESC LIMIT ?", (n,)).fetchall()
-        big = sum(1 for r in rows if size_label(r[0]) == "BIG")
-        return big, len(rows) - big
-
-    def rolling_outcomes(self, limit=80):
-        with self._conn() as c:
-            rows = c.execute("""
-                SELECT status, confidence, tier
-                FROM predictions
-                WHERE status != 'PENDING'
-                ORDER BY created_at DESC LIMIT ?
-            """, (limit,)).fetchall()
-        return rows
 
     def resolved_predictions_with_signals(self, limit=250):
         with self._conn() as c:
@@ -464,24 +480,12 @@ class Storage:
             ])
             w.writerows(rows)
 
-    def save_signal_weights(self, weights: dict):
-        with self._conn() as c:
-            now = time.time()
-            for name, weight in weights.items():
-                c.execute("""
-                    INSERT INTO signal_weights(name, weight, updated_at)
-                    VALUES(?,?,?)
-                    ON CONFLICT(name) DO UPDATE SET weight=excluded.weight, updated_at=excluded.updated_at
-                """, (name, float(weight), now))
 
-    def load_signal_weights(self):
-        with self._conn() as c:
-            rows = c.execute("SELECT name, weight FROM signal_weights").fetchall()
-        return {name: weight for name, weight in rows}
+STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# SIGNAL FRAMEWORK
+# SIGNALS
 # ============================================================
 
 @dataclass
@@ -492,62 +496,34 @@ class SignalResult:
     detail: str = ""
 
 
-class Signal:
+class SignalBase:
     name = "base"
-    def compute(self, sizes, nums) -> Optional[SignalResult]:
+    def compute(self, sizes, nums):
         raise NotImplementedError
 
 
-class PatternSignal(Signal):
+class PatternSignal(SignalBase):
     name = "pattern"
     def compute(self, sizes, nums):
-        for k in range(12, 3, -1):
+        for k in range(8, 3, -1):
             if len(sizes) < k + 1:
                 continue
             pat = tuple(sizes[-k:])
-            big = small = 0
+            b = s = 0
             for i in range(len(sizes) - k):
                 if tuple(sizes[i:i+k]) == pat:
                     if sizes[i+k]:
-                        big += 1
+                        b += 1
                     else:
-                        small += 1
-            t = big + small
-            if t >= (1 if k >= 8 else 2):
-                return SignalResult(self.name, (big + 1) / (t + 2), min(0.9, 0.15 + t * 0.1), f"P{k}:{big}B/{small}S")
+                        s += 1
+            t = b + s
+            if t >= 2:
+                p = (b + 1) / (t + 2)
+                return SignalResult(self.name, p, min(0.7, 0.15 + t * 0.08), f"k={k}")
         return None
 
 
-class RecencyPatternSignal(Signal):
-    name = "rpattern"
-    def compute(self, sizes, nums):
-        if len(sizes) < 12:
-            return None
-        for k in range(8, 3, -1):
-            target = tuple(sizes[-k:])
-            big_w = 0.0
-            small_w = 0.0
-            found = 0
-
-            for i in range(len(sizes) - k):
-                if tuple(sizes[i:i+k]) == target:
-                    age = len(sizes) - (i + k)
-                    w = 0.97 ** age
-                    if sizes[i+k]:
-                        big_w += w
-                    else:
-                        small_w += w
-                    found += 1
-
-            total = big_w + small_w
-            if found >= 2 and total > 0:
-                p = (big_w + 1.0) / (total + 2.0)
-                strength = min(0.85, 0.18 + found * 0.08 + abs(p - 0.5) * 0.4)
-                return SignalResult(self.name, p, strength, f"k={k},f={found}")
-        return None
-
-
-class WeightedMarkovSignal(Signal):
+class WeightedMarkovSignal(SignalBase):
     def __init__(self, order=2, decay=0.96):
         self.order = order
         self.decay = decay
@@ -556,33 +532,27 @@ class WeightedMarkovSignal(Signal):
     def compute(self, sizes, nums):
         if len(sizes) <= self.order + 5:
             return None
-
         key = tuple(sizes[-self.order:])
-        big_w = 0.0
-        small_w = 0.0
-        matches = 0
+        b = s = 0.0
+        m = 0
         horizon = len(sizes) - self.order
-
         for i in range(horizon):
             if tuple(sizes[i:i+self.order]) == key:
                 age = horizon - i
                 w = self.decay ** age
                 if sizes[i+self.order]:
-                    big_w += w
+                    b += w
                 else:
-                    small_w += w
-                matches += 1
-
-        total = big_w + small_w
+                    s += w
+                m += 1
+        total = b + s
         if total <= 0:
             return None
-
-        p = (big_w + 1.0) / (total + 2.0)
-        strength = min(0.85, 0.12 * matches + 0.25 * abs(p - 0.5))
-        return SignalResult(self.name, p, strength, f"m={matches}")
+        p = (b + 1.0) / (total + 2.0)
+        return SignalResult(self.name, p, min(0.75, 0.10 * m + 0.2 * abs(p - 0.5)), f"m={m}")
 
 
-class StreakSignal(Signal):
+class StreakSignal(SignalBase):
     name = "streak"
     def compute(self, sizes, nums):
         if len(sizes) < 2:
@@ -598,10 +568,10 @@ class StreakSignal(Signal):
             return SignalResult(self.name, 0.5, 0.0, "none")
         d = 1 if last else -1
         p = max(0.05, min(0.95, 0.5 + d * min(0.25, 0.06 * streak)))
-        return SignalResult(self.name, p, min(0.6, 0.12 * streak), f"streak{streak}")
+        return SignalResult(self.name, p, min(0.6, 0.12 * streak), f"streak={streak}")
 
 
-class MeanRevSignal(Signal):
+class MeanRevSignal(SignalBase):
     name = "meanrev"
     def __init__(self, window=20):
         self.window = window
@@ -610,29 +580,10 @@ class MeanRevSignal(Signal):
             return None
         bc = sum(sizes[-self.window:])
         ratio = bc / self.window
-        return SignalResult(self.name, 1 - ratio, min(0.7, abs(ratio - 0.5) * 2), f"{bc}/{self.window}B")
+        return SignalResult(self.name, 1 - ratio, min(0.7, abs(ratio - 0.5) * 2), f"{bc}/{self.window}")
 
 
-class ZScoreWindowSignal(Signal):
-    name = "zwindow"
-    def __init__(self, window=30):
-        self.window = window
-    def compute(self, sizes, nums):
-        if len(sizes) < self.window:
-            return None
-        w = sizes[-self.window:]
-        big = sum(w)
-        exp = self.window * 0.5
-        sd = math.sqrt(self.window * 0.25) or 1e-9
-        z = (big - exp) / sd
-        if abs(z) < 0.5:
-            return SignalResult(self.name, 0.5, 0.0, f"z={z:.2f}")
-        p = big / self.window
-        strength = min(0.55, abs(z) / 4.0)
-        return SignalResult(self.name, p, strength, f"z={z:.2f}")
-
-
-class EWMATrendSignal(Signal):
+class EWMASignal(SignalBase):
     name = "ewma"
     def __init__(self, alpha=0.25):
         self.alpha = alpha
@@ -643,125 +594,25 @@ class EWMATrendSignal(Signal):
         for x in sizes[1:]:
             ew = self.alpha * x + (1 - self.alpha) * ew
         p = max(0.05, min(0.95, ew))
-        strength = min(0.45, abs(ew - 0.5) * 1.8)
-        return SignalResult(self.name, p, strength, f"ew={ew:.3f}")
+        return SignalResult(self.name, p, min(0.45, abs(ew - 0.5) * 1.8), f"ew={ew:.2f}")
 
 
-class FreqSignal(Signal):
+class FrequencySignal(SignalBase):
     name = "freq"
     def __init__(self, window=50):
         self.window = window
     def compute(self, sizes, nums):
         if len(sizes) < self.window:
             return None
-        ratio = sum(sizes[-self.window:]) / self.window
-        p = 0.5 + max(-0.15, min(0.15, (0.5 - ratio) * 0.5))
-        return SignalResult(self.name, p, min(0.4, abs(ratio - 0.5)), f"{ratio:.2f}")
-
-
-class EntropySignal(Signal):
-    name = "entropy"
-    def __init__(self, window=20):
-        self.window = window
-    def compute(self, sizes, nums):
-        if len(sizes) < self.window:
-            return None
-        w = sizes[-self.window:]
-        p1 = sum(w) / len(w)
-        p0 = 1 - p1
-        ent = 0.0
-        for p in (p0, p1):
-            if p > 0:
-                ent -= p * math.log2(p)
-        major = 1 if p1 >= 0.5 else 0
-        strength = max(0.0, 1.0 - ent)
-        return SignalResult(self.name, 1.0 if major else 0.0, min(0.4, strength), f"H={ent:.2f}")
-
-
-class AutocorrSignal(Signal):
-    name = "autocorr"
-    def __init__(self, lag=1):
-        self.lag = lag
-    def compute(self, sizes, nums):
-        if len(sizes) < 30:
-            return None
-        x = sizes[-40:]
-        n = len(x) - self.lag
-        if n < 10:
-            return None
-        mean = sum(x) / len(x)
-        num = sum((x[i] - mean) * (x[i + self.lag] - mean) for i in range(n))
-        den = sum((v - mean) ** 2 for v in x) or 1e-9
-        r = num / den
-        last = sizes[-1]
-        p = 0.5 + r * (0.3 if last else -0.3)
-        return SignalResult(self.name, max(0.05, min(0.95, p)), min(0.4, abs(r)), f"r={r:+.2f}")
-
-
-class AlternationSignal(Signal):
-    name = "alternation"
-    def __init__(self, window=20):
-        self.window = window
-    def compute(self, sizes, nums):
-        if len(sizes) < self.window:
-            return None
-        w = sizes[-self.window:]
-        switches = sum(1 for i in range(1, len(w)) if w[i] != w[i-1])
-        sw = switches / (len(w) - 1)
-        last = sizes[-1]
-        p = (1 - last) * sw + last * (1 - sw)
-        return SignalResult(self.name, p, abs(sw - 0.5), f"sw={sw:.2f}")
-
-
-class MomentumSignal(Signal):
-    name = "momentum"
-    def __init__(self, window=10):
-        self.window = window
-    def compute(self, sizes, nums):
-        if len(sizes) < self.window:
-            return None
         r = sum(sizes[-self.window:]) / self.window
-        return SignalResult(self.name, r, min(0.3, abs(r - 0.5)), f"{r:.2f}")
+        p = 0.5 + max(-0.15, min(0.15, (0.5 - r) * 0.5))
+        return SignalResult(self.name, p, min(0.4, abs(r - 0.5)), f"r={r:.2f}")
 
 
-class RunHazardSignal(Signal):
-    name = "runhaz"
-    def compute(self, sizes, nums):
-        if len(sizes) < 40:
-            return None
-
-        runs = []
-        cur = 1
-        for i in range(1, len(sizes)):
-            if sizes[i] == sizes[i-1]:
-                cur += 1
-            else:
-                runs.append((sizes[i-1], cur))
-                cur = 1
-        runs.append((sizes[-1], cur))
-
-        last_val, last_run = runs[-1]
-        same_type_runs = [ln for val, ln in runs[:-1] if val == last_val]
-        if len(same_type_runs) < 3:
-            return None
-
-        avg = sum(same_type_runs) / len(same_type_runs)
-        over = last_run - avg
-
-        if over > 0:
-            p = 0.15 if last_val else 0.85
-            strength = min(0.5, over / max(avg, 1) * 0.35)
-        else:
-            p = 0.75 if last_val else 0.25
-            strength = 0.18
-
-        return SignalResult(self.name, p, strength, f"run={last_run},avg={avg:.2f}")
-
-
-class RunLengthSignal(Signal):
+class RunLengthSignal(SignalBase):
     name = "runlength"
     def compute(self, sizes, nums):
-        if len(sizes) < 30:
+        if len(sizes) < 20:
             return None
         runs = []
         cur = 1
@@ -772,7 +623,7 @@ class RunLengthSignal(Signal):
                 runs.append(cur)
                 cur = 1
         runs.append(cur)
-        avg = sum(runs) / len(runs) if runs else 1
+        avg = sum(runs) / len(runs)
         last = sizes[-1]
         if runs[-1] > avg:
             p = 0.0 if last else 1.0
@@ -780,30 +631,28 @@ class RunLengthSignal(Signal):
         else:
             p = 1.0 if last else 0.0
             strength = 0.15
-        return SignalResult(self.name, p, strength, f"run{runs[-1]}/avg{avg:.1f}")
+        return SignalResult(self.name, p, strength, f"{runs[-1]}/{avg:.1f}")
 
 
-class SelfCorrectionSignal(Signal):
+class SelfCorrectionSignal(SignalBase):
     name = "selfcorrect"
-    def __init__(self, store):
+    def __init__(self, store: Storage):
         self.store = store
+
     def compute(self, sizes, nums):
         rows = self.store.recent(6)
         if len(rows) < 3:
             return None
         wrong_streak = 0
         for r in rows:
-            status = r[5]
-            if status == "LOSS":
+            if r[5] == "LOSS":
                 wrong_streak += 1
             else:
                 break
         if wrong_streak < 2:
             return SignalResult(self.name, 0.5, 0.0, "ok")
         last_pred_big = 1 if size_label(rows[0][1]) == "BIG" else 0
-        p = 1 - last_pred_big
-        strength = min(0.5, 0.12 * wrong_streak)
-        return SignalResult(self.name, p, strength, f"wrong{wrong_streak}")
+        return SignalResult(self.name, 1 - last_pred_big, min(0.5, 0.12 * wrong_streak), f"loss={wrong_streak}")
 
 
 # ============================================================
@@ -816,24 +665,19 @@ class Predictor:
         self.cfg = cfg
         self.history = []
         self.last_fetch_meta = {}
+
         self.signals = [
-            RecencyPatternSignal(),
             PatternSignal(),
             WeightedMarkovSignal(2, 0.96),
             WeightedMarkovSignal(3, 0.97),
             StreakSignal(),
             MeanRevSignal(20),
-            ZScoreWindowSignal(30),
-            EWMATrendSignal(0.25),
-            FreqSignal(50),
-            EntropySignal(20),
-            AutocorrSignal(1),
-            AlternationSignal(20),
-            MomentumSignal(10),
-            RunHazardSignal(),
+            EWMASignal(0.25),
+            FrequencySignal(50),
             RunLengthSignal(),
-            SelfCorrectionSignal(self.store),
+            SelfCorrectionSignal(store),
         ]
+
         self.acc_weights = self._acc_weights()
         persisted = self.store.load_signal_weights()
         if persisted:
@@ -891,7 +735,7 @@ class Predictor:
         STATE.recalibration_runs += 1
         return self.acc_weights
 
-    async def fetch(self, session):
+    async def fetch(self, session: aiohttp.ClientSession):
         try:
             async with session.get(
                 self.cfg.api_url,
@@ -908,7 +752,7 @@ class Predictor:
                     txt = await r.text()
                     STATE.fetch_fail += 1
                     STATE.last_error = "invalid json"
-                    log.warning("invalid json: %s", txt[:250])
+                    log.warning("invalid json: %s", txt[:300])
                     return False
 
                 raw = data.get("data", {}).get("list", [])
@@ -923,7 +767,7 @@ class Predictor:
                             "num": n,
                             "size": 1 if n >= 5 else 0
                         })
-                    except (KeyError, TypeError, ValueError):
+                    except Exception:
                         continue
 
                 if not out:
@@ -949,6 +793,7 @@ class Predictor:
         except Exception as e:
             STATE.fetch_fail += 1
             STATE.last_error = f"fetch exception: {e}"
+            log.exception("fetch exception: %s", e)
             return False
 
     def _core(self, sizes, nums):
@@ -960,8 +805,8 @@ class Predictor:
             try:
                 r = sig.compute(sizes, nums)
             except Exception as e:
-                log.debug("signal %s failed: %s", getattr(sig, "name", "?"), e)
-                r = None
+                log.debug("signal failed %s: %s", getattr(sig, "name", "?"), e)
+                continue
             if r and r.strength > 0:
                 results[r.name] = r
 
@@ -979,7 +824,7 @@ class Predictor:
             weighted_sum += r.p_big * w
             total_weight += w
             raw_votes[name] = round(r.p_big, 3)
-            ranked.append((name, r, w, acc_w))
+            ranked.append((name, r, w))
 
         p_big = weighted_sum / total_weight if total_weight else 0.5
         pred_size = 1 if p_big >= 0.5 else 0
@@ -990,7 +835,7 @@ class Predictor:
 
         agreement = 0.0
         if top_ranked:
-            same_side = sum(1 for _, r, _, _ in top_ranked if (1 if r.p_big >= 0.5 else 0) == pred_size)
+            same_side = sum(1 for _, r, _ in top_ranked if (1 if r.p_big >= 0.5 else 0) == pred_size)
             agreement = same_side / len(top_ranked)
 
         big_pred, small_pred = self.store.recent_pred_bias(20)
@@ -1013,6 +858,7 @@ class Predictor:
                 edge *= 1.05
 
         confidence = self.cfg.min_confidence_floor + round(edge * 50 + agreement * 10)
+
         if rolling_rate is not None:
             if rolling_rate < 0.50:
                 confidence -= 4
@@ -1021,8 +867,8 @@ class Predictor:
 
         confidence = max(self.cfg.min_confidence_floor, min(self.cfg.max_confidence_cap, confidence))
 
-        logic = " + ".join([x[0] for x in top_ranked[:4]])
-        details = "hidden"
+        logic = " + ".join(name for name, _, _ in top_ranked[:4])
+
         return {
             "p_big": p_big,
             "pred_size": pred_size,
@@ -1030,7 +876,7 @@ class Predictor:
             "tier": confidence_tier(confidence),
             "signals": raw_votes,
             "logic": logic,
-            "details": details,
+            "details": "hidden",
         }
 
     def _number_scores(self, nums, pool):
@@ -1039,7 +885,7 @@ class Predictor:
 
         trans = defaultdict(Counter)
         for i in range(len(nums) - 1):
-            trans[nums[i]][nums[i + 1]] += 1
+            trans[nums[i]][nums[i+1]] += 1
 
         last_num = nums[-1]
         row = trans[last_num]
@@ -1051,7 +897,7 @@ class Predictor:
         gaps = {}
         for n in pool:
             gaps[n] = len(nums)
-            for i in range(len(nums) - 1, -1, -1):
+            for i in range(len(nums)-1, -1, -1):
                 if nums[i] == n:
                     gaps[n] = len(nums) - i
                     break
@@ -1062,19 +908,9 @@ class Predictor:
             p_freq = (freq.get(n, 0) + 0.5) / (freq_total + 5.0)
             gap_norm = min(1.0, gaps[n] / 20.0)
             anti_hot = 1.0 - min(1.0, p_freq * 10)
-            parity_bonus = 0.02 if (nums[-1] % 2 != n % 2) else 0.0
-
-            score = (
-                0.38 * p_trans * 10 +
-                0.16 * p_freq * 10 +
-                0.22 * gap_norm +
-                0.09 * anti_hot +
-                parity_bonus
-            )
-
+            score = 0.42 * p_trans * 10 + 0.18 * p_freq * 10 + 0.24 * gap_norm + 0.10 * anti_hot
             if n in self.recent_pred_nums:
                 score *= 0.45
-
             scores[n] = score
         return scores
 
@@ -1089,6 +925,7 @@ class Predictor:
         r = random.random() * total
         cum = 0.0
         chosen = max(scores, key=scores.get)
+
         for n in sorted(exp_s):
             cum += exp_s[n]
             if r < cum:
@@ -1113,8 +950,8 @@ class Predictor:
         if not self.history:
             return None
 
-        sizes = [h["size"] for h in self.history]
-        nums = [h["num"] for h in self.history]
+        sizes = [x["size"] for x in self.history]
+        nums = [x["num"] for x in self.history]
         core = self._core(sizes, nums)
         if not core:
             return None
@@ -1122,6 +959,7 @@ class Predictor:
         best_num, top = self._pick_number(nums, core["pred_size"])
         self.recent_pred_nums.append(best_num)
         calibrated = self._calibrate(core["confidence"])
+
         STATE.last_predict_at = time.time()
 
         return {
@@ -1142,16 +980,12 @@ class Predictor:
         min_history = min_history or self.cfg.backtest_min_history
         sizes = [h["size"] for h in self.history]
         nums = [h["num"] for h in self.history]
+
         if len(sizes) < min_history + 20:
             return None
 
-        size_hits = size_tot = 0
-        high_hits = high_tot = 0
-        mid_hits = mid_tot = 0
-        low_hits = low_tot = 0
-        num_hits_cond = num_tot_cond = 0
-        sig_hits, sig_tot = defaultdict(int), defaultdict(int)
-        calib = defaultdict(lambda: [0, 0])
+        size_hits = 0
+        size_tot = 0
         skipped = 0
 
         for i in range(min_history, len(sizes)):
@@ -1159,40 +993,10 @@ class Predictor:
             if not core:
                 skipped += 1
                 continue
-
             actual = sizes[i]
-            ok_size = core["pred_size"] == actual
-            size_hits += ok_size
+            ok = core["pred_size"] == actual
+            size_hits += 1 if ok else 0
             size_tot += 1
-
-            tier = core["tier"]
-            if tier == "HIGH":
-                high_tot += 1
-                high_hits += ok_size
-            elif tier == "MID":
-                mid_tot += 1
-                mid_hits += ok_size
-            else:
-                low_tot += 1
-                low_hits += ok_size
-
-            pool = list(range(5, 10)) if core["pred_size"] else list(range(0, 5))
-            scores = self._number_scores(nums[:i], pool)
-            pred_num = max(scores, key=scores.get)
-
-            if ok_size:
-                num_tot_cond += 1
-                if pred_num == nums[i]:
-                    num_hits_cond += 1
-
-            for name, p in core["signals"].items():
-                sig_tot[name] += 1
-                if (1 if p >= 0.5 else 0) == actual:
-                    sig_hits[name] += 1
-
-            b = (core["confidence"] // 10) * 10
-            calib[b][1] += 1
-            calib[b][0] += ok_size
 
         tail = sizes[min_history:]
         big_base = max(sum(tail), len(tail) - sum(tail)) / max(1, len(tail))
@@ -1207,20 +1011,9 @@ class Predictor:
             "big_baseline": big_base,
             "z": z,
             "p": pval,
-            "num_cond_hits": num_hits_cond,
-            "num_cond_total": num_tot_cond,
-            "num_cond_acc": (num_hits_cond / num_tot_cond) if num_tot_cond else 0,
-            "signal_acc": {k: (sig_hits[k], sig_tot[k]) for k in sig_tot},
-            "calib": {k: tuple(v) for k, v in sorted(calib.items())},
-            "tier_acc": {
-                "HIGH": (high_hits, high_tot, (high_hits / high_tot if high_tot else 0)),
-                "MID": (mid_hits, mid_tot, (mid_hits / mid_tot if mid_tot else 0)),
-                "LOW": (low_hits, low_tot, (low_hits / low_tot if low_tot else 0)),
-            }
         }
 
 
-STORE = Storage(CFG.db_path)
 PREDICTOR = Predictor(STORE, CFG)
 
 
@@ -1228,7 +1021,7 @@ PREDICTOR = Predictor(STORE, CFG)
 # TELEGRAM HELPERS
 # ============================================================
 
-def is_admin(update: Update) -> bool:
+def is_admin(update: Update):
     admins = CFG.admin_ids()
     if not admins:
         return True
@@ -1243,6 +1036,13 @@ def admin_only(fn):
             return
         return await fn(update, context)
     return wrapper
+
+
+async def reply(update: Update, text: str, **kwargs):
+    if update.message:
+        await update.message.reply_text(text, **kwargs)
+    elif update.effective_chat:
+        await update.get_bot().send_message(chat_id=update.effective_chat.id, text=text, **kwargs)
 
 
 class SendLimiter:
@@ -1263,18 +1063,15 @@ class SendLimiter:
 SEND_LIMITER = SendLimiter(CFG.send_cooldown)
 
 
-async def reply(update: Update, text: str, **kwargs):
-    if update.message:
-        await update.message.reply_text(text, **kwargs)
-    elif update.effective_chat:
-        await update.get_bot().send_message(chat_id=update.effective_chat.id, text=text, **kwargs)
-
-
-async def safe_send(app, text):
+async def safe_send(app: Application, text: str):
     for attempt in range(3):
         try:
             await SEND_LIMITER.wait_turn()
-            await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
+            await app.bot.send_message(
+                chat_id=CFG.parse_chat_id(),
+                text=text,
+                parse_mode="HTML"
+            )
             STATE.send_ok += 1
             STATE.sent_messages += 1
             return True
@@ -1285,19 +1082,20 @@ async def safe_send(app, text):
     return False
 
 
-def fmt_prediction(p):
+def fmt_prediction(p: dict):
     rows = STORE.recent(CFG.max_recent_lines)
     rows = rows[::-1]
     recent = "".join(
         f"➜ <code>{h(r[0][-4:])}</code> {h(size_label(r[4]))} {h(r[3])} → {h(status_emoji(r[5]))}\n"
         for r in rows
     )
-    top_str = " ".join(str(n) for n in p.get("top", [p["num"]]))
+
+    candidates = " ".join(str(n) for n in p.get("top", [p["num"]]))
 
     return (
         f"📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>\n"
         f"🎯 <b>Size</b>: <b>{h(p['size'])}</b> | 🔢 <b>Target</b>: <code>{h(p['num'])}</code>\n"
-        f"🎲 <b>Candidates</b>: {h(top_str)}\n"
+        f"🎲 <b>Candidates</b>: {h(candidates)}\n"
         f"📈 <b>Confidence</b>: {h(p['confidence'])}% <i>(cal: {h(p['calibrated'])}%)</i>\n"
         f"🏷 <b>Tier</b>: <b>{h(p['tier'])}</b>\n"
         f"━━━━━━━━━━━━━\n"
@@ -1316,7 +1114,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await reply(
         u,
         f"🧬 <b>{h(CFG.bot_name)}</b> online\n"
-        f"Commands: /stats /history /signals /weights /backtest /health /predict /last /status /config /stop /resume /export /recalibrate\n",
+        f"/stats /history /signals /weights /backtest /health /predict /last /status /config /stop /resume /export /recalibrate",
         parse_mode="HTML",
     )
 
@@ -1327,6 +1125,7 @@ async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not s:
         await reply(u, "📊 Koi resolved prediction nahi abhi.")
         return
+
     pending, resolved = STORE.counts()
     jack_rate = 100 * s["jacks"] / s["total"] if s["total"] else 0
     rows = STORE.rolling_outcomes(CFG.rolling_eval_window)
@@ -1338,8 +1137,8 @@ async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Resolved: {resolved} | Pending: {pending}\n"
         f"✅ Win: {s['wins']} | ❌ Loss: {s['loss']}\n"
         f"🏆 JACK: {s['jacks']} ({jack_rate:.1f}%)\n"
-        f"Overall size rate: <b>{s['rate']}%</b>\n"
-        f"Rolling({CFG.rolling_eval_window}) rate: <b>{100*rolling:.1f}%</b>",
+        f"Overall rate: <b>{s['rate']}%</b>\n"
+        f"Rolling({CFG.rolling_eval_window}): <b>{100*rolling:.1f}%</b>",
         parse_mode="HTML",
     )
 
@@ -1384,23 +1183,13 @@ async def cmd_backtest(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     edge = "EDGE ✅" if bt["p"] < 0.05 else "NO EDGE ❌"
-    tier = bt["tier_acc"]
-    sig_lines = [f"{n:<12} {100*h_/t_:5.1f}% ({h_}/{t_})" for n, (h_, t_) in sorted(bt["signal_acc"].items(), key=lambda kv: -kv[1][1])]
-    calib_lines = [f"{b}-{b+9}%: {100*h_/t_:5.1f}% ({t_})" for b, (h_, t_) in bt["calib"].items()]
-
     await reply(
         u,
         f"📉 <b>Backtest</b>\n"
         f"Samples: {bt['total']} | Skipped: {bt['skipped']}\n"
-        f"Size acc: <b>{100*bt['acc']:.1f}%</b>\n"
+        f"Accuracy: <b>{100*bt['acc']:.1f}%</b>\n"
         f"Baseline: {100*bt['big_baseline']:.1f}%\n"
-        f"z={bt['z']:+.2f}, p={bt['p']:.3f} → <b>{edge}</b>\n"
-        f"Conditional num acc: {100*bt['num_cond_acc']:.1f}% ({bt['num_cond_hits']}/{bt['num_cond_total']})\n\n"
-        f"🏷 HIGH: {100*tier['HIGH'][2]:.1f}% ({tier['HIGH'][0]}/{tier['HIGH'][1]})\n"
-        f"🏷 MID: {100*tier['MID'][2]:.1f}% ({tier['MID'][0]}/{tier['MID'][1]})\n"
-        f"🏷 LOW: {100*tier['LOW'][2]:.1f}% ({tier['LOW'][0]}/{tier['LOW'][1]})\n\n"
-        f"🧪 <b>Signals</b>\n<pre>{h(chr(10).join(sig_lines))}</pre>\n"
-        f"🎯 <b>Calibration</b>\n<pre>{h(chr(10).join(calib_lines))}</pre>",
+        f"z={bt['z']:+.2f}, p={bt['p']:.3f} → <b>{edge}</b>",
         parse_mode="HTML",
     )
 
@@ -1469,11 +1258,7 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"<i>{h(conf)}%/{h(calib)}%</i> <b>{h(tier)}</b>"
         )
 
-    await reply(
-        u,
-        "⏳ <b>Pending</b>\n" + "\n".join(lines),
-        parse_mode="HTML",
-    )
+    await reply(u, "⏳ <b>Pending</b>\n" + "\n".join(lines), parse_mode="HTML")
 
 
 @admin_only
@@ -1512,25 +1297,22 @@ async def cmd_export(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ts = int(time.time())
     export_path = str(Path(CFG.export_dir) / f"predictions_{ts}.csv")
     await asyncio.to_thread(STORE.export_csv, export_path)
-    await reply(
-        u,
-        f"📦 Exported: <code>{h(export_path)}</code>",
-        parse_mode="HTML",
-    )
+    await reply(u, f"📦 Exported: <code>{h(export_path)}</code>", parse_mode="HTML")
 
 
 @admin_only
 async def cmd_recalibrate(u: Update, c: ContextTypes.DEFAULT_TYPE):
     PREDICTOR.refresh_weights()
     PREDICTOR.adaptive_reweight()
+    STATE.resolved_since_recalibration = 0
     await reply(u, "♻️ Recalibrated weights.")
 
 
 # ============================================================
-# MAIN WORKER LOOP
+# WORKER LOOP
 # ============================================================
 
-async def worker_loop(app):
+async def worker_loop(app: Application):
     log.info("worker loop started")
     async with aiohttp.ClientSession() as session:
         while True:
@@ -1541,17 +1323,18 @@ async def worker_loop(app):
                 if ok and PREDICTOR.history:
                     hist = {x["issue"]: x for x in PREDICTOR.history}
 
-                    # Resolve pending predictions
                     resolved = STORE.resolve(hist, limit=CFG.resolve_limit)
                     if resolved:
                         STATE.last_resolve_at = time.time()
 
                     for res in resolved:
+                        STATE.resolved_since_recalibration += 1
                         PREDICTOR.refresh_weights()
 
-                        if STATE.recalibration_runs % max(1, CFG.recalibrate_every) == 0:
+                        if STATE.resolved_since_recalibration >= max(1, CFG.recalibrate_every):
                             with contextlib.suppress(Exception):
                                 PREDICTOR.adaptive_reweight()
+                            STATE.resolved_since_recalibration = 0
 
                         if not STATE.paused:
                             await safe_send(
@@ -1560,7 +1343,7 @@ async def worker_loop(app):
                                 f"Period <code>{h(res['issue'][-4:])}</code>\n"
                                 f"Pred {h(res['size'])} {h(res['num'])}\n"
                                 f"Actual {h(res['actual_size'])} {h(res['actual_num'])}\n"
-                                f"{h(status_emoji(res['status']))}",
+                                f"{h(status_emoji(res['status']))}"
                             )
 
                     latest_issue = PREDICTOR.history[-1]["issue"]
@@ -1581,10 +1364,7 @@ async def worker_loop(app):
                                     await safe_send(app, fmt_prediction(p))
                                     log.info("prediction saved/sent for issue %s", p["issue"])
                                 else:
-                                    log.info(
-                                        "prediction saved but not sent due to high_conf_only threshold: issue=%s conf=%s",
-                                        p["issue"], p["calibrated"]
-                                    )
+                                    log.info("prediction saved only for issue %s", p["issue"])
 
                 await asyncio.sleep(CFG.fetch_every)
 
@@ -1597,7 +1377,7 @@ async def worker_loop(app):
 
 
 # ============================================================
-# MAIN APP
+# MAIN
 # ============================================================
 
 async def main():
@@ -1652,7 +1432,6 @@ async def main():
             bg_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await bg_task
-
             await app.updater.stop()
             await app.stop()
 
