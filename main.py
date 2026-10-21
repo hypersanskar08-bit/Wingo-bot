@@ -35,7 +35,7 @@ class Config:
     telegram_token: str = "8611789455:AAFexWc48dhJKgcUK-hkCpRQowbGTm_Bwx0"
     chat_id_raw: str = "1264164655"
     admin_ids_raw: str = "1264164655"
-    source_api_url: str = os.getenv("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000", "").strip()
+    source_api_url: str = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
     
 
     db_path: str = os.getenv("DB_PATH", "monitor.db").strip() or "monitor.db"
