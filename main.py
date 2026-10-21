@@ -5,21 +5,20 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==========================================
-# 1. CONFIGURATION (Naya Token)
+# 1. CONFIGURATION
 # ==========================================
 TELEGRAM_TOKEN = "8611789455:AAEQb9B7N565qGDp--AR6Z1v_4lhzUIu-PQ" 
 CHAT_ID = "1264164655"
 API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
 
 # ==========================================
-# 2. V61 ADAPTIVE AI ENGINE
+# 2. V62 HYPER-TREND PRO ENGINE
 # ==========================================
-class AdaptivePredictor:
+class HyperTrendPredictor:
     def __init__(self):
         self.history = []
         self.logs = []
         self.loss_streak = 0
-        self.mistake_book = defaultdict(lambda: [0, 0]) # pattern -> [wins, losses]
 
     async def fetch_data(self):
         try:
@@ -41,67 +40,80 @@ class AdaptivePredictor:
             print(f"Fetch Error: {e}")
             return False
 
-    def get_trend_pred(self, sizes, idx):
-        last = sizes[idx]
-        stk = 1
-        for j in range(idx-1, -1, -1):
-            if sizes[j] == last: stk += 1
-            else: break
-        if stk >= 3: return last # Ride trend
-        else: return 1 - last # Break small streaks
-
-    def get_ngram_pred(self, sizes, idx):
-        if idx < 5: return None
-        win = sizes[idx-4:idx+1]
-        ng_b, ng_s = 0, 0
-        for j in range(idx-4):
-            if sizes[j:j+5] == win:
-                nxt = sizes[j+5]
-                if nxt == 1: ng_b += 1
-                else: ng_s += 1
-        if ng_b + ng_s >= 2:
-            return 1 if ng_b > ng_s else 0
-        return None
-
     def predict(self):
         if len(self.history) < 100:
             return None
 
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
+        last_size = sizes[-1]
+        last_num = nums[-1]
         
-        # --- 1. ADAPTIVE BACKTEST (Pichle 50 results par engines ko test karo) ---
-        trend_correct, ng_correct, valid_checks = 0, 0, 0
-        for i in range(len(sizes) - 50, len(sizes)):
-            if i < 10: continue
-            actual = sizes[i]
-            
-            if self.get_trend_pred(sizes, i-1) == actual: trend_correct += 1
-            ng_p = self.get_ngram_pred(sizes, i-1)
-            if ng_p is not None and ng_p == actual: ng_correct += 1
-            valid_checks += 1
-            
-        w_trend = max(0.5, (trend_correct / max(1, valid_checks)) * 4)
-        w_ngram = max(0.5, (ng_correct / max(1, valid_checks)) * 4)
-
-        # --- 2. CURRENT VOTES ---
         big_score, small_score = 0.0, 0.0
         engines_used = 0
+        reason = ""
 
-        # Trend Vote
-        t_pred = self.get_trend_pred(sizes, len(sizes)-1)
-        if t_pred == 1: big_score += w_trend
-        else: small_score += w_trend
-        engines_used += 1
+        # --- ENGINE 1: MOMENTUM / TREND RIDER ---
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == last_size: streak += 1
+            else: break
 
-        # N-Gram Vote
-        ng_pred = self.get_ngram_pred(sizes, len(sizes)-1)
-        if ng_pred is not None:
-            if ng_pred == 1: big_score += w_ngram
-            else: small_score += w_ngram
+        if streak >= 3:
+            # Strong trend: Follow it blindly (No break)
+            if last_size == 1: big_score += 4.0
+            else: small_score += 4.0
             engines_used += 1
+            reason = f"Trend({streak}x)"
+        elif streak == 2:
+            # Check history: when 2 same happened, did it continue or break?
+            cont, brk = 0, 0
+            for i in range(len(sizes)-3):
+                if sizes[i] == sizes[i+1] == last_size:
+                    if sizes[i+2] == last_size: cont += 1
+                    else: brk += 1
+            if cont > brk:
+                if last_size == 1: big_score += 2.0
+                else: small_score += 2.0
+            else:
+                if last_size == 1: small_score += 2.0
+                else: big_score += 2.0
+            engines_used += 1
+            reason = "Trend_Hist"
+        else:
+            # 1 result: Zigzag expected
+            if last_size == 1: small_score += 1.5
+            else: big_score += 1.5
+            reason = "Zigzag"
 
-        # Markov (Order 2) Vote
+        # --- ENGINE 2: NUMBER EXHAUSTION ---
+        # Agar lagatar chhote numbers aa rahe hain (0,1,2), toh BIG ka chance hai
+        last_3_nums = nums[-3:]
+        if all(n <= 3 for n in last_3_nums):
+            big_score += 2.5
+            engines_used += 1
+            reason += " +NumExhaust"
+        elif all(n >= 6 for n in last_3_nums):
+            small_score += 2.5
+            engines_used += 1
+            reason += " +NumExhaust"
+
+        # --- ENGINE 3: N-GRAM (Length 5) ---
+        window_sz = sizes[-5:]
+        ng_big, ng_small = 0, 0
+        for i in range(len(sizes) - 5):
+            if sizes[i:i+5] == window_sz:
+                if i+5 < len(sizes):
+                    if sizes[i+5] == 1: ng_big += 1
+                    else: ng_small += 1
+        
+        if ng_big + ng_small >= 2:
+            if ng_big > ng_small: big_score += 2.0
+            else: small_score += 2.0
+            engines_used += 1
+            reason += " +NGram"
+
+        # --- ENGINE 4: DEEP MARKOV (Order 2) ---
         trans = Counter()
         if len(sizes) > 2:
             w2 = (sizes[-2], sizes[-1])
@@ -113,23 +125,16 @@ class AdaptivePredictor:
             else: small_score += 1.5
             engines_used += 1
 
-        # Mistake Book Check
-        pattern = tuple(sizes[-4:])
-        if pattern in self.mistake_book and self.mistake_book[pattern][1] > self.mistake_book[pattern][0]:
-            # Agar is pattern par pehle loss khaya hai, toh is baar opposite jao
-            if big_score > small_score: small_score += 2.0
-            else: big_score += 2.0
-
-        # Loss Streak Penalty (Agar lagatar 2 loss hain, toh confidence kam karo)
+        # --- FINAL DECISION ---
         pred_size = 1 if big_score >= small_score else 0
         
-        # --- 3. CONFIDENCE CALC ---
+        # Confidence Calc
         total = big_score + small_score
         confidence = int((max(big_score, small_score) / total) * 100) if total > 0 else 50
-        if self.loss_streak >= 2: confidence -= 10
-        confidence = min(85, max(51, confidence))
+        if streak >= 4: confidence += 10 # High confidence on long trends
+        confidence = min(92, max(51, confidence))
 
-        # --- 4. TARGET NUMBER ---
+        # --- TARGET NUMBER (Smart Selection) ---
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         
         last_seen = {i: 1000 for i in range(10)}
@@ -138,12 +143,12 @@ class AdaptivePredictor:
         
         n_trans = Counter()
         for i in range(len(nums)-1):
-            if nums[i] == nums[-1]: n_trans[nums[i+1]] += 1
+            if nums[i] == last_num: n_trans[nums[i+1]] += 1
 
         best_num = pool[0]
         best_score = -999
         for n in pool:
-            score = (last_seen.get(n, 0) * 0.8) + (n_trans.get(n, 0) * 3.0)
+            score = (last_seen.get(n, 0) * 0.8) + (n_trans.get(n, 0) * 4.0)
             if score > best_score:
                 best_score = score
                 best_num = n
@@ -156,6 +161,7 @@ class AdaptivePredictor:
             "num": best_num,
             "confidence": confidence,
             "engines": engines_used,
+            "reason": reason[:15], # Short reason for UI
             "status": "PENDING"
         }
 
@@ -167,13 +173,6 @@ class AdaptivePredictor:
             if log["status"] == "PENDING" and log["issue"] in history_dict:
                 res = history_dict[log["issue"]]
                 size_win = (res["size"] == (1 if log["size"] == "BIG" else 0))
-                
-                # Save to mistake book
-                idx = self.history.index(res)
-                if idx >= 4:
-                    pattern = tuple(x["size"] for x in self.history[idx-4:idx])
-                    if size_win: self.mistake_book[pattern][0] += 1
-                    else: self.mistake_book[pattern][1] += 1
                 
                 if size_win:
                     log["status"] = "JACK 🎰" if res["num"] == log["num"] else "WIN ✅"
@@ -187,7 +186,7 @@ class AdaptivePredictor:
                 new_results.append(log)
         return new_results
 
-engine = AdaptivePredictor()
+engine = HyperTrendPredictor()
 
 def format_message(pred):
     recent_text = ""
@@ -201,20 +200,21 @@ def format_message(pred):
 🎯 **Target No**: `{pred['num']}`
 📊 **Size**: **{pred['size']}**
 
-📈 **Confidence**: {pred['confidence']}% ({pred['engines']} Engines)
+📈 **Confidence**: {pred['confidence']}% 
+🧠 **Logic**: {pred['reason']}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 **Recent Outcomes**:
 {recent_text}
 ━━━━━━━━━━━━━━━━━━
-🧠 *V61 ADAPTIVE AI - Learning from Mistakes*
+🔥 *V62 HYPER-TREND PRO*
 """
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔥 V61 ADAPTIVE AI Active!")
+    await update.message.reply_text("🔥 V62 HYPER-TREND PRO Active!")
 
 async def background_loop(app):
-    print("🚀 V61 Engine Started...")
+    print("🚀 V62 Engine Started...")
     while True:
         try:
             if await engine.fetch_data():
