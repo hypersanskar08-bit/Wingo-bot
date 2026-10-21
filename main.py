@@ -27,19 +27,12 @@ except ImportError:
     pass
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 @dataclass
 class Config:
     telegram_token: str = os.getenv("8611789455:AAEQb9B7N565qGDp--AR6Z1v_4lhzUIu-PQ", "").strip()
-    chat_id_raw: str = os.getenv("1264164655", "").strip()
-    admin_ids_raw: str = os.getenv("1264164655", "").strip()
-    api_url: str = os.getenv(
-        "API_URL",
-        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
-    ).strip()
+    chat_id_raw: str = "1264164655"
+    admin_ids_raw: str = "1264164655"
+    api_url: str = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
 
     db_path: str = os.getenv("DB_PATH", "predictor.db").strip() or "predictor.db"
     export_dir: str = os.getenv("EXPORT_DIR", "exports").strip() or "exports"
@@ -96,10 +89,6 @@ class Config:
 CFG = Config()
 
 
-# ============================================================
-# LOGGING
-# ============================================================
-
 def setup_logging():
     CFG.ensure_dirs()
 
@@ -126,10 +115,6 @@ def setup_logging():
 setup_logging()
 log = logging.getLogger("v98_fixed")
 
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 STATUS_EMOJI = {"WIN": "✅", "LOSS": "❌", "JACK": "🏆"}
 
@@ -172,10 +157,6 @@ def two_sided_p(z):
     return 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
 
 
-# ============================================================
-# STATE
-# ============================================================
-
 @dataclass
 class RuntimeState:
     started_at: float = field(default_factory=time.time)
@@ -204,10 +185,6 @@ class RuntimeState:
 
 STATE = RuntimeState()
 
-
-# ============================================================
-# STORAGE
-# ============================================================
 
 class Storage:
     def __init__(self, path: str):
@@ -484,9 +461,7 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 
-# ============================================================
-# SIGNALS
-# ============================================================
+from dataclasses import dataclass
 
 @dataclass
 class SignalResult:
@@ -655,10 +630,6 @@ class SelfCorrectionSignal(SignalBase):
         return SignalResult(self.name, 1 - last_pred_big, min(0.5, 0.12 * wrong_streak), f"loss={wrong_streak}")
 
 
-# ============================================================
-# PREDICTOR
-# ============================================================
-
 class Predictor:
     def __init__(self, store: Storage, cfg: Config):
         self.store = store
@@ -804,8 +775,7 @@ class Predictor:
         for sig in self.signals:
             try:
                 r = sig.compute(sizes, nums)
-            except Exception as e:
-                log.debug("signal failed %s: %s", getattr(sig, "name", "?"), e)
+            except Exception:
                 continue
             if r and r.strength > 0:
                 results[r.name] = r
@@ -866,7 +836,6 @@ class Predictor:
                 confidence += 3
 
         confidence = max(self.cfg.min_confidence_floor, min(self.cfg.max_confidence_cap, confidence))
-
         logic = " + ".join(name for name, _, _ in top_ranked[:4])
 
         return {
@@ -1017,10 +986,6 @@ class Predictor:
 PREDICTOR = Predictor(STORE, CFG)
 
 
-# ============================================================
-# TELEGRAM HELPERS
-# ============================================================
-
 def is_admin(update: Update):
     admins = CFG.admin_ids()
     if not admins:
@@ -1104,10 +1069,6 @@ def fmt_prediction(p: dict):
         f"🧬 <i>{h(CFG.bot_name)}</i>"
     )
 
-
-# ============================================================
-# COMMANDS
-# ============================================================
 
 @admin_only
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1308,10 +1269,6 @@ async def cmd_recalibrate(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await reply(u, "♻️ Recalibrated weights.")
 
 
-# ============================================================
-# WORKER LOOP
-# ============================================================
-
 async def worker_loop(app: Application):
     log.info("worker loop started")
     async with aiohttp.ClientSession() as session:
@@ -1376,10 +1333,6 @@ async def worker_loop(app: Application):
                 await asyncio.sleep(3)
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 async def main():
     CFG.validate()
 
@@ -1438,6 +1391,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
