@@ -12,9 +12,9 @@ CHAT_ID = "1264164655"
 API_URL = "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
 
 # ==========================================
-# 2. V63 QUANTUM DEEP CORE
+# 2. V65 PATTERN HUNTER ENGINE
 # ==========================================
-class QuantumDeepPredictor:
+class PatternHunterPredictor:
     def __init__(self):
         self.history = []
         self.logs = []
@@ -40,115 +40,100 @@ class QuantumDeepPredictor:
             pass
         return False
 
-    def detect_regime(self, sizes):
-        """Detect if market is TRENDING or ZIGZAGING"""
-        if len(sizes) < 20: return "MIXED"
-        last_20 = sizes[-20:]
-        alternations = sum(1 for i in range(1, len(last_20)) if last_20[i] != last_20[i-1])
-        
-        if alternations >= 13: return "ZIGZAG"
-        elif alternations <= 7: return "TREND"
-        else: return "MIXED"
-
     def predict(self):
-        if len(self.history) < 100:
+        if len(self.history) < 50:
             return None
 
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
-        last_size = sizes[-1]
-        last_num = nums[-1]
         
-        regime = self.detect_regime(sizes)
-        big_score, small_score = 0.0, 0.0
+        big_votes, small_votes = 0.0, 0.0
         logic_used = []
 
-        # --- ENGINE 1: REGIME BASED PREDICTION ---
-        if regime == "TREND":
-            # Follow the last result
-            if last_size == 1: big_score += 3.0
-            else: small_score += 3.0
-            logic_used.append("TrendRide")
-        elif regime == "ZIGZAG":
-            # Flip the last result
-            if last_size == 1: small_score += 3.0
-            else: big_score += 3.0
-            logic_used.append("Zigzag")
-        else:
-            # Mixed: check short streak
-            streak = 1
-            for i in range(len(sizes)-2, -1, -1):
-                if sizes[i] == last_size: streak += 1
-                else: break
-            if streak >= 2:
-                if last_size == 1: big_score += 1.5
-                else: small_score += 1.5
-            else:
-                if last_size == 1: small_score += 1.5
-                else: big_score += 1.5
-            logic_used.append("ShortTrend")
+        # --- ENGINE 1: DEEP SIZE PATTERN MATCHING (N-Gram) ---
+        # 7 se 3 length tak ke patterns dhoondho
+        for k in range(7, 2, -1):
+            if len(sizes) < k + 1: continue
+            pattern = tuple(sizes[-k:])
+            
+            big_follow, small_follow = 0, 0
+            # Pichle 1000 results me exact pattern search karo
+            for i in range(len(sizes) - k):
+                if tuple(sizes[i:i+k]) == pattern:
+                    if sizes[i+k] == 1: big_follow += 1
+                    else: small_follow += 1
+                    
+            total = big_follow + small_follow
+            if total >= 2: # Kam se kam 2 baar repeat hona chahiye
+                weight = k * 1.5  # Lamba pattern = zyada weight
+                big_votes += big_follow * weight
+                small_votes += small_follow * weight
+                logic_used.append(f"Pat-{k}({big_follow}B/{small_follow}S)")
+                break # Longest match milte hi ruk jao
+                
+        # --- ENGINE 2: TREND SEQUENCE ---
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == sizes[-1]: streak += 1
+            else: break
+            
+        if streak >= 3:
+            if sizes[-1] == 1: big_votes += streak * 1.5
+            else: small_votes += streak * 1.5
+            logic_used.append(f"Trend{streak}x")
 
-        # --- ENGINE 2: ORDER-3 MARKOV CHAIN ---
-        if len(sizes) > 3:
-            state = (sizes[-3], sizes[-2], sizes[-1])
+        # --- ENGINE 3: ORDER-2 MARKOV CHAIN ---
+        if len(sizes) > 2:
+            w2 = (sizes[-2], sizes[-1])
             trans = Counter()
-            for i in range(len(sizes)-3):
-                if (sizes[i], sizes[i+1], sizes[i+2]) == state:
-                    trans[sizes[i+3]] += 1
+            for i in range(len(sizes)-2):
+                if (sizes[i], sizes[i+1]) == w2: trans[sizes[i+2]] += 1
             if trans:
                 mc_res = trans.most_common(1)[0][0]
-                if mc_res == 1: big_score += 2.0
-                else: small_score += 2.0
-                logic_used.append("Markov-3")
+                if mc_res == 1: big_votes += 2.0
+                else: small_votes += 2.0
+                logic_used.append("Markov")
 
-        # --- ENGINE 3: N-GRAM (Length 6) ---
-        if len(sizes) > 6:
-            window = sizes[-6:]
-            ng_b, ng_s = 0, 0
-            for i in range(len(sizes) - 6):
-                if sizes[i:i+6] == window:
-                    if i+6 < len(sizes):
-                        if sizes[i+6] == 1: ng_b += 1
-                        else: ng_s += 1
-            if ng_b + ng_s >= 2:
-                if ng_b > ng_s: big_score += 2.5
-                else: small_score += 2.5
-                logic_used.append("NGram-6")
-
-        # --- FINAL DECISION (Fallback Guarantee) ---
-        # Agar sab kuch tie ho jaye, toh last result ka opposite le lo
-        if big_score == small_score:
-            if last_size == 1: small_score += 1.0
-            else: big_score += 1.0
+        # --- FINAL SIZE DECISION ---
+        if big_votes == small_votes:
+            pred_size = sizes[-1]
+        else:
+            pred_size = 1 if big_votes > small_votes else 0
             
-        pred_size = 1 if big_score >= small_score else 0
-        
-        total = big_score + small_score
-        confidence = int((max(big_score, small_score) / total) * 100) if total > 0 else 55
-        confidence = min(88, max(51, confidence))
+        total_votes = big_votes + small_votes
+        confidence = int((max(big_votes, small_votes) / total_votes) * 100) if total_votes > 0 else 50
+        confidence = min(92, max(51, confidence))
 
-        # --- SMART TARGET NUMBER ---
+        # --- DEEP NUMBER PATTERN MATCHING ---
+        num_votes = Counter()
+        # 5 se 2 length tak exact numbers ka sequence dhoondho
+        for k in range(5, 1, -1):
+            if len(nums) < k + 1: continue
+            num_pattern = tuple(nums[-k:])
+            
+            for i in range(len(nums) - k):
+                if tuple(nums[i:i+k]) == num_pattern:
+                    num_votes[nums[i+k]] += k * 2.0
+                    
+        # Sirf wahi numbers consider karo jo predicted size me aate hain
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         
-        # Overdue Gap
+        # Overdue Gap Fallback
         last_seen = {i: 1000 for i in range(10)}
         for i in range(len(nums)-1, -1, -1):
             if last_seen[nums[i]] == 1000: last_seen[nums[i]] = len(nums) - i
-        
-        # Markov for Numbers
-        n_trans = Counter()
-        for i in range(len(nums)-1):
-            if nums[i] == last_num: n_trans[nums[i+1]] += 1
 
         best_num = pool[0]
-        best_score = -999
+        best_score = -1
+        
         for n in pool:
-            # Combine gap and markov
-            score = (last_seen.get(n, 0) * 0.7) + (n_trans.get(n, 0) * 3.5)
+            # Number pattern score + Gap score
+            score = num_votes.get(n, 0) + (last_seen[n] * 0.1)
             if score > best_score:
                 best_score = score
                 best_num = n
-
+                
+        logic_str = " + ".join(logic_used) if logic_used else "Majority"
         next_issue = str(int(self.history[-1]["issue"]) + 1)
 
         return {
@@ -156,8 +141,7 @@ class QuantumDeepPredictor:
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "regime": regime,
-            "logic": "+".join(logic_used),
+            "logic": logic_str,
             "status": "PENDING"
         }
 
@@ -180,12 +164,16 @@ class QuantumDeepPredictor:
                 new_results.append(log)
         return new_results
 
-engine = QuantumDeepPredictor()
+engine = PatternHunterPredictor()
 
+# ==========================================
+# 3. FORMATTING (With 12 Recent Outcomes)
+# ==========================================
 def format_message(pred):
     recent_text = ""
     valid_logs = [l for l in engine.logs if l["status"] != "PENDING"]
     
+    # Show last 12 results (Max 12, Min 5)
     for log in valid_logs[-12:]:
         recent_text += f"➜ `{log['issue'][-4:]}` {log['actual_size']} {log['actual_num']} → **{log['status']}**\n"
 
@@ -196,20 +184,19 @@ def format_message(pred):
 
 📈 **Confidence**: {pred['confidence']}%
 🧠 **Logic**: {pred['logic']}
-⚖️ **Regime**: {pred['regime']}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 **Recent Outcomes**:
 {recent_text}
 ━━━━━━━━━━━━━━━━━━
-⚡ *V63 QUANTUM DEEP CORE*
+🎯 *V65 PATTERN HUNTER (1000 Result Match)*
 """
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔥 V63 QUANTUM DEEP Active!")
+    await update.message.reply_text("🎯 V65 PATTERN HUNTER Active!")
 
 async def background_loop(app):
-    print("🚀 V63 Engine Started...")
+    print("🚀 V65 Pattern Hunter Started...")
     while True:
         try:
             if await engine.fetch_data():
@@ -221,19 +208,18 @@ async def background_loop(app):
                 if engine.history:
                     latest_issue = str(int(engine.history[-1]["issue"]) + 1)
                     
-                    # Bug Fix: Only predict if we haven't predicted for this specific issue yet
                     if engine.last_predicted_issue != latest_issue:
                         pred = engine.predict()
                         if pred:
                             engine.logs.append(pred)
                             if len(engine.logs) > 50: engine.logs.pop(0)
                             
-                            engine.last_predicted_issue = latest_issue # Mark as predicted
+                            engine.last_predicted_issue = latest_issue 
                             
                             await app.bot.send_message(chat_id=CHAT_ID, text=format_message(pred), parse_mode="Markdown")
                             print(f"⚡ Predicted for {pred['issue']}")
 
-            await asyncio.sleep(1) # Fast loop
+            await asyncio.sleep(1)
         except Exception as e:
             print(f"Loop Error: {e}")
             await asyncio.sleep(2)
