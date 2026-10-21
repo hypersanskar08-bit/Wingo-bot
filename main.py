@@ -38,7 +38,7 @@ class Config:
     admin_ids_raw: str = os.getenv("1264164655", "").strip()
     api_url: str = os.getenv(
         "API_URL",
-        "https://example.com/api/history"
+        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000"
     ).strip()
 
     db_path: str = os.getenv("DB_PATH", "predictor.db").strip() or "predictor.db"
