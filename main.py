@@ -7,6 +7,7 @@ import math
 import os
 import signal
 import sqlite3
+import statistics
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -15,15 +16,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
-from aiohttp import web # 🔥 Render Web Server
+from aiohttp import web  # Render Port Fix
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 # =========================
 # CONFIG
@@ -37,9 +32,9 @@ class Config:
     
     db_path: str = "predictor.db"
     log_dir: str = "logs"
-    fetch_every: float = 1.5 # Fast loop
+    fetch_every: float = 1.5
     request_timeout: float = 5
-    bot_name: str = "V100 HYBRID PREDICTOR"
+    bot_name: str = "V101 ULTIMATE HYBRID"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -69,13 +64,16 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("hybrid")
+log = logging.getLogger("v101_hybrid")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
+def safe_mean(xs):
+    return sum(xs) / len(xs) if xs else 0.0
+
 # =========================
-# STORAGE
+# STORAGE (Fixed Duplicate Bug)
 # =========================
 class Storage:
     def __init__(self, path: str):
@@ -83,7 +81,7 @@ class Storage:
         self._init()
 
     def _conn(self):
-        c = sqlite3.connect(self.path, timeout=10)
+        c = sqlite3.connect(self.path, timeout=15)
         c.execute("PRAGMA journal_mode=TRUNCATE")
         return c
 
@@ -101,9 +99,15 @@ class Storage:
                 )
             """)
 
-    def save_prediction(self, issue, size, num):
+    def prediction_exists(self, issue):
         with self._conn() as c:
-            c.execute("INSERT OR REPLACE INTO predictions (issue, size, num, created_at) VALUES (?, ?, ?, ?)", 
+            row = c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
+        return row is not None
+
+    def save_prediction(self, issue, size, num):
+        # INSERT OR IGNORE: Agar pehle se hai toh overwrite mat karo
+        with self._conn() as c:
+            c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, created_at) VALUES (?, ?, ?, ?)", 
                       (issue, size, num, time.time()))
 
     def resolve_pending(self, history_dict):
@@ -115,8 +119,13 @@ class Storage:
             if issue in history_dict:
                 act = history_dict[issue]
                 act_size_str = "BIG" if act['size'] == 1 else "SMALL"
+                
+                # 🔥 WIN/LOSS LOGIC (100% Accurate)
                 win = (p_size == act_size_str)
-                status = ("JACK 🎰" if p_num == act['num'] else "WIN ✅") if win else "LOSS ❌"
+                if win:
+                    status = "JACK 🎰" if p_num == act['num'] else "WIN ✅"
+                else:
+                    status = "LOSS ❌"
                 
                 with self._conn() as c:
                     c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?", 
@@ -126,24 +135,32 @@ class Storage:
 
     def recent_outcomes(self, limit=12):
         with self._conn() as c:
-            return c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            # Order by issue DESC ensures latest results first
+            return c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY issue DESC LIMIT ?", (limit,)).fetchall()
+
+    def get_stats(self):
+        with self._conn() as c:
+            total = c.execute("SELECT COUNT(*) FROM predictions WHERE status!='PENDING'").fetchone()[0]
+            wins = c.execute("SELECT COUNT(*) FROM predictions WHERE status LIKE '%WIN%' OR status LIKE '%JACK%'").fetchone()[0]
+            jacks = c.execute("SELECT COUNT(*) FROM predictions WHERE status LIKE '%JACK%'").fetchone()[0]
+        return {"total": total, "wins": wins, "jacks": jacks, "acc": (wins/total*100) if total > 0 else 0}
 
 STORE = Storage(CFG.db_path)
 
 # =========================
-# PREDICTION ENGINE (Hybrid)
+# V101 ULTIMATE PREDICTION ENGINE
 # =========================
-class HybridPredictor:
+class UltimatePredictor:
     def __init__(self):
         self.history = []
-        self.last_predicted_issue = None
+        self.loss_streak = 0
 
     async def fetch_data(self, session):
         try:
             async with session.get(CFG.source_api_url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
                 if r.status != 200: return False
                 data = await r.json()
-                items = data.get("data", {}).get("list", [])[-300:] # Last 300 only to save memory
+                items = data.get("data", {}).get("list", [])[-300:] 
                 
                 out = []
                 for item in items:
@@ -164,11 +181,10 @@ class HybridPredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        prob_big = 0.5
-        prob_small = 0.5
+        prob_big, prob_small = 0.5, 0.5
         logic = []
 
-        # 1. Pattern Matching (12 to 4)
+        # 1. BAYESIAN PATTERN
         for k in range(12, 3, -1):
             if len(sizes) < k + 1: continue
             pat = tuple(sizes[-k:])
@@ -179,48 +195,64 @@ class HybridPredictor:
                     else: small_f += 1
             t = big_f + small_f
             if t >= (1 if k >= 8 else 2):
-                # Bayesian Smoothing
                 pb = (big_f + 1) / (t + 2)
                 ps = (small_f + 1) / (t + 2)
                 weight = min(0.35, k * 0.03)
                 prob_big += (pb - 0.5) * weight * 2
                 prob_small += (ps - 0.5) * weight * 2
-                logic.append(f"P{k}({big_f}B/{small_f}S)")
+                logic.append(f"P{k}")
                 break
 
-        # 2. Mean Reversion (Balance)
-        last_20 = sizes[-20:]
-        big_count = last_20.count(1)
-        if big_count >= 15:
-            prob_small += 0.15; logic.append("MeanRev(S)")
-        elif big_count <= 5:
-            prob_big += 0.15; logic.append("MeanRev(B)")
+        # 2. ORDER-3 MARKOV
+        if len(sizes) > 3:
+            state = tuple(sizes[-3:])
+            trans = Counter()
+            for i in range(len(sizes)-3):
+                if tuple(sizes[i:i+3]) == state: trans[sizes[i+3]] += 1
+            if trans:
+                total_t = sum(trans.values())
+                pb = (trans.get(1, 0) + 1) / (total_t + 2)
+                prob_big += (pb - 0.5) * 0.3
+                prob_small += ((1-pb) - 0.5) * 0.3
+                logic.append("M3")
 
-        # 3. Live Trend (Streak)
+        # 3. MEAN REVERSION
+        big_count = sizes[-20:].count(1)
+        if big_count >= 15:
+            prob_small += 0.15; logic.append("MR-S")
+        elif big_count <= 5:
+            prob_big += 0.15; logic.append("MR-B")
+
+        # 4. LIVE STREAK
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
             else: break
-        
-        if streak >= 3:
-            if sizes[-1] == 1: prob_big += 0.2; prob_small -= 0.1
-            else: prob_small += 0.2; prob_big -= 0.1
-            logic.append(f"Trend{streak}x")
+        if streak >= 4:
+            if sizes[-1] == 1: prob_big += 0.25
+            else: prob_small += 0.25
+            logic.append(f"S{streak}")
+            
+        # 5. ANTI-LOSS
+        if self.loss_streak >= 2:
+            if sizes[-1] == 1: prob_small += 0.2
+            else: prob_big += 0.2
+            logic.append("ANTI-L")
 
         # Final Probability
         total = prob_big + prob_small
         p_big = prob_big / total
         pred_size = 1 if p_big >= 0.5 else 0
         confidence = int(max(p_big, 1 - p_big) * 100)
+        confidence = min(92, max(52, confidence))
 
-        # Target Number
+        # TARGET NUMBER
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         last_seen = {i: 1000 for i in range(10)}
         for i in range(len(nums)-1, -1, -1):
             if last_seen[nums[i]] == 1000: last_seen[nums[i]] = len(nums) - i
             
         freq = Counter(nums[-50:])
-        
         best_num = pool[0]
         best_score = -1
         for n in pool:
@@ -233,37 +265,52 @@ class HybridPredictor:
             "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
-            "confidence": min(88, max(51, confidence)),
-            "logic": " + ".join(logic[:2]) if logic else "Neutral"
+            "confidence": confidence,
+            "logic": " + ".join(logic)
         }
 
-PREDICTOR = HybridPredictor()
+    def analyze_market(self):
+        if len(self.history) < 50: return "Not enough data."
+        sizes = [x["size"] for x in self.history[-120:]]
+        short = safe_mean(sizes[-12:])
+        long = safe_mean(sizes[-48:])
+        delta = short - long
+        
+        regime = "STABLE 🟢"
+        if abs(delta) >= 0.20: regime = "STRONG SHIFT 🔴"
+        elif abs(delta) >= 0.10: regime = "MODERATE SHIFT 🟡"
+        
+        trend = "UP (BIG)" if delta > 0 else "DOWN (SMALL)" if delta < 0 else "FLAT"
+        
+        return f"📊 <b>Market Analytics</b>\nRegime: {regime}\nTrend: {trend}\nShort Rate: {short*100:.1f}%\nLong Rate: {long*100:.1f}%"
+
+PREDICTOR = UltimatePredictor()
 
 # =========================
-# TELEGRAM FORMATTING
+# FORMATTING & SENDING (HTML Safe)
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(
-        f"➜ `{h(r[0][-4:])}` {h(r[1])} {h(r[2])} → **{h(r[3])}**\n"
+        f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
         for r in recent_rows
     )
     return f"""
-📌 **Period No**: `{p['issue'][-4:]}`
-🎯 **Target No**: `{p['num']}`
-📊 **Size**: **{p['size']}**
+📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
+🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
+📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
-📈 **Confidence**: {p['confidence']}%
-🧠 **Logic**: {p['logic']}
+📈 <b>Confidence</b>: {p['confidence']}%
+🧠 <b>Logic</b>: {h(p['logic'])}
 
 ━━━━━━━━━━━━━━━━━━
-🕒 **Recent Outcomes**:
+🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ *V100 HYBRID PREDICTOR*
+⚡ <i>V101 ULTIMATE HYBRID</i>
 """
 
 async def send_msg(app, text):
     try:
-        await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="Markdown")
+        await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
     except Exception as e:
         log.error(f"Send error: {e}")
 
@@ -271,20 +318,19 @@ async def send_msg(app, text):
 # COMMANDS
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 V100 Hybrid Predictor Active!\nBot will send predictions automatically.")
+    await update.message.reply_text("🤖 V101 Ultimate Hybrid Active!\nPredictions + Analytics.")
 
-async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = STORE.recent_outcomes(12)
-    if not rows: 
-        return await update.message.reply_text("No history yet.")
-    
-    text = "🧾 **Last 12 Outcomes**\n\n"
-    for r in rows[::-1]:
-        text += f"`{r[0][-4:]}` {r[1]} {r[2]} → {r[3]}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = PREDICTOR.analyze_market()
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = STORE.get_stats()
+    text = f"📊 <b>Bot Stats</b>\nTotal: {s['total']}\nWins: {s['wins']}\nJACK: {s['jacks']}\nAccuracy: {s['acc']:.1f}%"
+    await update.message.reply_text(text, parse_mode="HTML")
 
 # =========================
-# WORKER LOOP & SERVER
+# WORKER LOOP
 # =========================
 async def worker_loop(app, session):
     log.info("Worker loop started...")
@@ -293,27 +339,30 @@ async def worker_loop(app, session):
             if await PREDICTOR.fetch_data(session):
                 hist_dict = {x["issue"]: x for x in PREDICTOR.history}
                 
-                # 1. Resolve Pending
+                # 1. Resolve pending
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
-                    text = f"🎯 **Result**\nPeriod: `{res['issue'][-4:]}`\nPred: {res['size']} {res['num']}\nAct: {res['actual_size']} {res['actual_num']}\n**{res['status']}**"
+                    if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
+                    else: PREDICTOR.loss_streak = 0
+                    
+                    text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
 
-                # 2. New Prediction
+                # 2. Generate new prediction
                 latest_issue = PREDICTOR.history[-1]["issue"]
                 next_issue = str(int(latest_issue) + 1)
                 
-                if PREDICTOR.last_predicted_issue != next_issue:
+                # 🔥 Bug Fix: Check if prediction already exists in DB (prevents double send on restart)
+                if not STORE.prediction_exists(next_issue):
                     p = PREDICTOR.generate_prediction()
                     if p:
                         STORE.save_prediction(p['issue'], p['size'], p['num'])
-                        PREDICTOR.last_predicted_issue = next_issue
                         
                         recent = STORE.recent_outcomes(12)
                         await send_msg(app, format_prediction(p, recent))
                         log.info(f"Predicted for {p['issue']}")
             
-            gc.collect() # RAM Cleanup
+            gc.collect() 
             await asyncio.sleep(CFG.fetch_every)
         except asyncio.CancelledError:
             break
@@ -321,24 +370,28 @@ async def worker_loop(app, session):
             log.error(f"Loop error: {e}")
             await asyncio.sleep(2)
 
+# =========================
+# DUMMY WEB SERVER & MAIN
+# =========================
 async def handle_ping(request):
     return web.Response(text="Bot is running perfectly!")
 
 async def main():
     CFG.validate()
     
-    # Dummy Web Server for Render
+    # Web Server Fix
     web_app = web.Application()
     web_app.router.add_get('/', handle_ping)
     runner = web.AppRunner(web_app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info(f"Web server running on port {port}")
+    log.info(f"Dummy web server running on port {port}")
 
     app = Application.builder().token(CFG.telegram_token).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("last", cmd_last))
+    app.add_handler(CommandHandler("analyze", cmd_analyze))
+    app.add_handler(CommandHandler("stats", cmd_stats))
 
     async with app:
         await app.start()
@@ -347,7 +400,7 @@ async def main():
         
         async with aiohttp.ClientSession() as session:
             bg_task = asyncio.create_task(worker_loop(app, session))
-            await asyncio.Event().wait() # Run forever
+            await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
