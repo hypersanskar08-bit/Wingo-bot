@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 1.5
     request_timeout: float = 6
-    bot_name: str = "V105 TRUE DEEP"
+    bot_name: str = "V106 DEEP VENGEANCE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v105")
+log = logging.getLogger("v106_vengeance")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -64,7 +64,7 @@ class Storage:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
-                    status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT, created_at REAL
+                    status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT, logic TEXT, created_at REAL
                 )
             """)
     def _conn(self):
@@ -76,16 +76,16 @@ class Storage:
         with self._conn() as c:
             return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
 
-    def save_prediction(self, issue, size, num):
+    def save_prediction(self, issue, size, num, logic):
         with self._conn() as c:
-            c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, created_at) VALUES (?, ?, ?, ?)", 
-                      (issue, size, num, time.time()))
+            c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, logic, created_at) VALUES (?, ?, ?, ?, ?)", 
+                      (issue, size, num, logic, time.time()))
 
     def resolve_pending(self, history_dict):
         resolved = []
         with self._conn() as c:
-            rows = c.execute("SELECT issue, size, num FROM predictions WHERE status='PENDING'").fetchall()
-        for issue, p_size, p_num in rows:
+            rows = c.execute("SELECT issue, size, num, logic FROM predictions WHERE status='PENDING'").fetchall()
+        for issue, p_size, p_num, logic in rows:
             if issue in history_dict:
                 act = history_dict[issue]
                 act_size_str = "BIG" if act['size'] == 1 else "SMALL"
@@ -94,7 +94,7 @@ class Storage:
                 with self._conn() as c:
                     c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?", 
                               (status, act['num'], act_size_str, issue))
-                resolved.append({"issue": issue, "size": p_size, "num": p_num, "actual_num": act['num'], "actual_size": act_size_str, "status": status})
+                resolved.append({"issue": issue, "size": p_size, "num": p_num, "actual_num": act['num'], "actual_size": act_size_str, "status": status, "logic": logic})
         return resolved
 
     def recent_outcomes(self, limit=12):
@@ -105,11 +105,14 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V105 DEEP MATRIX PREDICTOR
+# V106 VENGEANCE PREDICTOR
 # =========================
-class DeepMatrixPredictor:
+class VengeancePredictor:
     def __init__(self):
         self.history = []
+        self.loss_streak = 0
+        self.is_vengeance_mode = False
+        self.last_lost_logic = ""
 
     async def fetch_data(self, session):
         try:
@@ -117,7 +120,7 @@ class DeepMatrixPredictor:
                 if r.status != 200: return False
                 data = await r.json()
                 items = data.get("data", {}).get("list", [])
-                items.sort(key=lambda x: int(x["issueNumber"])) # Oldest to Newest
+                items.sort(key=lambda x: int(x["issueNumber"]))
                 
                 out = []
                 seen = set()
@@ -134,10 +137,9 @@ class DeepMatrixPredictor:
         except Exception:
             return False
 
-    # --- ENGINE 1: Deep N-Gram Ensemble (4 to 15) ---
-    def engine_ngram(self, sizes):
-        probs = []
-        for k in range(15, 3, -1):
+    # Normal Engines
+    def engine_pattern(self, sizes, k_max=10):
+        for k in range(k_max, 3, -1):
             if len(sizes) < k + 1: continue
             pat = tuple(sizes[-k:])
             big_f, small_f = 0, 0
@@ -146,56 +148,20 @@ class DeepMatrixPredictor:
                     if sizes[i+k] == 1: big_f += 1
                     else: small_f += 1
             t = big_f + small_f
-            if t >= 2: # Need at least 2 historical matches
-                p_big = (big_f + 1) / (t + 2) # Laplace Smoothing
-                probs.append((p_big, k))
-                
-        if not probs: return 0.5, "N-Gram(None)"
-        # Weighted by length: Longer pattern = higher confidence
-        total_w = sum(w for _, w in probs)
-        p = sum(prob * w for prob, w in probs) / total_w
-        return p, f"N-Gram(k={probs[0][1]})"
+            if t >= 2: return ((big_f + 1) / (t + 2)), f"P{k}"
+        return 0.5, "P_None"
 
-    # --- ENGINE 2: Multi-Order Markov (2 to 5) ---
-    def engine_markov(self, sizes):
-        probs = []
-        for o in [2, 3, 4, 5]:
-            if len(sizes) < o + 1: continue
-            state = tuple(sizes[-o:])
-            big_f, small_f = 0, 0
-            for i in range(len(sizes) - o):
-                if tuple(sizes[i:i+o]) == state:
-                    if sizes[i+o] == 1: big_f += 1
-                    else: small_f += 1
-            t = big_f + small_f
-            if t >= 1:
-                p_big = (big_f + 1) / (t + 2)
-                probs.append((p_big, o))
-                
-        if not probs: return 0.5, "Markov(None)"
-        total_w = sum(w for _, w in probs)
-        p = sum(prob * w for prob, w in probs) / total_w
-        return p, f"Markov(2-5)"
-
-    # --- ENGINE 3: SMA Crossover (Trend Shift Detector) ---
-    def engine_trend_shift(self, sizes):
-        if len(sizes) < 20: return 0.5, "SMA(Wait)"
-        sma5 = sum(sizes[-5:]) / 5.0
-        sma20 = sum(sizes[-20:]) / 20.0
-        
-        diff = sma5 - sma20
-        # Detect shift logic
-        if diff > 0.15: return 1.0, "SMA_Bullish"
-        elif diff < -0.15: return 0.0, "SMA_Bearish"
-        return 0.5, "SMA_Flat"
-
-    # --- ENGINE 4: Mean Reversion (Oscillator) ---
-    def engine_mean_reversion(self, sizes):
-        if len(sizes) < 30: return 0.5, "MR(Wait)"
-        big_count = sizes[-30:].count(1)
-        if big_count >= 22: return 0.0, "MR_Overbought" # Expect SMALL
-        elif big_count <= 8: return 1.0, "MR_Oversold"   # Expect BIG
-        return 0.5, "MR_Neutral"
+    def engine_markov(self, sizes, order=3):
+        if len(sizes) < order + 1: return 0.5, "M_None"
+        state = tuple(sizes[-order:])
+        big_f, small_f = 0, 0
+        for i in range(len(sizes) - order):
+            if tuple(sizes[i:i+order]) == state:
+                if sizes[i+order] == 1: big_f += 1
+                else: small_f += 1
+        t = big_f + small_f
+        if t >= 2: return ((big_f + 1) / (t + 2)), f"M{order}"
+        return 0.5, "M_None"
 
     def generate_prediction(self):
         if len(self.history) < 100: return None
@@ -203,59 +169,92 @@ class DeepMatrixPredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        # Run all deep engines
-        p_ngram, l_ngram = self.engine_ngram(sizes)
-        p_markov, l_markov = self.engine_markov(sizes)
-        p_sma, l_sma = self.engine_trend_shift(sizes)
-        p_mr, l_mr = self.engine_mean_reversion(sizes)
-        
-        # Combine Probabilities (Dynamic Weights based on Market Regime)
-        # If SMA says Bull/Bear strongly, give it 40% weight. N-Gram 30%, Markov 20%, MR 10%
-        weights = {"ngram": 0.3, "markov": 0.2, "sma": 0.4, "mr": 0.1}
-        
-        # If Market is choppy (SMA Flat), MR and Markov matter more
-        if p_sma == 0.5:
-            weights = {"ngram": 0.2, "markov": 0.3, "sma": 0.1, "mr": 0.4}
-            
-        final_p_big = (p_ngram * weights["ngram"]) + (p_markov * weights["markov"]) + (p_sma * weights["sma"]) + (p_mr * weights["mr"])
-        
-        pred_size = 1 if final_p_big >= 0.5 else 0
-        confidence = int(abs(final_p_big - 0.5) * 2 * 100) # Convert to 0-100 scale
-        confidence = max(52, min(92, confidence))
-        
-        logic_tags = [l_ngram, l_markov, l_sma, l_mr]
+        p_big, p_small = 0.5, 0.5
+        logic = []
 
         # ==========================================
-        # DEEP NUMBER SELECTION (Target No)
+        # 🚨 VENGEANCE MODE (Activated after 1 LOSS)
+        # ==========================================
+        if self.is_vengeance_mode:
+            logic.append("VENGEANCE")
+            
+            # Agar pichli baar Pattern galat tha, toh Pattern ko veto karo
+            if "P" in self.last_lost_logic:
+                p_big, logic_tag = self.engine_markov(sizes, order=4) # Deep Markov 4
+                logic.append(logic_tag)
+                # Invert pattern completely
+                p_pat, _ = self.engine_pattern(sizes, k_max=15)
+                p_big = 1.0 - p_pat # ULTA
+                
+            # Agar pichli baar Markov galat tha, toh 15-Length N-Gram chalao
+            elif "M" in self.last_lost_logic:
+                p_pat, logic_tag = self.engine_pattern(sizes, k_max=15)
+                logic.append(logic_tag)
+                p_mark, _ = self.engine_markov(sizes, order=3)
+                p_big = 1.0 - p_mark # ULTA
+                
+            # Agar Trend galat tha, toh Mean Reversion maaro
+            elif "Trend" in self.last_lost_logic:
+                big_count = sizes[-20:].count(1)
+                if big_count >= 12: p_big = 0.2 # Expect SMALL
+                else: p_big = 0.8 # Expect BIG
+                logic.append("Reversion")
+            
+            # Default Recovery: Agar kuch samajh na aaye, toh last result ka ulta
+            else:
+                p_big = 0.0 if sizes[-1] == 1 else 1.0
+                logic.append("Flip")
+                
+        # ==========================================
+        # 🧠 NORMAL MODE
+        # ==========================================
+        else:
+            p1, l1 = self.engine_pattern(sizes, k_max=12)
+            p2, l2 = self.engine_markov(sizes, order=3)
+            
+            # Trend Engine
+            streak = 1
+            for i in range(len(sizes)-2, -1, -1):
+                if sizes[i] == sizes[-1]: streak += 1
+                else: break
+            if streak >= 4:
+                p3 = 1.0 if sizes[-1] == 1 else 0.0
+                l3 = f"T{streak}"
+            else:
+                p3 = 0.5; l3 = "T_None"
+                
+            p_big = (p1 * 0.4) + (p2 * 0.4) + (p3 * 0.2)
+            logic = [l1, l2, l3]
+
+        # Final Decision
+        pred_size = 1 if p_big >= 0.5 else 0
+        confidence = int(abs(p_big - 0.5) * 2 * 100)
+        
+        if self.is_vengeance_mode:
+            confidence = min(85, max(60, confidence + 15)) # Recovery me confidence boost
+        else:
+            confidence = min(80, max(52, confidence))
+
+        # ==========================================
+        # DEEP NUMBER SELECTION
         # ==========================================
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
-        
-        # 1. Digit Transition Matrix
         last_num = nums[-1]
+        
         trans = Counter()
         for i in range(len(nums)-1):
             if nums[i] == last_num: trans[nums[i+1]] += 1
             
-        # 2. Gap Analysis (Overdue numbers)
         gaps = {i: 1000 for i in range(10)}
         for i in range(len(nums)-1, -1, -1):
             if gaps[nums[i]] == 1000: gaps[nums[i]] = len(nums) - i
 
-        # 3. Frequency Analysis (Hot numbers in last 50)
-        recent_freq = Counter(nums[-50:])
-
         best_num = pool[0]
         best_score = -1
-        
         for n in pool:
-            # Combine Transition (high weight) + Gap (medium) + Freq (low)
-            t_score = trans.get(n, 0) * 0.5
-            g_score = (gaps[n] / 50.0) * 0.3  # Normalize gap
-            f_score = recent_freq.get(n, 0) * 0.2
-            
-            total_score = t_score + g_score + f_score
-            if total_score > best_score:
-                best_score = total_score
+            score = (trans.get(n, 0) * 0.6) + (gaps[n] * 0.1)
+            if score > best_score:
+                best_score = score
                 best_num = n
 
         return {
@@ -263,10 +262,10 @@ class DeepMatrixPredictor:
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "logic": " + ".join(logic_tags)
+            "logic": " + ".join(logic)
         }
 
-PREDICTOR = DeepMatrixPredictor()
+PREDICTOR = VengeancePredictor()
 
 # =========================
 # FORMATTING & SENDING
@@ -280,18 +279,21 @@ def format_prediction(p, recent_rows):
         status = r[3]
         recent_text += f"➜ <code>{h(issue)}</code> Actual: {h(act_size)} {h(act_num)} → <b>{h(status)}</b>\n"
 
+    mode = "🚨 VENGEANCE" if PREDICTOR.is_vengeance_mode else "🧠 NORMAL"
+
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
 📈 <b>Confidence</b>: {p['confidence']}%
-🧠 <b>Deep Math</b>: {h(p['logic'])}
+🧠 <b>Logic</b>: {h(p['logic'])}
+⚖️ <b>Mode</b>: {mode}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V105 TRUE DEEP MATRIX</i>
+⚡ <i>V106 DEEP VENGEANCE</i>
 """
 
 async def send_msg(app, text):
@@ -301,13 +303,13 @@ async def send_msg(app, text):
         log.error(f"Send error: {e}")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 V105 TRUE DEEP MATRIX Active!\nMulti-Order Markov & N-Gram (4-15) is running.")
+    await update.message.reply_text("🤖 V106 Vengeance Active!\nAfter 1 loss, bot enters Ultra-Deep Recovery Mode.")
 
 # =========================
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V105 Worker loop started...")
+    log.info("V106 Worker loop started...")
     while True:
         try:
             if await PREDICTOR.fetch_data(session):
@@ -315,6 +317,15 @@ async def worker_loop(app, session):
                 
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
+                    if "LOSS" in res['status']:
+                        PREDICTOR.loss_streak += 1
+                        PREDICTOR.is_vengeance_mode = True
+                        PREDICTOR.last_lost_logic = res.get('logic', '')
+                    else:
+                        PREDICTOR.loss_streak = 0
+                        PREDICTOR.is_vengeance_mode = False
+                        PREDICTOR.last_lost_logic = ""
+                    
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
 
@@ -324,10 +335,10 @@ async def worker_loop(app, session):
                 if not STORE.prediction_exists(next_issue):
                     p = PREDICTOR.generate_prediction()
                     if p:
-                        STORE.save_prediction(p['issue'], p['size'], p['num'])
+                        STORE.save_prediction(p['issue'], p['size'], p['num'], p['logic'])
                         recent = STORE.recent_outcomes(12)
                         await send_msg(app, format_prediction(p, recent))
-                        log.info(f"Pred {p['issue']} | Logic: {p['logic']}")
+                        log.info(f"Pred {p['issue']} | Mode: {PREDICTOR.is_vengeance_mode} | {p['logic']}")
             
             gc.collect() 
             await asyncio.sleep(CFG.fetch_every)
@@ -341,7 +352,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V105 is running!")
+    return web.Response(text="V106 is running!")
 
 async def main():
     CFG.validate()
