@@ -11,8 +11,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ============================================================
 # CONFIG — secrets env vars se lo, code mein mat likho
 # ============================================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PASTE_TOKEN_HERE")
-CHAT_ID        = os.getenv("CHAT_ID", "PASTE_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8611789455:AAEQb9B7N565qGDp--AR6Z1v_4lhzUIu-PQ")
+CHAT_ID        = os.getenv("CHAT_ID", "1264164655")
 API_URL        = os.getenv("API_URL", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000")
 
 STATE_FILE  = os.getenv("STATE_FILE", "predictor_state.json")
