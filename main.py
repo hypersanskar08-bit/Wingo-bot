@@ -23,7 +23,7 @@ CHAT_ID        = os.getenv("CHAT_ID", "1264164655")
 API_URL        = os.getenv("API_URL", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000")
 DB_PATH        = os.getenv("DB_PATH", "predictor.db")
 FETCH_EVERY    = float(os.getenv("FETCH_EVERY", "1.5"))
-BOT_NAME       = "V93 DEEP PIPELINE"
+BOT_NAME       = "V94 DEEP PIPELINE"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("predictor")
@@ -46,7 +46,6 @@ def size_label(v):
     return "BIG" if int(v) == 1 else "SMALL"
 
 def two_sided_p(z):
-    """Approximate two-sided p-value for a z-score."""
     return 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
 
 def binomial_z(hits, total, p=0.5):
@@ -120,7 +119,6 @@ class Storage:
                 "jacks": jacks, "rate": round(100 * wins / total, 1)}
 
     def recent(self, n=12):
-        """Returns rows newest-first: (issue,size,num,actual_num,actual_size,status)"""
         with self._conn() as c:
             return c.execute("""SELECT issue,size,num,actual_num,actual_size,status
                                 FROM predictions WHERE status != 'PENDING'
@@ -134,7 +132,6 @@ class Storage:
         return [r[0] for r in rows][::-1]
 
     def signal_accuracy(self):
-        """All-time per-signal accuracy."""
         acc = defaultdict(lambda: [0, 0])
         with self._conn() as c:
             rows = c.execute("""SELECT signals, actual_size FROM predictions
@@ -153,8 +150,6 @@ class Storage:
         return {k: tuple(v) for k, v in acc.items()}
 
     def recent_signal_accuracy(self, limit=60):
-        """Short-window per-signal accuracy (last N resolved predictions)
-           -> reacts fast to regime shifts instead of relying on stale all-time stats."""
         acc = defaultdict(lambda: [0, 0])
         with self._conn() as c:
             rows = c.execute("""SELECT signals, actual_size FROM predictions
@@ -190,9 +185,16 @@ class Storage:
             row = c.execute("SELECT issue FROM predictions ORDER BY created_at DESC LIMIT 1").fetchone()
         return row[0] if row else None
 
+    def recent_pred_bias(self, n=20):
+        with self._conn() as c:
+            rows = c.execute("""SELECT size FROM predictions
+                                ORDER BY created_at DESC LIMIT ?""", (n,)).fetchall()
+        big = sum(1 for r in rows if size_label(r[0]) == "BIG")
+        return big, len(rows) - big
+
 
 # ============================================================
-# SIGNAL FRAMEWORK (12 size engines)
+# SIGNAL FRAMEWORK
 # ============================================================
 @dataclass
 class SignalResult:
@@ -233,8 +235,8 @@ class StreakSignal(Signal):
             else: break
         if streak < 2: return SignalResult(self.name, 0.5, 0.0, "none")
         d = 1 if last else -1
-        p = max(0.05, min(0.95, 0.5 + d * min(0.35, 0.08 * streak)))
-        return SignalResult(self.name, p, min(0.8, 0.15 * streak), f"streak{streak}")
+        p = max(0.05, min(0.95, 0.5 + d * min(0.25, 0.06 * streak)))
+        return SignalResult(self.name, p, min(0.6, 0.12 * streak), f"streak{streak}")
 
 class MeanRevSignal(Signal):
     name = "meanrev"
@@ -332,13 +334,11 @@ class RunLengthSignal(Signal):
         return SignalResult(self.name, p, strength, f"run{runs[-1]}/avg{avg:.1f}")
 
 class SelfCorrectionSignal(Signal):
-    """Watches the bot's own recent LOSS streak and biases away from
-       repeating the same mistake. Needs access to Storage."""
     name = "selfcorrect"
     def __init__(self, store):
         self.store = store
     def compute(self, sizes, nums):
-        rows = self.store.recent(6)  # newest-first
+        rows = self.store.recent(6)
         if len(rows) < 3:
             return None
         wrong_streak = 0
@@ -351,7 +351,7 @@ class SelfCorrectionSignal(Signal):
         if wrong_streak < 2:
             return SignalResult(self.name, 0.5, 0.0, "ok")
         last_pred_big = 1 if size_label(rows[0][1]) == "BIG" else 0
-        p = 1 - last_pred_big  # flip bias away from the losing call
+        p = 1 - last_pred_big
         strength = min(0.5, 0.12 * wrong_streak)
         return SignalResult(self.name, p, strength, f"wrong{wrong_streak}")
 
@@ -373,7 +373,6 @@ class Predictor:
         self.acc_weights = self._acc_weights()
         self.recent_pred_nums = deque(self.store.recent_pred_nums(6), maxlen=6)
 
-    # ---- Blended long-term + recent-form weighting (Laplace smoothed) ----
     def _acc_weights(self):
         long_acc = self.store.signal_accuracy()
         short_acc = self.store.recent_signal_accuracy(60)
@@ -383,10 +382,8 @@ class Predictor:
             hs, ts = short_acc.get(s.name, (0, 0))
             long_rate = (hl + 5) / (tl + 10)
             short_rate = (hs + 3) / (ts + 6)
-            # 60% weight to recent form (adapts fast to regime shifts),
-            # 40% to long-term stability (avoids overreacting to noise)
             blended = 0.4 * long_rate + 0.6 * short_rate
-            w[s.name] = 0.5 + blended   # range roughly [0.5, 1.5]
+            w[s.name] = 0.5 + blended
         return w
 
     def refresh_weights(self):
@@ -415,7 +412,6 @@ class Predictor:
             log.debug(f"fetch: {e}")
             return False
 
-    # ---------- size core (probability of BIG) ----------
     def _core(self, sizes, nums):
         if len(sizes) < 50: return None
         results = {}
@@ -433,34 +429,31 @@ class Predictor:
             votes[name] = round(r.p_big, 3)
         p_big = num / den if den else 0.5
 
-        # --- CONFIDENCE GATE ---
-        # Skip the round entirely if the ensemble is too weak / too conflicted.
-        # This is what reduces forced back-to-back losses: no signal, no bet.
         edge = abs(p_big - 0.5)
         agree = sum(1 for v in votes.values() if (v >= 0.5) == (p_big >= 0.5))
         disagree_ratio = agree / len(votes)
-        if edge < 0.04 or disagree_ratio < 0.55:
+        if edge < 0.02 or disagree_ratio < 0.45:
             return None
-        # ------------------------
 
         pred_size = 1 if p_big >= 0.5 else 0
+
+        big_pred, small_pred = self.store.recent_pred_bias(20)
+        total_pred = big_pred + small_pred
+        if total_pred >= 10:
+            bias_ratio = big_pred / total_pred
+            if bias_ratio > 0.70 and pred_size == 1:
+                edge *= 0.6
+            elif bias_ratio < 0.30 and pred_size == 0:
+                edge *= 0.6
+
         confidence = 50 + round(min(1.0, edge * 2) * 40)
         return {"p_big": p_big, "pred_size": pred_size, "confidence": confidence,
                 "signals": votes, "logic": " + ".join(list(votes)[:4])}
 
-    # ---------- number scoring (advanced) ----------
     def _number_scores(self, nums, pool):
-        """Blend of:
-           35% number-transition Markov (which digit follows 'last' most often)
-           20% local frequency (hot in last 100)
-           20% gap norm (exploration via cooldown)
-           10% anti-extreme (avoid over-hot)
-           plus a soft penalty on recently predicted numbers.
-        """
         if not nums:
             return {n: 1.0 for n in pool}
 
-        # 10x10 transition matrix
         trans = defaultdict(Counter)
         for i in range(len(nums) - 1):
             trans[nums[i]][nums[i + 1]] += 1
@@ -488,7 +481,7 @@ class Predictor:
                      0.20 * gap_norm +
                      0.10 * anti_hot)
             if n in self.recent_pred_nums:
-                score *= 0.45   # soft penalty, not absolute
+                score *= 0.45
             scores[n] = score
         return scores
 
@@ -499,7 +492,7 @@ class Predictor:
         exp_s = {n: math.exp((s - max_s) / temperature) for n, s in scores.items()}
         total = sum(exp_s.values()) or 1.0
         r = random.random() * total; cum = 0.0
-        chosen = max(scores, key=scores.get)  # fallback
+        chosen = max(scores, key=scores.get)
         for n in sorted(exp_s):
             cum += exp_s[n]
             if r < cum:
@@ -536,14 +529,13 @@ class Predictor:
                 "logic": core["logic"], "signals": core["signals"],
                 "status": "PENDING"}
 
-    # ---------- backtest ----------
     def backtest(self, min_history=80, greedy=True):
         sizes = [h["size"] for h in self.history]
         nums = [h["num"] for h in self.history]
         if len(sizes) < min_history + 20: return None
 
         size_hits = size_tot = 0
-        num_hits_cond = num_tot_cond = 0   # number correct given size correct
+        num_hits_cond = num_tot_cond = 0
         sig_hits, sig_tot = defaultdict(int), defaultdict(int)
         calib = defaultdict(lambda: [0, 0])
         skipped = 0
@@ -558,7 +550,6 @@ class Predictor:
             ok_size = core["pred_size"] == actual
             size_hits += ok_size
 
-            # number test (greedy = argmax, deterministic)
             pool = list(range(5, 10)) if core["pred_size"] else list(range(0, 5))
             scores = self._number_scores(nums[:i], pool)
             pred_num = max(scores, key=scores.get)
@@ -610,7 +601,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         f"🧬 <b>{BOT_NAME}</b> online\n"
         "12 size-engines • number-Markov • Boltzmann pick • Platt calibration\n"
-        "Confidence-gated: weak/conflicted rounds are skipped, not forced.\n"
+        "Confidence-gated + bias-corrected ensemble.\n"
         "Commands: /stats /history /signals /weights /backtest\n"
         "⚠️ RNG draws — heuristic/entertainment. No real edge.",
         parse_mode="HTML")
@@ -631,7 +622,7 @@ async def cmd_history(u: Update, c: ContextTypes.DEFAULT_TYPE):
     rows = predictor.store.recent(15)
     if not rows:
         await u.message.reply_text("🗂 Empty."); return
-    rows = rows[::-1]  # oldest on top, newest at bottom
+    rows = rows[::-1]
     lines = [f"<code>{r[0][-4:]}</code> {size_label(r[4])} {r[3]} → {status_emoji(r[5])}" for r in rows]
     await u.message.reply_text("🗂 <b>Recent</b> <i>(oldest→newest)</i>\n" + "\n".join(lines), parse_mode="HTML")
 
@@ -713,7 +704,7 @@ async def loop(app):
 
 def fmt(p):
     rows = predictor.store.recent(10)
-    rows = rows[::-1]  # oldest on top, newest at bottom
+    rows = rows[::-1]
     recent = "".join(
         f"➜ <code>{r[0][-4:]}</code> {size_label(r[4])} {r[3]} → {status_emoji(r[5])}\n"
         for r in rows)
@@ -748,6 +739,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
