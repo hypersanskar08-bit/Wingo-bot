@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
-from aiohttp import web  # Render Port Fix
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -73,7 +73,7 @@ def safe_mean(xs):
     return sum(xs) / len(xs) if xs else 0.0
 
 # =========================
-# STORAGE (Fixed Duplicate Bug)
+# STORAGE (Fixed)
 # =========================
 class Storage:
     def __init__(self, path: str):
@@ -105,7 +105,6 @@ class Storage:
         return row is not None
 
     def save_prediction(self, issue, size, num):
-        # INSERT OR IGNORE: Agar pehle se hai toh overwrite mat karo
         with self._conn() as c:
             c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, created_at) VALUES (?, ?, ?, ?)", 
                       (issue, size, num, time.time()))
@@ -120,7 +119,7 @@ class Storage:
                 act = history_dict[issue]
                 act_size_str = "BIG" if act['size'] == 1 else "SMALL"
                 
-                # 🔥 WIN/LOSS LOGIC (100% Accurate)
+                # Strict Matching Logic
                 win = (p_size == act_size_str)
                 if win:
                     status = "JACK 🎰" if p_num == act['num'] else "WIN ✅"
@@ -135,20 +134,20 @@ class Storage:
 
     def recent_outcomes(self, limit=12):
         with self._conn() as c:
-            # Order by issue DESC ensures latest results first
-            return c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY issue DESC LIMIT ?", (limit,)).fetchall()
-
-    def get_stats(self):
-        with self._conn() as c:
-            total = c.execute("SELECT COUNT(*) FROM predictions WHERE status!='PENDING'").fetchone()[0]
-            wins = c.execute("SELECT COUNT(*) FROM predictions WHERE status LIKE '%WIN%' OR status LIKE '%JACK%'").fetchone()[0]
-            jacks = c.execute("SELECT COUNT(*) FROM predictions WHERE status LIKE '%JACK%'").fetchone()[0]
-        return {"total": total, "wins": wins, "jacks": jacks, "acc": (wins/total*100) if total > 0 else 0}
+            # Strict Actual Result Fetch (Integer Cast for sorting)
+            rows = c.execute("""
+                SELECT issue, actual_size, actual_num, status 
+                FROM predictions 
+                WHERE status!='PENDING' 
+                ORDER BY CAST(issue AS INTEGER) DESC 
+                LIMIT ?
+            """, (limit,)).fetchall()
+        return rows[::-1] # Return Oldest -> Newest
 
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V101 ULTIMATE PREDICTION ENGINE
+# PREDICTION ENGINE
 # =========================
 class UltimatePredictor:
     def __init__(self):
@@ -160,19 +159,26 @@ class UltimatePredictor:
             async with session.get(CFG.source_api_url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
                 if r.status != 200: return False
                 data = await r.json()
-                items = data.get("data", {}).get("list", [])[-300:] 
+                items = data.get("data", {}).get("list", [])
+                
+                # Deduplicate & Sort
+                items.sort(key=lambda x: int(x["issueNumber"]))
+                items = items[-300:] # Last 300
                 
                 out = []
+                seen = set()
                 for item in items:
                     try:
                         issue = str(item["issueNumber"])
+                        if issue in seen: continue
+                        seen.add(issue)
                         num = int(item["number"])
                         out.append({"issue": issue, "num": num, "size": 1 if num >= 5 else 0})
                     except: continue
-                out.sort(key=lambda x: int(x["issue"]))
                 self.history = out
                 return True
-        except Exception:
+        except Exception as e:
+            log.error(f"Fetch error: {e}")
             return False
 
     def generate_prediction(self):
@@ -287,13 +293,18 @@ class UltimatePredictor:
 PREDICTOR = UltimatePredictor()
 
 # =========================
-# FORMATTING & SENDING (HTML Safe)
+# FORMATTING (Strict Actual Result)
 # =========================
 def format_prediction(p, recent_rows):
-    recent_text = "".join(
-        f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
-        for r in recent_rows
-    )
+    recent_text = ""
+    for r in recent_rows:
+        issue = r[0][-4:]
+        act_size = r[1] or "?"
+        act_num = r[2] if r[2] is not None else "?"
+        status = r[3]
+        # Explicitly show "Actual:"
+        recent_text += f"➜ <code>{h(issue)}</code> Actual: {h(act_size)} {h(act_num)} → <b>{h(status)}</b>\n"
+
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
@@ -320,13 +331,18 @@ async def send_msg(app, text):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 V101 Ultimate Hybrid Active!\nPredictions + Analytics.")
 
-async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = PREDICTOR.analyze_market()
-    await update.message.reply_text(txt, parse_mode="HTML")
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = STORE.get_stats()
-    text = f"📊 <b>Bot Stats</b>\nTotal: {s['total']}\nWins: {s['wins']}\nJACK: {s['jacks']}\nAccuracy: {s['acc']:.1f}%"
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = STORE.recent_outcomes(15)
+    if not rows:
+        return await update.message.reply_text("No history yet.")
+    
+    text = "🧾 <b>Recent Outcomes</b>\n\n"
+    for r in rows:
+        issue = r[0][-4:]
+        act_size = r[1] or "?"
+        act_num = r[2] if r[2] is not None else "?"
+        status = r[3]
+        text += f"<code>{h(issue)}</code> Actual: {h(act_size)} {h(act_num)} → <b>{h(status)}</b>\n"
     await update.message.reply_text(text, parse_mode="HTML")
 
 # =========================
@@ -352,12 +368,10 @@ async def worker_loop(app, session):
                 latest_issue = PREDICTOR.history[-1]["issue"]
                 next_issue = str(int(latest_issue) + 1)
                 
-                # 🔥 Bug Fix: Check if prediction already exists in DB (prevents double send on restart)
                 if not STORE.prediction_exists(next_issue):
                     p = PREDICTOR.generate_prediction()
                     if p:
                         STORE.save_prediction(p['issue'], p['size'], p['num'])
-                        
                         recent = STORE.recent_outcomes(12)
                         await send_msg(app, format_prediction(p, recent))
                         log.info(f"Predicted for {p['issue']}")
@@ -379,7 +393,7 @@ async def handle_ping(request):
 async def main():
     CFG.validate()
     
-    # Web Server Fix
+    # Web Server Fix for Render
     web_app = web.Application()
     web_app.router.add_get('/', handle_ping)
     runner = web.AppRunner(web_app)
@@ -390,8 +404,7 @@ async def main():
 
     app = Application.builder().token(CFG.telegram_token).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("history", cmd_history))
 
     async with app:
         await app.start()
