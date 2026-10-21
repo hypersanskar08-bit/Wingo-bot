@@ -23,16 +23,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-
 # ============================================================
 # CONFIG
 # ============================================================
 
 @dataclass
 class Config:
+    # Fallbacks me tumhara Token aur Chat ID daal diya hai
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAEQb9B7N565qGDp--AR6Z1v_4lhzUIu-PQ")
     chat_id_raw: str = os.getenv("CHAT_ID", "1264164655")
-    admin_ids_raw: str = os.getenv("ADMIN_IDS", "")
+    admin_ids_raw: str = os.getenv("ADMIN_IDS", "1264164655")
     api_url: str = os.getenv(
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-30s-1000",
@@ -98,6 +98,9 @@ CFG = Config()
 
 
 def setup_logging():
+    # 🔥 FIX: Folder create karo pehle, warna Render crash karega
+    os.makedirs(CFG.log_dir, exist_ok=True)
+    
     root = logging.getLogger()
     root.setLevel(getattr(logging, CFG.log_level, logging.INFO))
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
