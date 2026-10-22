@@ -31,7 +31,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 6
-    bot_name: str = "V121 ADAPTIVE DEEP LEARNING"
+    bot_name: str = "V122 HYPER-ADAPTIVE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -53,27 +53,24 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v121_adaptive")
+log = logging.getLogger("v122_adaptive")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
     def __init__(self, path: str):
         self.path = path
         with self._conn() as c:
-            # Predictions Table
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
                     status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT, logic TEXT, engine_probs TEXT, created_at REAL
                 )
             """)
-            # Engine Weights Table (For 24/7 Learning)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS engine_weights (
                     name TEXT PRIMARY KEY, weight REAL
                 )
             """)
-            # Number Penalties Table
             c.execute("""
                 CREATE TABLE IF NOT EXISTS number_penalties (
                     num INTEGER PRIMARY KEY, penalty REAL
@@ -144,22 +141,19 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V121 ADAPTIVE DEEP LEARNING
+# V122 HYPER-ADAPTIVE ENGINE
 # =========================
-class AdaptiveDeepLearning:
+class HyperAdaptivePredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # Load state from DB (24/7 Memory)
         self.weights = STORE.load_weights()
         self.number_penalties = STORE.load_number_penalties()
         
-        # Default weights if DB is empty
         for eng in ['pattern', 'markov', 'zscore', 'trendseq', 'fuzzy']:
             if eng not in self.weights:
                 self.weights[eng] = 1.0
-
         for n in range(10):
             if n not in self.number_penalties:
                 self.number_penalties[n] = 1.0
@@ -187,7 +181,6 @@ class AdaptiveDeepLearning:
         except Exception:
             return False
 
-    # --- ENGINE 1: DEEP PATTERN (10-Length) ---
     def engine_pattern(self, sizes):
         for k in range(10, 3, -1):
             if len(sizes) < k + 1: continue
@@ -198,14 +191,12 @@ class AdaptiveDeepLearning:
                     if sizes[i+k] == 1: big += 1
                     else: small += 1
             total = big + small
-            if total >= 2:
-                return (big + 1) / (total + 2), f"P{k}"
-        return 0.5, "P_None"
+            if total >= 2: return (big + 1) / (total + 2), f"Pat{k}"
+        return 0.5, "Pat0"
 
-    # --- ENGINE 2: MARKOV-4 ---
     def engine_markov(self, sizes):
         order = 4
-        if len(sizes) < order + 1: return 0.5, "M_None"
+        if len(sizes) < order + 1: return 0.5, "Mrk0"
         state = tuple(sizes[-order:])
         big, small = 0, 0
         for i in range(len(sizes) - order):
@@ -213,30 +204,25 @@ class AdaptiveDeepLearning:
                 if sizes[i+order] == 1: big += 1
                 else: small += 1
         total = big + small
-        if total >= 2:
-            return (big + 1) / (total + 2), f"M4"
-        return 0.5, "M_None"
+        if total >= 2: return (big + 1) / (total + 2), "Mrk4"
+        return 0.5, "Mrk0"
 
-    # --- ENGINE 3: Z-SCORE (Mean Reversion) ---
     def engine_zscore(self, sizes):
-        if len(sizes) < 40: return 0.5, "Z_None"
+        if len(sizes) < 40: return 0.5, "Z0"
         w = sizes[-40:]
         big_count = sum(w)
         z = (big_count - 20) / math.sqrt(40 * 0.25)
-        
-        if z > 1.5: return 0.15, f"Z-Extreme({big_count}B)"
-        if z < -1.5: return 0.85, f"Z-Extreme({big_count}B)"
-        return 0.5, "Z_Neutral"
+        if z > 1.5: return 0.15, f"Z-Ext"
+        if z < -1.5: return 0.85, f"Z-Ext"
+        return 0.5, "Z0"
 
-    # --- ENGINE 4: TREND SEQUENCE (Adaptive) ---
     def engine_trendseq(self, sizes):
-        if len(sizes) < 20: return 0.5, "T_None"
+        if len(sizes) < 20: return 0.5, "Trd0"
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
             else: break
 
-        # Search history for same streak length
         breaks, conts = 0, 0
         for i in range(len(sizes) - streak - 1):
             if all(sizes[i+j] == sizes[-1] for j in range(streak)):
@@ -246,37 +232,22 @@ class AdaptiveDeepLearning:
         
         total = breaks + conts
         if total >= 3:
-            if breaks > conts:
-                # Historically breaks, so we break
-                return (0.0 if sizes[-1] == 1 else 1.0), f"T-Break({breaks}/{total})"
-            else:
-                # Historically continues, so we continue
-                return (1.0 if sizes[-1] == 1 else 0.0), f"T-Cont({conts}/{total})"
-                
-        # Default momentum if no history
-        return (1.0 if sizes[-1] == 1 else 0.0), "T-Momentum"
+            if breaks > conts: return (0.0 if sizes[-1] == 1 else 1.0), "TrdBrk"
+            else: return (1.0 if sizes[-1] == 1 else 0.0), "TrdCnt"
+        return (1.0 if sizes[-1] == 1 else 0.0), "TrdMom"
 
-    # --- ENGINE 5: FUZZY PATTERN (80% Match) ---
     def engine_fuzzy(self, sizes):
-        if len(sizes) < 12: return 0.5, "Fz_None"
+        if len(sizes) < 12: return 0.5, "Fz0"
         target = sizes[-8:]
-        best_score = 0
-        next_val = 0.5
-        
+        best_score, next_val = 0, 0.5
         for i in range(len(sizes) - 12):
             window = sizes[i:i+8]
             score = sum(1 for a, b in zip(target, window) if a == b)
             if score >= 7:
-                best_score = score
-                next_val = sizes[i+8]
-                
-        if best_score >= 7:
-            return (0.8 if next_val == 1 else 0.2), f"Fz({best_score}/8)"
-        return 0.5, "Fz_None"
+                best_score, next_val = score, sizes[i+8]
+        if best_score >= 7: return (0.8 if next_val == 1 else 0.2), "Fz80"
+        return 0.5, "Fz0"
 
-    # ==========================================
-    # LEARNING MECHANISM (Update Weights)
-    # ==========================================
     def update_learning(self, engine_probs_json, actual_size, pred_num, actual_num):
         if not engine_probs_json: return
         try:
@@ -284,20 +255,16 @@ class AdaptiveDeepLearning:
             for name, p_big in probs.items():
                 if name in self.weights:
                     pred_size = 1 if p_big >= 0.5 else 0
-                    
-                    # If engine was wrong, penalize weight
                     if pred_size != actual_size:
                         self.weights[name] = max(0.1, self.weights[name] - 0.1)
                     else:
                         self.weights[name] = min(3.0, self.weights[name] + 0.05)
             
-            # Penalize Number if predicted wrong
             if pred_num != actual_num:
                 self.number_penalties[pred_num] = max(0.2, self.number_penalties[pred_num] - 0.2)
             else:
-                self.number_penalties[pred_num] = 1.0 # Reset penalty if hit
+                self.number_penalties[pred_num] = 1.0
 
-            # Slowly recover penalties for other numbers
             for n in self.number_penalties:
                 if n != pred_num:
                     self.number_penalties[n] = min(1.0, self.number_penalties[n] + 0.05)
@@ -313,7 +280,6 @@ class AdaptiveDeepLearning:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        # Get raw engine outputs
         p_pat, l_pat = self.engine_pattern(sizes)
         p_mark, l_mark = self.engine_markov(sizes)
         p_z, l_z = self.engine_zscore(sizes)
@@ -329,14 +295,14 @@ class AdaptiveDeepLearning:
 
         for name, p_big in raw_probs.items():
             w = self.weights[name]
-            
-            # 🔥 ADAPTIVE INVERSION: If weight is too low, engine is failing. INVERT IT.
             if w < 0.4:
                 final_probs[name] = 1.0 - p_big
                 logic_tags.append(f"INV_{name}")
             else:
                 final_probs[name] = p_big
-                if p_big > 0.5: logic_tags.append(name)
+                # 🔥 FIX: Display logic for BOTH Big and Small
+                direction = "B" if p_big >= 0.5 else "S"
+                logic_tags.append(f"{name}({direction})")
 
             weighted_sum += final_probs[name] * w
             total_w += w
@@ -345,17 +311,14 @@ class AdaptiveDeepLearning:
         pred_size = 1 if final_p_big >= 0.5 else 0
         confidence = int(abs(final_p_big - 0.5) * 2 * 100)
 
-        # 🔥 CONTRARIAN OVERRIDE (If confused, invert)
         if 48 <= confidence <= 55:
             pred_size = 1 - pred_size
-            logic_tags.append("CONTRARIAN")
+            logic_tags = ["CONTRARIAN_OVERRIDE"]
             confidence = 65
         
         confidence = min(88, max(55, confidence))
 
-        # ==========================================
-        # DEEP NUMBER MATRIX (With Penalties)
-        # ==========================================
+        # Number Matrix
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         last_num = nums[-1]
         
@@ -377,13 +340,8 @@ class AdaptiveDeepLearning:
             g_score = min(gaps[n], 30) / 30 * 100
             f_score = (freq.get(n, 0) / 50) * 100
             
-            # Base Score
             score = (t_score * 0.5) + (g_score * 0.3) + (f_score * 0.2)
-            
-            # Neighbour Bonus
             if n == (last_num + 1) % 10 or n == (last_num - 1 + 10) % 10: score += 15
-            
-            # 🔥 APPLY NUMBER PENALTY
             score *= self.number_penalties[n]
                 
             if score > best_score:
@@ -395,11 +353,11 @@ class AdaptiveDeepLearning:
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "logic": " + ".join(logic_tags[:3]),
+            "logic": " + ".join(logic_tags),
             "engine_probs": final_probs
         }
 
-PREDICTOR = AdaptiveDeepLearning()
+PREDICTOR = HyperAdaptivePredictor()
 
 # =========================
 # FORMATTING
@@ -420,7 +378,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V121 ADAPTIVE DEEP LEARNING</i>
+⚡ <i>V122 HYPER-ADAPTIVE MATRIX</i>
 """
 
 async def send_msg(app, text):
@@ -433,7 +391,7 @@ async def send_msg(app, text):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V121 Adaptive loop started...")
+    log.info("V122 Hyper-Adaptive loop started...")
     last_processed_issue = None
 
     while True:
@@ -446,14 +404,8 @@ async def worker_loop(app, session):
                     if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
                     else: PREDICTOR.loss_streak = 0
                     
-                    # 🔥 UPDATE LEARNING BRAIN
                     act_int = 1 if res['actual_size'] == 'BIG' else 0
-                    PREDICTOR.update_learning(
-                        res.get('engine_probs'), 
-                        act_int, 
-                        res.get('num'), 
-                        res.get('actual_num')
-                    )
+                    PREDICTOR.update_learning(res.get('engine_probs'), act_int, res.get('num'), res.get('actual_num'))
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -482,7 +434,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V121 Adaptive Deep Learning is running!")
+    return web.Response(text="V122 Hyper-Adaptive is running!")
 
 async def main():
     CFG.validate()
