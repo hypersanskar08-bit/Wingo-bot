@@ -154,12 +154,10 @@ class UltimatePredictor:
             exact_big, exact_small = 0, 0
             fuzzy_big, fuzzy_small = 0, 0
             
-            # Time-decay weighting: recent matches matter more
             for i in range(len(sizes) - order):
                 window = sizes[i:i+order]
                 next_val = sizes[i+order]
                 
-                # Calculate Hamming Distance (Mismatches)
                 distance = sum(1 for a, b in zip(target, window) if a != b)
                 recency_weight = 0.95 ** (len(sizes) - (i + order))
                 
@@ -167,18 +165,16 @@ class UltimatePredictor:
                     if next_val == 1: exact_big += 1 * recency_weight
                     else: exact_small += 1 * recency_weight
                 elif distance == 1:
-                    if next_val == 1: fuzzy_big += 1 * (recency_weight * 0.5) # Fuzzy gets half weight
+                    if next_val == 1: fuzzy_big += 1 * (recency_weight * 0.5)
                     else: fuzzy_small += 1 * (recency_weight * 0.5)
             
             total_exact = exact_big + exact_small
             total_fuzzy = fuzzy_big + fuzzy_small
             
-            # 1. Exact Match Priority
             if total_exact >= 0.5:
                 p_big = (exact_big + 0.5) / (total_exact + 1.0)
                 return p_big, f"M{order}_Exact"
             
-            # 2. Fuzzy Match Fallback
             if total_fuzzy >= 1.0:
                 p_big = (fuzzy_big + 0.5) / (total_fuzzy + 1.0)
                 return p_big, f"M{order}_Fuzzy"
@@ -218,6 +214,13 @@ class UltimatePredictor:
         nums = [x["num"] for x in self.history]
         
         mode = self.detect_market_mode(sizes)
+        
+        # 🔥 FIX: Define streak here so it doesn't throw NameError
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == sizes[-1]: streak += 1
+            else: break
+
         pred_size = 0
         logic = ""
         confidence = 60
@@ -236,12 +239,11 @@ class UltimatePredictor:
                 if z > 1.5: p_z = 0.1
                 elif z < -1.5: p_z = 0.9
 
-            # Combine Deep Markov and Z-Score
             final_p = (p_mark * 0.6) + (p_z * 0.4)
             pred_size = 1 if final_p >= 0.5 else 0
             
             logic = f"V_{l_mark} + V_ZCore"
-            confidence = 75 + int(abs(final_p - 0.5) * 20) # 75% to 85%
+            confidence = 75 + int(abs(final_p - 0.5) * 20)
 
         # ==========================================
         # 📈 TREND
