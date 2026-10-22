@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V127 REGIME-GATED EXPERTS"
+    bot_name: str = "V129 ULTIMATE VENGEANCE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,26 +54,18 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v127_experts")
+log = logging.getLogger("v129_ultimate")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
     def __init__(self, path: str):
         self.path = path
         with self._conn() as c:
-            # Predictions Table
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
                     status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT, 
-                    regime INTEGER, expert_probs TEXT, logic TEXT, created_at REAL
-                )
-            """)
-            # Expert Stats Table (The Brain)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS expert_stats (
-                    regime INTEGER, expert TEXT, wins INTEGER, total INTEGER,
-                    PRIMARY KEY (regime, expert)
+                    mode TEXT, logic TEXT, created_at REAL
                 )
             """)
 
@@ -86,16 +78,16 @@ class Storage:
         with self._conn() as c:
             return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
 
-    def save_prediction(self, issue, size, num, regime, expert_probs, logic):
+    def save_prediction(self, issue, size, num, mode, logic):
         with self._conn() as c:
-            c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, regime, expert_probs, logic, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                      (issue, size, num, regime, json.dumps(expert_probs), logic, time.time()))
+            c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, mode, logic, created_at) VALUES (?, ?, ?, ?, ?, ?)", 
+                      (issue, size, num, mode, logic, time.time()))
 
     def resolve_pending(self, history_dict):
         resolved = []
         with self._conn() as c:
-            rows = c.execute("SELECT issue, size, num, regime, expert_probs FROM predictions WHERE status='PENDING'").fetchall()
-        for issue, p_size, p_num, regime, probs_json in rows:
+            rows = c.execute("SELECT issue, size, num, mode FROM predictions WHERE status='PENDING'").fetchall()
+        for issue, p_size, p_num, mode in rows:
             if issue in history_dict:
                 act = history_dict[issue]
                 act_size_str = "BIG" if act['size'] == 1 else "SMALL"
@@ -109,7 +101,7 @@ class Storage:
                 resolved.append({
                     "issue": issue, "size": p_size, "num": p_num, 
                     "actual_num": act['num'], "actual_size": act_size_str, 
-                    "status": status, "regime": regime, "expert_probs": probs_json
+                    "status": status, "mode": mode
                 })
         return resolved
 
@@ -118,32 +110,15 @@ class Storage:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
-    def get_expert_stats(self):
-        with self._conn() as c:
-            rows = c.execute("SELECT regime, expert, wins, total FROM expert_stats").fetchall()
-            return {(r, e): (w, t) for r, e, w, t in rows}
-
-    def save_expert_stats(self, regime, expert, wins, total):
-        with self._conn() as c:
-            c.execute("INSERT OR REPLACE INTO expert_stats (regime, expert, wins, total) VALUES (?, ?, ?, ?)", (regime, expert, wins, total))
-
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V127 MIXTURE OF EXPERTS (MOE)
+# V129 ULTIMATE MULTI-MODE PREDICTOR
 # =========================
-class RegimeGatedPredictor:
+class UltimatePredictor:
     def __init__(self):
         self.history = []
-        self.stats = STORE.get_expert_stats()
-        
-        self.experts = ['momentum', 'trend', 'reversion', 'pattern', 'markov']
-        
-        # Initialize stats if empty
-        for r in range(6):
-            for e in self.experts:
-                if (r, e) not in self.stats:
-                    self.stats[(r, e)] = (0, 0)
+        self.loss_streak = 0
 
     async def fetch_data(self, session):
         try:
@@ -168,92 +143,73 @@ class RegimeGatedPredictor:
         except Exception:
             return False
 
-    def get_regime(self, sizes):
-        """0:MIXED, 1:TREND_BIG, 2:TREND_SMALL, 3:CHOP, 4:EXTREME_BIG, 5:EXTREME_SMALL"""
-        if len(sizes) < 30: return 0
-        w = sizes[-30:]
-        big_count = sum(w)
+    # --- ULTIMATE DEEP MARKOV ENGINE ---
+    def engine_deep_markov(self, sizes):
+        orders = [6, 5, 4, 3]
         
-        # Z-Score Extreme
-        z = (big_count - 15) / math.sqrt(30 * 0.25)
-        if z > 1.5: return 4
-        if z < -1.5: return 5
-        
-        # Choppiness
-        switches = sum(1 for i in range(1, 15) if sizes[-i] != sizes[-i-1])
-        if switches >= 10: return 3
-        
-        # Trend
-        sma10 = sum(sizes[-10:]) / 10.0
-        sma30 = sum(sizes[-30:]) / 30.0
-        if sma10 > 0.65 and sma30 > 0.55: return 1
-        if sma10 < 0.35 and sma30 < 0.45: return 2
-        
-        return 0
+        for order in orders:
+            if len(sizes) < order + 5: continue
+            target = sizes[-order:]
+            
+            exact_big, exact_small = 0, 0
+            fuzzy_big, fuzzy_small = 0, 0
+            
+            # Time-decay weighting: recent matches matter more
+            for i in range(len(sizes) - order):
+                window = sizes[i:i+order]
+                next_val = sizes[i+order]
+                
+                # Calculate Hamming Distance (Mismatches)
+                distance = sum(1 for a, b in zip(target, window) if a != b)
+                recency_weight = 0.95 ** (len(sizes) - (i + order))
+                
+                if distance == 0:
+                    if next_val == 1: exact_big += 1 * recency_weight
+                    else: exact_small += 1 * recency_weight
+                elif distance == 1:
+                    if next_val == 1: fuzzy_big += 1 * (recency_weight * 0.5) # Fuzzy gets half weight
+                    else: fuzzy_small += 1 * (recency_weight * 0.5)
+            
+            total_exact = exact_big + exact_small
+            total_fuzzy = fuzzy_big + fuzzy_small
+            
+            # 1. Exact Match Priority
+            if total_exact >= 0.5:
+                p_big = (exact_big + 0.5) / (total_exact + 1.0)
+                return p_big, f"M{order}_Exact"
+            
+            # 2. Fuzzy Match Fallback
+            if total_fuzzy >= 1.0:
+                p_big = (fuzzy_big + 0.5) / (total_fuzzy + 1.0)
+                return p_big, f"M{order}_Fuzzy"
+                
+        return 0.5, "M_None"
 
-    # --- EXPERT 1: MOMENTUM ---
-    def expert_momentum(self, sizes):
-        return 1.0 if sizes[-1] == 1 else 0.0
+    def detect_market_mode(self, sizes):
+        if self.loss_streak >= 1:
+            return "VENGEANCE"
 
-    # --- EXPERT 2: TREND (Streak Follower) ---
-    def expert_trend(self, sizes):
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
             else: break
-        if streak >= 3: return 1.0 if sizes[-1] == 1 else 0.0
-        return 0.5
+            
+        if streak >= 3:
+            return "TREND"
 
-    # --- EXPERT 3: REVERSION (Contrarian) ---
-    def expert_reversion(self, sizes):
-        big_count = sum(sizes[-20:])
-        if big_count >= 14: return 0.1 # Expect Small
-        if big_count <= 6: return 0.9  # Expect Big
-        return 0.5
+        if len(sizes) >= 30:
+            w = sizes[-30:]
+            big_count = sum(w)
+            z = (big_count - 15) / math.sqrt(30 * 0.25)
+            if z > 1.8 or z < -1.8:
+                return "EXTREME"
 
-    # --- EXPERT 4: DEEP PATTERN ---
-    def expert_pattern(self, sizes):
-        for k in range(10, 3, -1):
-            if len(sizes) < k+1: continue
-            pat = tuple(sizes[-k:])
-            big, small = 0, 0
-            for i in range(len(sizes)-k):
-                if tuple(sizes[i:i+k]) == pat:
-                    if sizes[i+k] == 1: big += 1
-                    else: small += 1
-            if big+small >= 2: return (big+1)/(big+small+2)
-        return 0.5
+        if len(sizes) >= 15:
+            switches = sum(1 for i in range(1, 15) if sizes[-i] != sizes[-i-1])
+            if switches >= 11:
+                return "CHOP"
 
-    # --- EXPERT 5: MARKOV-4 ---
-    def expert_markov(self, sizes):
-        order = 4
-        if len(sizes) < order+1: return 0.5
-        state = tuple(sizes[-order:])
-        big, small = 0, 0
-        for i in range(len(sizes)-order):
-            if tuple(sizes[i:i+order]) == state:
-                if sizes[i+order] == 1: big += 1
-                else: small += 1
-        if big+small >= 2: return (big+1)/(big+small+2)
-        return 0.5
-
-    def update_learning(self, regime, expert_probs_json, actual_size):
-        """Core RL Brain: Update Expert x Regime accuracy"""
-        if not expert_probs_json: return
-        try:
-            probs = json.loads(expert_probs_json)
-            for name, p_big in probs.items():
-                pred_size = 1 if p_big >= 0.5 else 0
-                wins, total = self.stats.get((regime, name), (0, 0))
-                
-                if pred_size == actual_size:
-                    wins += 1
-                total += 1
-                
-                self.stats[(regime, name)] = (wins, total)
-                STORE.save_expert_stats(regime, name, wins, total)
-        except Exception as e:
-            log.error(f"Learn error: {e}")
+        return "NORMAL"
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
@@ -261,54 +217,75 @@ class RegimeGatedPredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        regime = self.get_regime(sizes)
-        
-        expert_probs = {
-            'momentum': self.expert_momentum(sizes),
-            'trend': self.expert_trend(sizes),
-            'reversion': self.expert_reversion(sizes),
-            'pattern': self.expert_pattern(sizes),
-            'markov': self.expert_markov(sizes)
-        }
+        mode = self.detect_market_mode(sizes)
+        pred_size = 0
+        logic = ""
+        confidence = 60
 
-        weighted_sum = 0
-        total_weight = 0
-        logic_tags = []
-
-        # 🔥 CONTEXTUAL BANDIT WEIGHTING (Data-Driven)
-        for name, p_big in expert_probs.items():
-            wins, total = self.stats.get((regime, name), (0, 0))
+        # ==========================================
+        # 🚨 VENGEANCE (Ultra Deep Mode)
+        # ==========================================
+        if mode == "VENGEANCE":
+            p_mark, l_mark = self.engine_deep_markov(sizes)
             
-            if total < 3:
-                # Need data: Explore this expert
-                weight = 1.0 
-            else:
-                acc = wins / total
-                # Exploration bonus (UCB1)
-                exploration = math.sqrt(2 * math.log(total + 10) / total)
-                weight = max(0.05, acc + exploration * 0.5)
+            p_z = 0.5
+            if len(sizes) >= 30:
+                w = sizes[-30:]
+                big_count = sum(w)
+                z = (big_count - 15) / math.sqrt(30 * 0.25)
+                if z > 1.5: p_z = 0.1
+                elif z < -1.5: p_z = 0.9
+
+            # Combine Deep Markov and Z-Score
+            final_p = (p_mark * 0.6) + (p_z * 0.4)
+            pred_size = 1 if final_p >= 0.5 else 0
             
-            # Only show experts that have good weight
-            if weight > 0.55:
-                direction = "B" if p_big >= 0.5 else "S"
-                logic_tags.append(f"{name.capitalize()}({direction})")
+            logic = f"V_{l_mark} + V_ZCore"
+            confidence = 75 + int(abs(final_p - 0.5) * 20) # 75% to 85%
 
-            weighted_sum += p_big * weight
-            total_weight += weight
+        # ==========================================
+        # 📈 TREND
+        # ==========================================
+        elif mode == "TREND":
+            pred_size = sizes[-1]
+            logic = f"TREND_LOCK({streak}x)"
+            confidence = 75
 
-        final_p_big = weighted_sum / total_weight if total_weight > 0 else 0.5
-        pred_size = 1 if final_p_big >= 0.5 else 0
-        
-        confidence = int(abs(final_p_big - 0.5) * 2 * 100)
-        
-        # If confidence is too low, it means experts are disagreeing. 
-        # Reduce confidence to avoid false hope.
-        confidence = min(88, max(51, confidence))
-        
-        if not logic_tags:
-            logic_tags = ["MixtureOfExperts"]
+        # ==========================================
+        # ⚖️ EXTREME (Reversal)
+        # ==========================================
+        elif mode == "EXTREME":
+            w = sizes[-30:]
+            big_count = sum(w)
+            if big_count >= 20: 
+                pred_size = 0
+                logic = f"EXTREME_REVERSION"
+            else: 
+                pred_size = 1
+                logic = f"EXTREME_REVERSION"
+            confidence = 70
 
-        # NUMBER MATRIX
+        # ==========================================
+        # 🌪️ CHOP (Zigzag)
+        # ==========================================
+        elif mode == "CHOP":
+            pred_size = 1 - sizes[-1]
+            logic = "CHOP_ZIGZAG"
+            confidence = 65
+
+        # ==========================================
+        # 🧠 NORMAL (Pattern / Markov)
+        # ==========================================
+        else:
+            p_pat, l_pat = self.engine_deep_markov(sizes)
+            pred_size = 1 if p_pat >= 0.5 else 0
+            logic = l_pat
+            confidence = int(abs(p_pat - 0.5) * 2 * 100)
+            confidence = min(75, max(55, confidence))
+
+        confidence = min(85, max(52, confidence))
+
+        # Target Number
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         last_num = nums[-1]
         
@@ -338,26 +315,19 @@ class RegimeGatedPredictor:
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "logic": " + ".join(logic_tags[:3]),
-            "regime": regime,
-            "expert_probs": expert_probs
+            "logic": logic,
+            "mode": mode
         }
 
-PREDICTOR = RegimeGatedPredictor()
+PREDICTOR = UltimatePredictor()
 
 # =========================
 # FORMATTING
 # =========================
-def get_regime_name(regime):
-    names = {0: "MIXED", 1: "TREND_BIG", 2: "TREND_SMALL", 3: "CHOP", 4: "EXTREME_BIG", 5: "EXTREME_SMALL"}
-    return names.get(regime, "UNKNOWN")
-
 def format_prediction(p, recent_rows):
     recent_text = ""
     for r in recent_rows:
         recent_text += f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
-
-    reg_name = get_regime_name(p['regime'])
 
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
@@ -365,13 +335,13 @@ def format_prediction(p, recent_rows):
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
 📈 <b>Confidence</b>: {p['confidence']}%
-🧠 <b>Best Experts</b>: {h(p['logic'])}
-🌐 <b>Market Regime</b>: {reg_name}
+🧠 <b>Logic</b>: {h(p['logic'])}
+⚖️ <b>Mode</b>: <b>{h(p['mode'])}</b>
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V127 REGIME-GATED EXPERTS (AI)</i>
+⚡ <i>V129 ULTIMATE VENGEANCE</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -389,7 +359,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V127 Regime-Gated Experts started...")
+    log.info("V129 Ultimate loop started...")
     last_processed_issue = None
 
     while True:
@@ -399,14 +369,8 @@ async def worker_loop(app, session):
                 
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
-                    act_int = 1 if res['actual_size'] == 'BIG' else 0
-                    
-                    # 🔥 FIRE THE LEARNING ENGINE
-                    PREDICTOR.update_learning(
-                        res.get('regime'), 
-                        res.get('expert_probs'), 
-                        act_int
-                    )
+                    if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
+                    else: PREDICTOR.loss_streak = 0
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -418,7 +382,7 @@ async def worker_loop(app, session):
                     if not STORE.prediction_exists(next_issue):
                         p = PREDICTOR.generate_prediction()
                         if p:
-                            STORE.save_prediction(p['issue'], p['size'], p['num'], p['regime'], p['expert_probs'], p['logic'])
+                            STORE.save_prediction(p['issue'], p['size'], p['num'], p['mode'], p['logic'])
                             recent = STORE.recent_outcomes(12)
                             await send_msg(app, format_prediction(p, recent))
                             last_processed_issue = latest_issue
@@ -435,7 +399,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V127 MoE is running!")
+    return web.Response(text="V129 Ultimate is running!")
 
 async def main():
     CFG.validate()
