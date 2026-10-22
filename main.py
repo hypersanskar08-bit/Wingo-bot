@@ -33,7 +33,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V135 HYPER-MINER"
+    bot_name: str = "V137 HYPER-QUANTUM"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -55,7 +55,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v135_miner")
+log = logging.getLogger("v137")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -66,12 +66,11 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS predictions (
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
                     status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT, 
-                    mode TEXT, logic TEXT, created_at REAL
+                    mode TEXT, logic TEXT, sigs TEXT, created_at REAL
                 )
             """)
-            # For Mistake Book
             c.execute("""
-                CREATE TABLE IF NOT EXISTS mistake_book (
+                CREATE TABLE IF NOT EXISTS vault (
                     pat_key TEXT PRIMARY KEY, wins INTEGER, total INTEGER
                 )
             """)
@@ -85,16 +84,16 @@ class Storage:
         with self._conn() as c:
             return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
 
-    def save_prediction(self, issue, size, num, mode, logic):
+    def save_prediction(self, issue, size, num, mode, logic, sigs):
         with self._conn() as c:
-            c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, mode, logic, created_at) VALUES (?, ?, ?, ?, ?, ?)", 
-                      (issue, size, num, mode, logic, time.time()))
+            c.execute("INSERT OR IGNORE INTO predictions (issue, size, num, mode, logic, sigs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                      (issue, size, num, mode, logic, json.dumps(sigs), time.time()))
 
     def resolve_pending(self, history_dict):
         resolved = []
         with self._conn() as c:
-            rows = c.execute("SELECT issue, size, num, mode FROM predictions WHERE status='PENDING'").fetchall()
-        for issue, p_size, p_num, mode in rows:
+            rows = c.execute("SELECT issue, size, num, mode, sigs FROM predictions WHERE status='PENDING'").fetchall()
+        for issue, p_size, p_num, mode, sigs_json in rows:
             if issue in history_dict:
                 act = history_dict[issue]
                 act_size_str = "BIG" if act['size'] == 1 else "SMALL"
@@ -106,7 +105,7 @@ class Storage:
                 resolved.append({
                     "issue": issue, "size": p_size, "num": p_num, 
                     "actual_num": act['num'], "actual_size": act_size_str, 
-                    "status": status, "mode": mode
+                    "status": status, "mode": mode, "sigs": sigs_json, "win": win
                 })
         return resolved
 
@@ -114,25 +113,24 @@ class Storage:
         with self._conn() as c:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
-        
-    def update_book(self, key, hit):
+
+    def update_vault(self, key, hit):
         with self._conn() as c:
-            row = c.execute("SELECT wins, total FROM mistake_book WHERE pat_key=?", (key,)).fetchone()
+            row = c.execute("SELECT wins, total FROM vault WHERE pat_key=?", (key,)).fetchone()
             if row:
-                wins, total = row
-                c.execute("UPDATE mistake_book SET wins=?, total=? WHERE pat_key=?", (wins+hit, total+1, key))
+                c.execute("UPDATE vault SET wins=?, total=? WHERE pat_key=?", (row[0]+hit, row[1]+1, key))
             else:
-                c.execute("INSERT INTO mistake_book (pat_key, wins, total) VALUES (?, ?, ?)", (key, hit, 1))
+                c.execute("INSERT INTO vault (pat_key, wins, total) VALUES (?, ?, ?)", (key, hit, 1))
                 
-    def get_book(self):
+    def get_vault(self):
         with self._conn() as c:
-            rows = c.execute("SELECT pat_key, wins, total FROM mistake_book").fetchall()
+            rows = c.execute("SELECT pat_key, wins, total FROM vault").fetchall()
             return {k: (w, t) for k, w, t in rows}
 
 STORE = Storage(CFG.db_path)
 
 # =========================
-# UTILS & STATS (Ported from HTML)
+# UTILS & MATH
 # =========================
 def binom_tail(n, c, p):
     if c <= 0: return 1
@@ -144,24 +142,33 @@ def binom_tail(n, c, p):
         if k >= c: tot += coef * (p ** k) * ((1 - p) ** (n - k))
     return min(1, tot)
 
-def wilson_lower(w, n, z=1.64):
-    if n == 0: return 0
-    p = w / n
-    d = 1 + z * z / n
-    return (p + z * z / (2 * n) - z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / d
+def bayes_conf(wins, total):
+    if total == 0: return 0.5
+    return (wins + 1) / (total + 2)
+
+def sample_weight(total):
+    return total / (total + 5)
 
 def logit(p):
     p = max(0.03, min(0.97, p))
     return math.log(p / (1 - p))
 
 # =========================
-# V135 FULL PATTERN MINER
+# V137 HYPER-QUANTUM (META-LEARNER)
 # =========================
-class HyperMinerPredictor:
+class HyperQuantum:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
-        self.book = STORE.get_book()
+        self.vault = STORE.get_vault()
+        
+        # Meta-Learner Stats
+        self.engine_stats = {
+            'Pattern': {'wins': 0, 'total': 0},
+            'Markov': {'wins': 0, 'total': 0},
+            'ZScore': {'wins': 0, 'total': 0},
+            'Trend': {'wins': 0, 'total': 0}
+        }
 
     async def fetch_data(self, session):
         try:
@@ -186,13 +193,19 @@ class HyperMinerPredictor:
         except Exception:
             return False
 
-    def pat_mult(self, key):
-        if key not in self.book: return 1.0
-        wins, total = self.book[key]
-        acc = (wins + 1) / (total + 2)
-        return max(0.2, min(1.6, 1 + (acc - 0.5) * 3))
+    def get_engine_weight(self, name):
+        stats = self.engine_stats[name]
+        if stats['total'] < 5: return 1.0
+        acc = stats['wins'] / stats['total']
+        return max(0.2, acc * 2) # If 50% acc, weight is 1.0. If 30%, weight is 0.6.
 
-    # --- HTML RUN PATTERNS ---
+    def vault_mult(self, key):
+        if key not in self.vault: return 1.0
+        wins, total = self.vault[key]
+        acc = (wins + 1) / (total + 2)
+        return max(0.6, min(1.5, 1 + (acc - 0.5) * 4))
+
+    # --- PATTERN MINING (HTML PORT) ---
     def extract_runs(self, seq):
         runs = []
         if not seq: return runs
@@ -208,13 +221,12 @@ class HyperMinerPredictor:
     def analyze_run(self, runs):
         if len(runs) < 3: return None
         ongoing = runs[-1]
-        best_match = None
+        best = None
         
         for k in range(min(13, len(runs)), 2, -1):
             window = runs[-k:]
             prefix = window[:-1]
             cont, brk = 0, 0
-            
             for j in range(k, len(runs) - 1):
                 cand = runs[j]
                 if cand['len'] < ongoing['len']: continue
@@ -226,122 +238,87 @@ class HyperMinerPredictor:
                 if ok:
                     if cand['len'] > ongoing['len']: cont += 1
                     else: brk += 1
-                    
             total = cont + brk
             if total >= 3:
-                p_cont = (cont + 1) / (total + 2)
-                best_match = {
-                    'dir': ongoing['side'] if p_cont >= 0.5 else 1 - ongoing['side'],
-                    'conf': max(p_cont, 1 - p_cont),
-                    'key': f"Run:{k}:{ongoing['side']}",
-                    'weight': total
+                p_cont = bayes_conf(cont, total)
+                adj_p = 0.5 + (p_cont - 0.5) * sample_weight(total)
+                dir = ongoing['side'] if adj_p >= 0.5 else 1 - ongoing['side']
+                best = {
+                    'dir': dir,
+                    'conf': max(adj_p, 1 - adj_p),
+                    'key': f"Run{k}:{dir}",
+                    'weight': 1.5
                 }
                 break
-        return best_match
+        return best
 
-    # --- HTML NUMBER GAP PATTERNS ---
     def analyze_num_gaps(self, nums):
         N = len(nums)
         if N < 10: return None
         cur = N - 1
-        best_match = None
-        
+        best = None
         for i in range(max(0, N - 15), N - 1):
             if nums[i] != nums[cur]: continue
-            
             common = [0]
             for d in range(1, 8):
                 if i - d >= 0 and nums[i-d] == nums[cur-d]:
                     common.append(d)
-                    
             if len(common) >= 3:
                 dist = Counter()
                 for j in range(max(common), N - 1):
                     if all(nums[j - off] == nums[cur - off] for off in common):
                         dist[nums[j+1]] += 1
-                        
                 if sum(dist.values()) >= 2:
                     b_cnt = sum(v for k, v in dist.items() if k >= 5)
                     s_cnt = sum(v for k, v in dist.items() if k < 5)
-                    p_big = (b_cnt + 1) / (b_cnt + s_cnt + 2)
-                    
+                    p_big = bayes_conf(b_cnt, b_cnt + s_cnt)
                     vote_side = 1 if p_big >= 0.5 else 0
-                    pool = [5,6,7,8,9] if vote_side == 1 else [0,1,2,3,4]
                     
+                    pool = [5,6,7,8,9] if vote_side == 1 else [0,1,2,3,4]
                     best_num, max_c = pool[0], 0
                     for k, v in dist.items():
                         if k in pool and v > max_c:
                             max_c = v
                             best_num = k
-                            
-                    best_match = {
+                    best = {
                         'dir': vote_side,
                         'conf': max(p_big, 1 - p_big),
                         'num': best_num,
                         'key': f"NumGap:{len(common)}",
-                        'weight': sum(dist.values())
+                        'weight': 1.2
                     }
                     break
-        return best_match
+        return best
 
-    # --- HTML RELATION PATTERNS (Same/Opposite) ---
-    def analyze_rel(self, nums, num_matches_hits):
-        # Simplified version for speed: check last 3 occurrences of last digit
-        N = len(nums)
-        cur = N - 1
-        if N < 10: return None
-        
-        for L in range(1, 8):
-            n, same, opp = 0, 0, 0
-            for j in range(N - 10, N - 1):
-                if nums[j] == nums[cur]:
-                    src = nums[j + 1 - L]
-                    if src >= 0:
-                        n += 1
-                        if nums[j+1] == src: same += 1
-                        elif nums[j+1] == (src + 5) % 10: opp += 1
-            
-            if n >= 3:
-                if same / n >= 0.8:
-                    d = nums[cur + 1 - L]
-                    return {'dir': 1 if d >= 5 else 0, 'conf': same/n, 'num': d, 'key': f"Rel:Same:{L}"}
-                if opp / n >= 0.8:
-                    d = (nums[cur + 1 - L] + 5) % 10
-                    return {'dir': 1 if d >= 5 else 0, 'conf': opp/n, 'num': d, 'key': f"Rel:Opp:{L}"}
+    def analyze_markov(self, sizes):
+        if len(sizes) < 5: return None
+        state = tuple(sizes[-4:])
+        big, small = 0, 0
+        for i in range(len(sizes) - 4):
+            if tuple(sizes[i:i+4]) == state:
+                if sizes[i+4] == 1: big += 1
+                else: small += 1
+        total = big + small
+        if total >= 2:
+            p = bayes_conf(big, total)
+            return {
+                'dir': 1 if p >= 0.5 else 0,
+                'conf': max(p, 1 - p),
+                'key': "Markov4",
+                'weight': 1.0
+            }
         return None
 
-    # --- HTML HYPER RULES ---
-    def analyze_hyper(self, nums, sizes):
-        n = min(10, len(nums))
-        if n < 3: return 0
-        use = nums[::-1][:n]
-        last = use[0]
-        avg = sum(use) / n
-        range_val = max(use) - min(use)
-        even = sum(1 for x in use if x % 2 == 0)
-        special = sum(1 for x in use if x == 0 or x == 5)
-        
-        vote = 0
-        # Avg
-        if avg >= 5.2: vote -= 2
-        elif avg <= 3.8: vote += 2
-        else: vote += -1 if last >= 5 else 1
-        
-        # Pattern ASC/DESC
-        if use[0] < use[1] < use[2]: vote += 1
-        elif use[0] > use[1] > use[2]: vote -= 1
-        
-        # Special 0/5
-        if special >= 2: vote += -1 if last >= 5 else 1
-        
-        # Streak
-        stk = 1
-        for i in range(1, min(20, len(sizes))):
-            if sizes[-1-i] == sizes[-1]: stk += 1
-            else: break
-        if stk >= 4: vote += 4 if sizes[-1] == 1 else -4
-        
-        return vote
+    def analyze_zscore(self, sizes):
+        if len(sizes) < 30: return None
+        w = sizes[-30:]
+        big_c = sum(w)
+        z = (big_c - 15) / math.sqrt(30 * 0.25)
+        if z > 1.5:
+            return {'dir': 0, 'conf': 0.7, 'key': "ZScore:S", 'weight': 1.2}
+        if z < -1.5:
+            return {'dir': 1, 'conf': 0.7, 'key': "ZScore:B", 'weight': 1.2}
+        return None
 
     def detect_mode(self, sizes):
         if len(sizes) < 20: return "MIXED"
@@ -360,70 +337,73 @@ class HyperMinerPredictor:
         mode = self.detect_mode(sizes)
         runs = self.extract_runs(sizes)
         
-        log_odds = 0.0
-        big_votes, small_votes = 0.0, 0.0
-        logic_tags = []
-        target_num = nums[-1] # default
+        signals = []
         
-        def add_signal(dir, conf, weight, key):
-            nonlocal log_odds, big_votes, small_votes
-            mult = self.pat_mult(key)
-            w = weight * mult
-            if dir == 1: big_votes += w
-            else: small_votes += w
-            log_odds += (1 if dir == 1 else -1) * logit(conf) * mult
-            logic_tags.append(key)
+        def add_sig(engine, res):
+            if not res: return
+            w = res['weight'] * self.get_engine_weight(engine) * self.vault_mult(res['key'])
+            signals.append({
+                'engine': engine,
+                'dir': res['dir'],
+                'conf': res['conf'],
+                'key': res['key'],
+                'weight': w
+            })
 
-        # 1. Run Pattern
-        rm = self.analyze_run(runs)
-        if rm:
-            add_signal(rm['dir'], rm['conf'], 2.0, rm['key'])
-            
-        # 2. Number Gap Pattern
-        nm = self.analyze_num_gaps(nums)
-        if nm:
-            add_signal(nm['dir'], nm['conf'], 1.5, nm['key'])
-            target_num = nm['num']
-            
-        # 3. Relation Pattern
-        rel = self.analyze_rel(nums, [])
-        if rel:
-            add_signal(rel['dir'], rel['conf'], 2.5, rel['key'])
-            target_num = rel['num']
-            
-        # 4. HYPER Rules
-        hx_vote = self.analyze_hyper(nums, sizes)
-        if hx_vote != 0:
-            hx_dir = 1 if hx_vote > 0 else 0
-            add_signal(hx_dir, 0.6, abs(hx_vote) * 0.5, "HYPER_RULE")
-            
-        # 5. Mode Override
+        add_sig('Pattern', self.analyze_run(runs))
+        add_sig('Pattern', self.analyze_num_gaps(nums))
+        add_sig('Markov', self.analyze_markov(sizes))
+        add_sig('ZScore', self.analyze_zscore(sizes))
+        
+        # Mode Override (Trend / Zigzag)
         if mode == "TREND" and runs[-1]['len'] >= 3:
-            add_signal(runs[-1]['side'], 0.7, 2.0, "TrendMode")
+            add_sig('Trend', {'dir': runs[-1]['side'], 'conf': 0.75, 'key': "TREND", 'weight': 2.0})
         elif mode == "ZIGZAG":
-            add_signal(1 - sizes[-1], 0.65, 2.0, "ZigzagMode")
+            add_sig('Trend', {'dir': 1-sizes[-1], 'conf': 0.65, 'key': "ZIGZAG", 'weight': 1.5})
 
-        # Final Decision
+        # Mixer (Log Odds)
+        log_odds = 0.0
+        for s in signals:
+            log_odds += (1 if s['dir'] == 1 else -1) * logit(s['conf']) * s['weight']
+
         pred_size = 1 if log_odds > 0 else 0
-        confidence = int(max(big_votes, small_votes) / (big_votes + small_votes + 1e-9) * 100)
-        confidence = min(85, max(52, confidence))
+        confidence = int(min(85, max(52, 50 + abs(log_odds) * 10)))
         
-        # Ensure target number matches predicted size
-        if pred_size == 1 and target_num < 5: target_num = 7
-        if pred_size == 0 and target_num >= 5: target_num = 3
+        # Loss Streak Protection
+        if self.loss_streak >= 2:
+            # In high loss streak, only trust ZScore and Strong Trend
+            safe_sigs = [s for s in signals if s['engine'] in ['ZScore', 'Trend']]
+            if safe_sigs:
+                safe_log_odds = sum((1 if s['dir'] == 1 else -1) * logit(s['conf']) * s['weight'] for s in safe_sigs)
+                pred_size = 1 if safe_log_odds > 0 else 0
+                confidence = 75
+                logic_tags = [s['key'] for s in safe_sigs]
+            else:
+                logic_tags = ["SAFE_MODE_NEUTRAL"]
+        else:
+            logic_tags = [s['key'] for s in signals]
 
-        logic_str = " + ".join(logic_tags[:3])
-        
+        # Target Number
+        target_num = 0
+        # Try to find from pattern
+        for s in signals:
+            if 'num' in s: target_num = s['num']; break
+            
+        if target_num == 0 or (pred_size == 1 and target_num < 5) or (pred_size == 0 and target_num >= 5):
+            pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
+            target_num = max(pool, key=lambda n: nums[-50:].count(n))
+
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": target_num,
             "confidence": confidence,
-            "logic": logic_str,
-            "mode": mode
+            "logic": " + ".join(logic_tags[:3]),
+            "mode": mode,
+            "sigs": [{"k": s['key'], "engine": s['engine'], "hit": 0} for s in signals]
         }
 
-PREDICTOR = HyperMinerPredictor()
+PREDICTOR = HyperQuantum()
 
 # =========================
 # FORMATTING
@@ -445,7 +425,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V135 FULL HYPER-MINER</i>
+⚡ <i>V137 HYPER-QUANTUM</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -463,7 +443,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V135 Hyper-Miner started...")
+    log.info("V137 Hyper-Quantum started...")
     last_processed_issue = None
 
     while True:
@@ -473,13 +453,18 @@ async def worker_loop(app, session):
                 
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
-                    if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
-                    else: PREDICTOR.loss_streak = 0
+                    if res['win']: PREDICTOR.loss_streak = 0
+                    else: PREDICTOR.loss_streak += 1
                     
-                    # Update Mistake Book
-                    if "Logic" in res:
-                        for k in res['mode'].split(" + "):
-                            STORE.update_book(k, 1 if "WIN" in res['status'] or "JACK" in res['status'] else 0)
+                    try:
+                        sigs = json.loads(res['sigs'])
+                        for s in sigs:
+                            STORE.update_vault(s['k'], 1 if res['win'] else 0)
+                            if s['engine'] in PREDICTOR.engine_stats:
+                                PREDICTOR.engine_stats[s['engine']]['total'] += 1
+                                if res['win']: PREDICTOR.engine_stats[s['engine']]['wins'] += 1
+                    except: pass
+                    PREDICTOR.vault = STORE.get_vault()
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -491,7 +476,7 @@ async def worker_loop(app, session):
                     if not STORE.prediction_exists(next_issue):
                         p = PREDICTOR.generate_prediction()
                         if p:
-                            STORE.save_prediction(p['issue'], p['size'], p['num'], p['mode'], p['logic'])
+                            STORE.save_prediction(p['issue'], p['size'], p['num'], p['mode'], p['logic'], p['sigs'])
                             recent = STORE.recent_outcomes(12)
                             await send_msg(app, format_prediction(p, recent))
                             last_processed_issue = latest_issue
@@ -508,7 +493,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V135 Hyper-Miner is running!")
+    return web.Response(text="V137 Hyper-Quantum is running!")
 
 async def main():
     CFG.validate()
