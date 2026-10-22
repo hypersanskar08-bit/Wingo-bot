@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import sqlite3
 import time
 from collections import Counter
@@ -31,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 6
-    bot_name: str = "V115 CONTRARIAN MATRIX"
+    bot_name: str = "V117 VENGEANCE OVERDRIVE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -53,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v115_contrarian")
+log = logging.getLogger("v117_vengeance")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -113,17 +114,14 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V115 CONTRARIAN ENGINE
+# V117 VENGEANCE PREDICTOR
 # =========================
-class ContrarianPredictor:
+class VengeancePredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # 7 Base Engines (No Weights, we use raw accuracy now)
         self.engines = ['pattern', 'markov', 'hash', 'chaos', 'quantum', 'cusum', 'entropy']
-        
-        # Track last 15 predictions accuracy for each engine
         self.engine_history = {name: [] for name in self.engines}
 
     async def fetch_data(self, session):
@@ -158,13 +156,11 @@ class ContrarianPredictor:
                     pred_size = 1 if p_big >= 0.5 else 0
                     is_correct = (pred_size == actual_size)
                     self.engine_history[name].append(1 if is_correct else 0)
-                    # Keep only last 15
-                    if len(self.engine_history[name]) > 15:
+                    if len(self.engine_history[name]) > 10: 
                         self.engine_history[name].pop(0)
         except Exception:
             pass
 
-    # --- ENGINES (Return raw p_big) ---
     def engine_hash(self, sizes):
         if len(sizes) < 6: return 0.5, "H_None"
         target_hash = tuple(sizes[-5:])
@@ -246,12 +242,7 @@ class ContrarianPredictor:
         if ent < 0.7: return (0.7 if p1 > 0.5 else 0.3), "Ent"
         return 0.5, "Ent_Rand"
 
-    def generate_prediction(self):
-        if len(self.history) < 50: return None
-        
-        sizes = [x["size"] for x in self.history]
-        nums = [x["num"] for x in self.history]
-        
+    def generate_normal_prediction(self, sizes, nums):
         raw_engines = {
             'hash': self.engine_hash(sizes),
             'chaos': self.engine_chaos(sizes),
@@ -267,54 +258,132 @@ class ContrarianPredictor:
         weighted_sum = 0
         total_w = 0
 
-        # --- 🔥 CONTRARIAN LOGIC ---
         for name, (p_big, label) in raw_engines.items():
             hist = self.engine_history[name]
             
-            # If not enough data, use default weight
             if len(hist) < 5:
-                acc = 0.5
                 weight = 1.0
                 final_engine_probs[name] = p_big
                 logic_tags.append(label)
             else:
                 acc = sum(hist) / len(hist)
-                
-                if acc > 0.55:
-                    # Good Engine: High weight, keep prediction
+                if acc >= 0.6:
                     weight = 2.0
                     final_engine_probs[name] = p_big
                     logic_tags.append(label)
-                elif acc < 0.45:
-                    # Bad Engine: INVERT PREDICTION, medium weight
+                elif acc <= 0.3: 
                     weight = 1.5
                     final_engine_probs[name] = 1.0 - p_big
                     logic_tags.append(f"INV_{label}")
                 else:
-                    # Random Engine: Ignore it (weight 0)
                     weight = 0.0
                     final_engine_probs[name] = p_big
 
             weighted_sum += final_engine_probs[name] * weight
             total_w += weight
 
-        if total_w == 0:
-            # Fallback if all engines are random
-            final_p_big = 0.5
-        else:
-            final_p_big = weighted_sum / total_w
+        matrix_p_big = weighted_sum / total_w if total_w > 0 else 0.5
+        matrix_pred = 1 if matrix_p_big >= 0.5 else 0
 
-        pred_size = 1 if final_p_big >= 0.5 else 0
-        confidence = int(abs(final_p_big - 0.5) * 2 * 100)
-        
-        # If tie happens, follow the last result (Momentum)
-        if 48 <= confidence <= 52:
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == sizes[-1]: streak += 1
+            else: break
+
+        pred_size = matrix_pred
+        logic = " + ".join(logic_tags[:3])
+
+        if streak >= 4:
             pred_size = sizes[-1]
-            final_p_big = 1.0 if pred_size == 1 else 0.0
-            confidence = 51
-            logic_tags.append("TieMomentum")
+            matrix_p_big = 1.0 if pred_size == 1 else 0.0
+            logic = f"TREND_LOCK({streak}x)"
+        elif abs(matrix_p_big - 0.5) < 0.02:
+            pred_size = sizes[-1]
+            matrix_p_big = 1.0 if pred_size == 1 else 0.0
+            logic = "Momentum"
 
+        confidence = int(abs(matrix_p_big - 0.5) * 2 * 100)
         confidence = min(92, max(51, confidence))
+        if streak >= 4: confidence = min(90, 65 + streak * 3)
+
+        return pred_size, confidence, logic, final_engine_probs
+
+    def generate_vengeance_prediction(self, sizes, nums):
+        """Ultra-Aggressive Mode after 1 Loss"""
+        logic_tags = []
+        v_big, v_small = 0.0, 0.0
+        
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == sizes[-1]: streak += 1
+            else: break
+            
+        # Rule 1: Streak Rider (Do not fight a strong trend)
+        if streak >= 4:
+            if sizes[-1] == 1: v_big += 3.0
+            else: v_small += 3.0
+            logic_tags.append(f"V_TrendRide({streak}x)")
+        elif streak == 3:
+            if sizes[-1] == 1: v_big += 1.5
+            else: v_small += 1.5
+            logic_tags.append("V_WeakTrend")
+        else:
+            # Rule 2: Mean Reversion (Z-score) if no strong trend
+            big_count = sizes[-30:].count(1)
+            big_ratio = big_count / 30.0
+            if big_ratio > 0.65:
+                v_small += 2.5
+                logic_tags.append("V_DeepBalance(S)")
+            elif big_ratio < 0.35:
+                v_big += 2.5
+                logic_tags.append("V_DeepBalance(B)")
+                
+        # Rule 3: Deep Order-5 Markov
+        order = 5
+        if len(sizes) > order:
+            state = tuple(sizes[-order:])
+            m_big, m_small = 0, 0
+            for i in range(len(sizes) - order):
+                if tuple(sizes[i:i+order]) == state:
+                    if sizes[i+order] == 1: m_big += 1
+                    else: m_small += 1
+            if m_big + m_small > 0:
+                if m_big > m_small:
+                    v_big += 2.0
+                    logic_tags.append(f"V_Markov5({m_big}B/{m_small}S)")
+                else:
+                    v_small += 2.0
+                    logic_tags.append(f"V_Markov5({m_big}B/{m_small}S)")
+
+        # Final Decision
+        if v_big > v_small:
+            pred_size = 1
+            prob = v_big / (v_big + v_small)
+        elif v_small > v_big:
+            pred_size = 0
+            prob = v_small / (v_big + v_small)
+        else:
+            pred_size = 0 if sizes[-1] == 1 else 1
+            prob = 0.6
+            logic_tags.append("V_Flip")
+            
+        # Extreme Confidence Calculation
+        confidence = int(70 + (prob * 20)) # Forced between 70% and 90%
+        
+        final_engine_probs = {'vengeance': (1.0 if pred_size == 1 else 0.0)}
+        return pred_size, confidence, " + ".join(logic_tags), final_engine_probs
+
+    def generate_prediction(self):
+        if len(self.history) < 50: return None
+        
+        sizes = [x["size"] for x in self.history]
+        nums = [x["num"] for x in self.history]
+        
+        # 🔥 CHOOSE MODE
+        if self.loss_streak >= 1:
+            pred_size, confidence, logic, engine_probs = self.generate_vengeance_prediction(sizes, nums)
+        else:
+            pred_size, confidence, logic, engine_probs = self.generate_normal_prediction(sizes, nums)
 
         # --- NUMBER MATRIX ---
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
@@ -345,19 +414,16 @@ class ContrarianPredictor:
                 best_score = score
                 best_num = n
 
-        # Only show first 3 logic tags to avoid spamming
-        logic = " + ".join(logic_tags[:3]) 
-        
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
             "logic": logic,
-            "engine_probs": final_engine_probs
+            "engine_probs": engine_probs
         }
 
-PREDICTOR = ContrarianPredictor()
+PREDICTOR = VengeancePredictor()
 
 # =========================
 # FORMATTING
@@ -367,7 +433,7 @@ def format_prediction(p, recent_rows):
     for r in recent_rows:
         recent_text += f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
 
-    mode = "🚨 RECOVERY" if PREDICTOR.loss_streak > 0 else "🧠 NORMAL"
+    mode = "🚨 VENGEANCE OVERDRIVE" if PREDICTOR.loss_streak > 0 else "🧠 NORMAL"
 
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
@@ -381,7 +447,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V115 CONTRARIAN MATRIX</i>
+⚡ <i>V117 VENGEANCE OVERDRIVE</i>
 """
 
 async def send_msg(app, text):
@@ -394,7 +460,7 @@ async def send_msg(app, text):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V115 Contrarian loop started...")
+    log.info("V117 Vengeance loop started...")
     while True:
         try:
             if await PREDICTOR.fetch_data(session):
@@ -406,7 +472,6 @@ async def worker_loop(app, session):
                     else: PREDICTOR.loss_streak = 0
                     
                     act_int = 1 if res['actual_size'] == 'BIG' else 0
-                    # 🔥 UPDATE ENGINE ACCURACY FOR CONTRARIAN LOGIC
                     PREDICTOR.update_engine_accuracy(res.get('engine_probs'), act_int)
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
@@ -434,7 +499,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V115 Contrarian is running perfectly!")
+    return web.Response(text="V117 Vengeance Overdrive is running perfectly!")
 
 async def main():
     CFG.validate()
