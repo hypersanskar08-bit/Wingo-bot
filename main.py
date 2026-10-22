@@ -31,7 +31,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 6
-    bot_name: str = "V114 OMNISCIENT MATRIX"
+    bot_name: str = "V115 CONTRARIAN MATRIX"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -53,7 +53,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v114_matrix")
+log = logging.getLogger("v115_contrarian")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -113,17 +113,18 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V114 OMNISCIENT PREDICTOR (NO SKIP)
+# V115 CONTRARIAN ENGINE
 # =========================
-class OmniscientMatrix:
+class ContrarianPredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
-        self.engines = {
-            'pattern': {'w': 1.0}, 'markov': {'w': 1.0}, 
-            'hash': {'w': 1.0}, 'chaos': {'w': 1.0}, 
-            'quantum': {'w': 1.0}, 'cusum': {'w': 1.0}, 'entropy': {'w': 1.0}
-        }
+        
+        # 7 Base Engines (No Weights, we use raw accuracy now)
+        self.engines = ['pattern', 'markov', 'hash', 'chaos', 'quantum', 'cusum', 'entropy']
+        
+        # Track last 15 predictions accuracy for each engine
+        self.engine_history = {name: [] for name in self.engines}
 
     async def fetch_data(self, session):
         try:
@@ -148,6 +149,22 @@ class OmniscientMatrix:
         except Exception:
             return False
 
+    def update_engine_accuracy(self, engine_probs_json, actual_size):
+        if not engine_probs_json: return
+        try:
+            probs = json.loads(engine_probs_json)
+            for name, p_big in probs.items():
+                if name in self.engine_history:
+                    pred_size = 1 if p_big >= 0.5 else 0
+                    is_correct = (pred_size == actual_size)
+                    self.engine_history[name].append(1 if is_correct else 0)
+                    # Keep only last 15
+                    if len(self.engine_history[name]) > 15:
+                        self.engine_history[name].pop(0)
+        except Exception:
+            pass
+
+    # --- ENGINES (Return raw p_big) ---
     def engine_hash(self, sizes):
         if len(sizes) < 6: return 0.5, "H_None"
         target_hash = tuple(sizes[-5:])
@@ -157,25 +174,18 @@ class OmniscientMatrix:
                 if sizes[i+5] == 1: big += 1
                 else: small += 1
         total = big + small
-        if total > 0:
-            return (big + 1) / (total + 2), f"Hash({total}x)"
+        if total > 0: return (big + 1) / (total + 2), f"Hash({total}x)"
         return 0.5, "H_None"
 
     def engine_chaos(self, sizes):
         if len(sizes) < 10: return 0.5, "Ch_None"
         x, y, z = sizes[-3], sizes[-2], sizes[-1]
-        best_dist = 999
-        next_val = 0.5
-        
+        best_dist, next_val = 999, 0.5
         for i in range(len(sizes) - 4):
-            hx, hy, hz = sizes[i], sizes[i+1], sizes[i+2]
-            dist = math.sqrt((x-hx)**2 + (y-hy)**2 + (z-hz)**2)
+            dist = math.sqrt((x-sizes[i])**2 + (y-sizes[i+1])**2 + (z-sizes[i+2])**2)
             if dist < best_dist:
-                best_dist = dist
-                next_val = sizes[i+3]
-                
-        if best_dist <= 1.0:
-            return (0.8 if next_val == 1 else 0.2), f"Chaos(d={best_dist:.1f})"
+                best_dist, next_val = dist, sizes[i+3]
+        if best_dist <= 1.0: return (0.8 if next_val == 1 else 0.2), f"Chaos({best_dist:.1f})"
         return 0.5, "Ch_None"
 
     def engine_quantum(self, sizes):
@@ -183,15 +193,12 @@ class OmniscientMatrix:
         wave_big, wave_small = 0, 0
         for i in range(10, 30):
             if len(sizes) < i: break
-            gap = i - 10
-            freq = 3.14 / (1 + gap) 
+            freq = 3.14 / (1 + (i - 10)) 
             if sizes[-i] == 1: wave_big += math.sin(freq)
             else: wave_small += math.sin(freq)
-                
         total = abs(wave_big) + abs(wave_small)
         if total == 0: return 0.5, "Q_None"
-        prob = abs(wave_big) / total
-        return prob, "Quantum"
+        return abs(wave_big) / total, "Quantum"
 
     def engine_pattern(self, sizes):
         for k in range(15, 3, -1):
@@ -203,8 +210,7 @@ class OmniscientMatrix:
                     if sizes[i+k] == 1: big += 1
                     else: small += 1
             total = big + small
-            if total >= 1:
-                return (big + 1) / (total + 2), f"P{k}"
+            if total >= 1: return (big + 1) / (total + 2), f"P{k}"
         return 0.5, "P_None"
 
     def engine_markov(self, sizes, order=4):
@@ -216,17 +222,15 @@ class OmniscientMatrix:
                 if sizes[i+order] == 1: big += 1
                 else: small += 1
         total = big + small
-        if total >= 1:
-            return (big + 1) / (total + 2), f"M{order}"
+        if total >= 1: return (big + 1) / (total + 2), f"M{order}"
         return 0.5, "M_None"
 
     def engine_cusum(self, sizes):
         if len(sizes) < 30: return 0.5, "CUSUM_None"
-        target = 0.5
         pos_sum, neg_sum = 0.0, 0.0
         for s in sizes[-30:]:
-            pos_sum = max(0, pos_sum + s - target - 0.1)
-            neg_sum = max(0, neg_sum - s + target - 0.1)
+            pos_sum = max(0, pos_sum + s - 0.6)
+            neg_sum = max(0, neg_sum - s + 0.4)
         if pos_sum > 2.0: return 0.75, "Shift_Big"
         if neg_sum > 2.0: return 0.25, "Shift_Small"
         return 0.5, "CUSUM_Neutral"
@@ -239,9 +243,7 @@ class OmniscientMatrix:
         ent = 0
         if p1 > 0: ent -= p1 * math.log2(p1)
         if p0 > 0: ent -= p0 * math.log2(p0)
-        if ent < 0.7:
-            if p1 > 0.5: return 0.7, "Ent_Big"
-            else: return 0.3, "Ent_Small"
+        if ent < 0.7: return (0.7 if p1 > 0.5 else 0.3), "Ent"
         return 0.5, "Ent_Rand"
 
     def generate_prediction(self):
@@ -250,42 +252,68 @@ class OmniscientMatrix:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        p_pat, l_pat = self.engine_pattern(sizes)
-        p_mark, l_mark = self.engine_markov(sizes, order=4)
-        p_hash, l_hash = self.engine_hash(sizes)
-        p_chaos, l_chaos = self.engine_chaos(sizes)
-        p_quant, l_quant = self.engine_quantum(sizes)
-        p_cusum, l_cusum = self.engine_cusum(sizes)
-        p_ent, l_ent = self.engine_entropy(sizes)
-        
-        engine_probs = {
-            'pattern': p_pat, 'markov': p_mark, 'hash': p_hash, 
-            'chaos': p_chaos, 'quantum': p_quant, 'cusum': p_cusum, 'entropy': p_ent
+        raw_engines = {
+            'hash': self.engine_hash(sizes),
+            'chaos': self.engine_chaos(sizes),
+            'quantum': self.engine_quantum(sizes),
+            'pattern': self.engine_pattern(sizes),
+            'markov': self.engine_markov(sizes, order=4),
+            'cusum': self.engine_cusum(sizes),
+            'entropy': self.engine_entropy(sizes)
         }
 
-        temp_mult = {k: 1.0 for k in engine_probs}
-        if self.loss_streak >= 1:
-            temp_mult['pattern'] = 0.1   
-            temp_mult['markov'] = 2.0    
-            temp_mult['cusum'] = 2.5     
-            temp_mult['chaos'] = 1.5     
-
+        final_engine_probs = {}
+        logic_tags = []
         weighted_sum = 0
         total_w = 0
-        for name, p_big in engine_probs.items():
-            w = self.engines[name]['w'] * temp_mult[name]
-            weighted_sum += p_big * w
-            total_w += w
 
-        final_p_big = weighted_sum / total_w if total_w > 0 else 0.5
-        
-        # Ensure no ties (force a prediction)
-        if final_p_big == 0.5:
-            final_p_big = 0.51 if sizes[-1] == 0 else 0.49
+        # --- 🔥 CONTRARIAN LOGIC ---
+        for name, (p_big, label) in raw_engines.items():
+            hist = self.engine_history[name]
             
+            # If not enough data, use default weight
+            if len(hist) < 5:
+                acc = 0.5
+                weight = 1.0
+                final_engine_probs[name] = p_big
+                logic_tags.append(label)
+            else:
+                acc = sum(hist) / len(hist)
+                
+                if acc > 0.55:
+                    # Good Engine: High weight, keep prediction
+                    weight = 2.0
+                    final_engine_probs[name] = p_big
+                    logic_tags.append(label)
+                elif acc < 0.45:
+                    # Bad Engine: INVERT PREDICTION, medium weight
+                    weight = 1.5
+                    final_engine_probs[name] = 1.0 - p_big
+                    logic_tags.append(f"INV_{label}")
+                else:
+                    # Random Engine: Ignore it (weight 0)
+                    weight = 0.0
+                    final_engine_probs[name] = p_big
+
+            weighted_sum += final_engine_probs[name] * weight
+            total_w += weight
+
+        if total_w == 0:
+            # Fallback if all engines are random
+            final_p_big = 0.5
+        else:
+            final_p_big = weighted_sum / total_w
+
         pred_size = 1 if final_p_big >= 0.5 else 0
-        
         confidence = int(abs(final_p_big - 0.5) * 2 * 100)
+        
+        # If tie happens, follow the last result (Momentum)
+        if 48 <= confidence <= 52:
+            pred_size = sizes[-1]
+            final_p_big = 1.0 if pred_size == 1 else 0.0
+            confidence = 51
+            logic_tags.append("TieMomentum")
+
         confidence = min(92, max(51, confidence))
 
         # --- NUMBER MATRIX ---
@@ -311,14 +339,14 @@ class OmniscientMatrix:
             f_score = (freq.get(n, 0) / 50) * 100
             
             score = (t_score * 0.5) + (g_score * 0.3) + (f_score * 0.2)
-            if n == (last_num + 1) % 10 or n == (last_num - 1 + 10) % 10:
-                score += 12
+            if n == (last_num + 1) % 10 or n == (last_num - 1 + 10) % 10: score += 12
                 
             if score > best_score:
                 best_score = score
                 best_num = n
 
-        logic = f"{l_hash} + {l_chaos} + {l_mark} + {l_cusum}"
+        # Only show first 3 logic tags to avoid spamming
+        logic = " + ".join(logic_tags[:3]) 
         
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -326,10 +354,10 @@ class OmniscientMatrix:
             "num": best_num,
             "confidence": confidence,
             "logic": logic,
-            "engine_probs": engine_probs
+            "engine_probs": final_engine_probs
         }
 
-PREDICTOR = OmniscientMatrix()
+PREDICTOR = ContrarianPredictor()
 
 # =========================
 # FORMATTING
@@ -339,7 +367,7 @@ def format_prediction(p, recent_rows):
     for r in recent_rows:
         recent_text += f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
 
-    mode = "🚨 HYPER-RECOVERY" if PREDICTOR.loss_streak > 0 else "🧠 NORMAL"
+    mode = "🚨 RECOVERY" if PREDICTOR.loss_streak > 0 else "🧠 NORMAL"
 
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
@@ -347,13 +375,13 @@ def format_prediction(p, recent_rows):
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
 📈 <b>Confidence</b>: {p['confidence']}%
-🧠 <b>Matrix Logic</b>: {h(p['logic'])}
+🧠 <b>Logic</b>: {h(p['logic'])}
 ⚖️ <b>Mode</b>: {mode}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V114 OMNISCIENT MATRIX</i>
+⚡ <i>V115 CONTRARIAN MATRIX</i>
 """
 
 async def send_msg(app, text):
@@ -366,7 +394,7 @@ async def send_msg(app, text):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V114 Matrix loop started...")
+    log.info("V115 Contrarian loop started...")
     while True:
         try:
             if await PREDICTOR.fetch_data(session):
@@ -376,6 +404,10 @@ async def worker_loop(app, session):
                 for res in resolved:
                     if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
                     else: PREDICTOR.loss_streak = 0
+                    
+                    act_int = 1 if res['actual_size'] == 'BIG' else 0
+                    # 🔥 UPDATE ENGINE ACCURACY FOR CONTRARIAN LOGIC
+                    PREDICTOR.update_engine_accuracy(res.get('engine_probs'), act_int)
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -402,7 +434,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V114 Omniscient Matrix is running perfectly!")
+    return web.Response(text="V115 Contrarian is running perfectly!")
 
 async def main():
     CFG.validate()
