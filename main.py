@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V129 ULTIMATE VENGEANCE"
+    bot_name: str = "V131 TRUE ENSEMBLE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v129_ultimate")
+log = logging.getLogger("v131_ensemble")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -113,9 +113,9 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V129 ULTIMATE MULTI-MODE PREDICTOR
+# V131 TRUE ENSEMBLE PREDICTOR
 # =========================
-class UltimatePredictor:
+class TrueEnsemblePredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -143,21 +143,17 @@ class UltimatePredictor:
         except Exception:
             return False
 
-    # --- ULTIMATE DEEP MARKOV ENGINE ---
     def engine_deep_markov(self, sizes):
         orders = [6, 5, 4, 3]
-        
         for order in orders:
             if len(sizes) < order + 5: continue
             target = sizes[-order:]
-            
             exact_big, exact_small = 0, 0
             fuzzy_big, fuzzy_small = 0, 0
             
             for i in range(len(sizes) - order):
                 window = sizes[i:i+order]
                 next_val = sizes[i+order]
-                
                 distance = sum(1 for a, b in zip(target, window) if a != b)
                 recency_weight = 0.95 ** (len(sizes) - (i + order))
                 
@@ -172,40 +168,43 @@ class UltimatePredictor:
             total_fuzzy = fuzzy_big + fuzzy_small
             
             if total_exact >= 0.5:
-                p_big = (exact_big + 0.5) / (total_exact + 1.0)
-                return p_big, f"M{order}_Exact"
-            
+                return (exact_big + 0.5) / (total_exact + 1.0), f"M{order}_Ex"
             if total_fuzzy >= 1.0:
-                p_big = (fuzzy_big + 0.5) / (total_fuzzy + 1.0)
-                return p_big, f"M{order}_Fuzzy"
-                
+                return (fuzzy_big + 0.5) / (total_fuzzy + 1.0), f"M{order}_Fz"
         return 0.5, "M_None"
 
-    def detect_market_mode(self, sizes):
-        if self.loss_streak >= 1:
-            return "VENGEANCE"
+    def engine_pattern(self, sizes):
+        for k in range(10, 3, -1):
+            if len(sizes) < k+1: continue
+            pat = tuple(sizes[-k:])
+            big, small = 0, 0
+            for i in range(len(sizes)-k):
+                if tuple(sizes[i:i+k]) == pat:
+                    if sizes[i+k] == 1: big += 1
+                    else: small += 1
+            if big+small >= 2: 
+                return (big+1)/(big+small+2), f"Pat{k}"
+        return 0.5, "Pat0"
 
+    def engine_zscore(self, sizes):
+        if len(sizes) < 30: return 0.5, "Z0"
+        w = sizes[-30:]
+        big_count = sum(w)
+        z = (big_count - 15) / math.sqrt(30 * 0.25)
+        if z > 1.5: return 0.1, f"Z_Core(S)"
+        if z < -1.5: return 0.9, f"Z_Core(B)"
+        return 0.5, "Z0"
+
+    def engine_trend(self, sizes):
+        if len(sizes) < 10: return 0.5, "T0"
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
             else: break
-            
+        
         if streak >= 3:
-            return "TREND"
-
-        if len(sizes) >= 30:
-            w = sizes[-30:]
-            big_count = sum(w)
-            z = (big_count - 15) / math.sqrt(30 * 0.25)
-            if z > 1.8 or z < -1.8:
-                return "EXTREME"
-
-        if len(sizes) >= 15:
-            switches = sum(1 for i in range(1, 15) if sizes[-i] != sizes[-i-1])
-            if switches >= 11:
-                return "CHOP"
-
-        return "NORMAL"
+            return (1.0 if sizes[-1] == 1 else 0.0), f"Trend{streak}x"
+        return 0.5, "T0"
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
@@ -213,79 +212,44 @@ class UltimatePredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        mode = self.detect_market_mode(sizes)
-        
-        # 🔥 FIX: Define streak here so it doesn't throw NameError
-        streak = 1
-        for i in range(len(sizes)-2, -1, -1):
-            if sizes[i] == sizes[-1]: streak += 1
-            else: break
+        # 1. Calculate all engines
+        p_mark, l_mark = self.engine_deep_markov(sizes)
+        p_pat, l_pat = self.engine_pattern(sizes)
+        p_z, l_z = self.engine_zscore(sizes)
+        p_trend, l_trend = self.engine_trend(sizes)
 
-        pred_size = 0
-        logic = ""
-        confidence = 60
+        is_vengeance = self.loss_streak >= 1
+        mode = "VENGEANCE" if is_vengeance else "NORMAL"
 
-        # ==========================================
-        # 🚨 VENGEANCE (Ultra Deep Mode)
-        # ==========================================
-        if mode == "VENGEANCE":
-            p_mark, l_mark = self.engine_deep_markov(sizes)
-            
-            p_z = 0.5
-            if len(sizes) >= 30:
-                w = sizes[-30:]
-                big_count = sum(w)
-                z = (big_count - 15) / math.sqrt(30 * 0.25)
-                if z > 1.5: p_z = 0.1
-                elif z < -1.5: p_z = 0.9
-
-            final_p = (p_mark * 0.6) + (p_z * 0.4)
-            pred_size = 1 if final_p >= 0.5 else 0
-            
-            logic = f"V_{l_mark} + V_ZCore"
-            confidence = 75 + int(abs(final_p - 0.5) * 20)
-
-        # ==========================================
-        # 📈 TREND
-        # ==========================================
-        elif mode == "TREND":
-            pred_size = sizes[-1]
-            logic = f"TREND_LOCK({streak}x)"
-            confidence = 75
-
-        # ==========================================
-        # ⚖️ EXTREME (Reversal)
-        # ==========================================
-        elif mode == "EXTREME":
-            w = sizes[-30:]
-            big_count = sum(w)
-            if big_count >= 20: 
-                pred_size = 0
-                logic = f"EXTREME_REVERSION"
-            else: 
-                pred_size = 1
-                logic = f"EXTREME_REVERSION"
-            confidence = 70
-
-        # ==========================================
-        # 🌪️ CHOP (Zigzag)
-        # ==========================================
-        elif mode == "CHOP":
-            pred_size = 1 - sizes[-1]
-            logic = "CHOP_ZIGZAG"
-            confidence = 65
-
-        # ==========================================
-        # 🧠 NORMAL (Pattern / Markov)
-        # ==========================================
+        # 2. Define Weights based on Mode
+        if is_vengeance:
+            # In Vengeance, Deep Markov and Z-Score get priority, but others still vote
+            weights = {'markov': 0.40, 'zscore': 0.30, 'pattern': 0.15, 'trend': 0.15}
         else:
-            p_pat, l_pat = self.engine_deep_markov(sizes)
-            pred_size = 1 if p_pat >= 0.5 else 0
-            logic = l_pat
-            confidence = int(abs(p_pat - 0.5) * 2 * 100)
-            confidence = min(75, max(55, confidence))
+            # In Normal, Pattern and Markov get priority
+            weights = {'markov': 0.30, 'zscore': 0.20, 'pattern': 0.30, 'trend': 0.20}
 
-        confidence = min(85, max(52, confidence))
+        # 3. Combine Votes
+        final_p_big = (
+            (p_mark * weights['markov']) + 
+            (p_z * weights['zscore']) + 
+            (p_pat * weights['pattern']) + 
+            (p_trend * weights['trend'])
+        )
+        
+        pred_size = 1 if final_p_big >= 0.5 else 0
+        confidence = int(abs(final_p_big - 0.5) * 2 * 100)
+        
+        # 4. Logic string
+        logic = f"{l_mark} + {l_pat} + {l_z}"
+
+        # 🔥 ANTI-LOW CONFIDENCE TRAP
+        if confidence <= 60:
+            pred_size = 1 - pred_size
+            logic = "CONTRARIAN_OVERRIDE"
+            confidence = 68
+
+        confidence = min(88, max(65, confidence))
 
         # Target Number
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
@@ -321,7 +285,7 @@ class UltimatePredictor:
             "mode": mode
         }
 
-PREDICTOR = UltimatePredictor()
+PREDICTOR = TrueEnsemblePredictor()
 
 # =========================
 # FORMATTING
@@ -343,7 +307,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V129 ULTIMATE VENGEANCE</i>
+⚡ <i>V131 TRUE ENSEMBLE</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -361,7 +325,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V129 Ultimate loop started...")
+    log.info("V131 True Ensemble started...")
     last_processed_issue = None
 
     while True:
@@ -401,7 +365,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V129 Ultimate is running!")
+    return web.Response(text="V131 True Ensemble is running!")
 
 async def main():
     CFG.validate()
