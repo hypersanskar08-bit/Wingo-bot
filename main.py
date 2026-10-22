@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V141 DEEP VENGEANCE"
+    bot_name: str = "V142 HYPER-QUANTUM PRO"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v141")
+log = logging.getLogger("v142")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -143,16 +143,16 @@ def logit(p):
     return math.log(p / (1 - p))
 
 # =========================
-# V141 DEEP VENGEANCE ENGINE
+# V142 HYPER-QUANTUM PRO
 # =========================
-class DeepVengeance:
+class HyperQuantumPro:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         self.vault = STORE.get_vault()
         
         self.engine_stats = {
-            'Pattern': {'wins': 0, 'total': 0},
+            'RunPattern': {'wins': 0, 'total': 0},
             'Markov': {'wins': 0, 'total': 0},
             'ZScore': {'wins': 0, 'total': 0},
             'Trend': {'wins': 0, 'total': 0},
@@ -194,7 +194,7 @@ class DeepVengeance:
         acc = (wins + 1) / (total + 2)
         return max(0.6, min(1.5, 1 + (acc - 0.5) * 4))
 
-    # --- EXACT CSV LOGIC: hxDigitScores (JACK MAKER) ---
+    # --- EXACT CSV LOGIC: hxDigitScores ---
     def get_best_number(self, data, side):
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
@@ -220,6 +220,53 @@ class DeepVengeance:
             
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
+
+    # --- HTML RUN PATTERN LOGIC ---
+    def extract_runs(self, seq):
+        runs = []
+        if not seq: return runs
+        curr, length = seq[0], 1
+        for x in seq[1:]:
+            if x == curr: length += 1
+            else:
+                runs.append({"side": curr, "len": length})
+                curr, length = x, 1
+        runs.append({"side": curr, "len": length})
+        return runs
+
+    def analyze_run(self, runs):
+        if len(runs) < 3: return None
+        ongoing = runs[-1]
+        best = None
+        
+        for k in range(min(13, len(runs)), 2, -1):
+            window = runs[-k:]
+            prefix = window[:-1]
+            cont, brk = 0, 0
+            for j in range(k, len(runs) - 1):
+                cand = runs[j]
+                if cand['len'] < ongoing['len']: continue
+                ok = True
+                for t in range(k - 1):
+                    if runs[j - (k - 1) + t]['len'] != prefix[t]['len']:
+                        ok = False
+                        break
+                if ok:
+                    if cand['len'] > ongoing['len']: cont += 1
+                    else: brk += 1
+            total = cont + brk
+            if total >= 3:
+                p_cont = bayes_conf(cont, total)
+                adj_p = 0.5 + (p_cont - 0.5) * sample_weight(total)
+                dir = ongoing['side'] if adj_p >= 0.5 else 1 - ongoing['side']
+                best = {
+                    'dir': dir,
+                    'conf': max(adj_p, 1 - adj_p),
+                    'key': f"Run{k}:{dir}",
+                    'weight': 1.5
+                }
+                break
+        return best
 
     # --- DEEP SIZE ENGINES ---
     def analyze_markov6(self, sizes):
@@ -262,6 +309,7 @@ class DeepVengeance:
         if len(self.history) < 50: return None
         
         sizes = [x["size"] for x in self.history]
+        runs = self.extract_runs(sizes)
         signals = []
         
         def add_sig(engine, res):
@@ -275,18 +323,18 @@ class DeepVengeance:
                 'weight': w
             })
 
-        # 🔥 DYNAMIC LOGIC
-        if self.loss_streak >= 2:
-            # VENGEANCE MODE: No Blind Follow. Deep Markov + Z-Score + Exhaustion
+        # 🔥 1 LOSS = VENGEANCE MODE
+        if self.loss_streak >= 1:
+            # No Pattern, No Trend. Only Pure Math.
             add_sig('ZScore', self.analyze_zscore(sizes))
             add_sig('Markov', self.analyze_markov6(sizes))
             add_sig('Exhaustion', self.analyze_exhaustion(sizes))
             
-            # If Vengeance engines fail, FORCE FLIP (Zigzag Vengeance)
             if not signals:
                 add_sig('Trend', {'dir': 1 - sizes[-1], 'conf': 0.65, 'key': "Zigzag_Vengeance", 'weight': 2.0})
         else:
-            # NORMAL MODE
+            # SUPER ADVANCED NORMAL MODE
+            add_sig('RunPattern', self.analyze_run(runs))
             add_sig('ZScore', self.analyze_zscore(sizes))
             add_sig('Markov', self.analyze_markov6(sizes))
             add_sig('Exhaustion', self.analyze_exhaustion(sizes))
@@ -304,7 +352,7 @@ class DeepVengeance:
             log_odds += (1 if s['dir'] == 1 else -1) * logit(s['conf']) * s['weight']
 
         if not signals:
-            pred_size = 1 - sizes[-1] # If totally blind, flip
+            pred_size = 1 - sizes[-1]
             confidence = 60
             logic_tags = ["ForceFlip"]
         else:
@@ -315,7 +363,7 @@ class DeepVengeance:
         # Target Number (CSV Logic)
         target_num = self.get_best_number(self.history, pred_size)
 
-        mode = "DEEP_VENGEANCE" if self.loss_streak >= 2 else "NORMAL"
+        mode = "DEEP_VENGEANCE" if self.loss_streak >= 1 else "HYPER_NORMAL"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -327,7 +375,7 @@ class DeepVengeance:
             "sigs": [{"k": s['key'], "engine": s['engine'], "hit": 0} for s in signals]
         }
 
-PREDICTOR = DeepVengeance()
+PREDICTOR = HyperQuantumPro()
 
 # =========================
 # FORMATTING
@@ -349,7 +397,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V141 DEEP VENGEANCE</i>
+⚡ <i>V142 HYPER-QUANTUM PRO</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -367,7 +415,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V141 Deep Vengeance started...")
+    log.info("V142 Hyper-Quantum Pro started...")
     last_processed_issue = None
 
     while True:
@@ -417,7 +465,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V141 Deep Vengeance is running!")
+    return web.Response(text="V142 Hyper-Quantum Pro is running!")
 
 async def main():
     CFG.validate()
