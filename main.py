@@ -26,8 +26,8 @@ from telegram.error import TimedOut, NetworkError
 # =========================
 @dataclass
 class Config:
-    telegram_token: str = os.environ.get("8611789455:AAFulww2_9jPKSwUdwAmTwZjYJw1KTPNisA", "")
-    chat_id_raw: str = os.environ.get("1264164655", "")
+    telegram_token: str = "8611789455:AAFulww2_9jPKSwUdwAmTwZjYJw1KTPNisA"
+    chat_id_raw: str = "1264164655"
     source_api_url: str = os.environ.get(
         "SOURCE_API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
