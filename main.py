@@ -2,14 +2,13 @@ import asyncio
 import contextlib
 import gc
 import html
-import itertools
 import json
 import logging
 import math
 import os
 import sqlite3
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -33,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V139 CSV-MATCHER"
+    bot_name: str = "V141 DEEP VENGEANCE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -55,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v139")
+log = logging.getLogger("v141")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -144,9 +143,9 @@ def logit(p):
     return math.log(p / (1 - p))
 
 # =========================
-# V139 CSV-MATCHER ENGINE
+# V141 DEEP VENGEANCE ENGINE
 # =========================
-class CSVMatcher:
+class DeepVengeance:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -156,7 +155,8 @@ class CSVMatcher:
             'Pattern': {'wins': 0, 'total': 0},
             'Markov': {'wins': 0, 'total': 0},
             'ZScore': {'wins': 0, 'total': 0},
-            'Trend': {'wins': 0, 'total': 0}
+            'Trend': {'wins': 0, 'total': 0},
+            'Exhaustion': {'wins': 0, 'total': 0}
         }
 
     async def fetch_data(self, session):
@@ -194,56 +194,8 @@ class CSVMatcher:
         acc = (wins + 1) / (total + 2)
         return max(0.6, min(1.5, 1 + (acc - 0.5) * 4))
 
-    # --- HTML LOGIC: Run Patterns ---
-    def extract_runs(self, seq):
-        runs = []
-        if not seq: return runs
-        curr, length = seq[0], 1
-        for x in seq[1:]:
-            if x == curr: length += 1
-            else:
-                runs.append({"side": curr, "len": length})
-                curr, length = x, 1
-        runs.append({"side": curr, "len": length})
-        return runs
-
-    def analyze_run(self, runs):
-        if len(runs) < 3: return None
-        ongoing = runs[-1]
-        best = None
-        
-        for k in range(min(13, len(runs)), 2, -1):
-            window = runs[-k:]
-            prefix = window[:-1]
-            cont, brk = 0, 0
-            for j in range(k, len(runs) - 1):
-                cand = runs[j]
-                if cand['len'] < ongoing['len']: continue
-                ok = True
-                for t in range(k - 1):
-                    if runs[j - (k - 1) + t]['len'] != prefix[t]['len']:
-                        ok = False
-                        break
-                if ok:
-                    if cand['len'] > ongoing['len']: cont += 1
-                    else: brk += 1
-            total = cont + brk
-            if total >= 3:
-                p_cont = bayes_conf(cont, total)
-                adj_p = 0.5 + (p_cont - 0.5) * sample_weight(total)
-                dir = ongoing['side'] if adj_p >= 0.5 else 1 - ongoing['side']
-                best = {
-                    'dir': dir,
-                    'conf': max(adj_p, 1 - adj_p),
-                    'key': f"Run{k}:{dir}",
-                    'weight': 1.5
-                }
-                break
-        return best
-
-    # --- EXACT HTML LOGIC: hxDigitScores ---
+    # --- EXACT CSV LOGIC: hxDigitScores (JACK MAKER) ---
     def get_best_number(self, data, side):
-        # data is the history list. We need newest first.
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
         
@@ -258,46 +210,58 @@ class CSVMatcher:
         
         scored = []
         for num in pool:
-            gp = d.index(num) if num in d else 60
+            gp = d.index(num) if num in pool else 60
             gg = min(gp, 30)
             tr = tm.get(f"{last_n}>{num}", 0)
             nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
             
-            # Formula from HTML
             s = gg * 1.2 + freq.get(num, 0) * 1.5 + tr * 3 + nh
             scored.append((s, num))
             
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
+    # --- DEEP SIZE ENGINES ---
+    def analyze_markov6(self, sizes):
+        order = 6
+        if len(sizes) < order + 5: return None
+        state = tuple(sizes[-order:])
+        big, small = 0, 0
+        for i in range(len(sizes) - order):
+            if tuple(sizes[i:i+order]) == state:
+                if sizes[i+order] == 1: big += 1
+                else: small += 1
+        total = big + small
+        if total >= 2:
+            p = bayes_conf(big, total)
+            return {'dir': 1 if p >= 0.5 else 0, 'conf': max(p, 1-p), 'key': f"Markov6", 'weight': 1.5}
+        return None
+
     def analyze_zscore(self, sizes):
         if len(sizes) < 30: return None
         w = sizes[-30:]
         big_c = sum(w)
         z = (big_c - 15) / math.sqrt(30 * 0.25)
-        if z > 1.5:
-            return {'dir': 0, 'conf': 0.7, 'key': "ZScore:S", 'weight': 1.2}
-        if z < -1.5:
-            return {'dir': 1, 'conf': 0.7, 'key': "ZScore:B", 'weight': 1.2}
+        if z > 1.8:
+            return {'dir': 0, 'conf': 0.8, 'key': "ZScore_Extreme", 'weight': 2.0}
+        if z < -1.8:
+            return {'dir': 1, 'conf': 0.8, 'key': "ZScore_Extreme", 'weight': 2.0}
         return None
 
-    def detect_mode(self, sizes):
-        if len(sizes) < 20: return "MIXED"
-        w = sizes[-20:]
-        switches = sum(1 for i in range(1, 20) if w[i] != w[i-1])
-        if switches >= 12: return "ZIGZAG"
-        if switches <= 8: return "TREND"
-        return "MIXED"
+    def analyze_exhaustion(self, sizes):
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == sizes[-1]: streak += 1
+            else: break
+            
+        if streak >= 5:
+            return {'dir': 1 - sizes[-1], 'conf': 0.75, 'key': f"Exhaustion({streak}x)", 'weight': 2.5}
+        return None
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
         
         sizes = [x["size"] for x in self.history]
-        nums = [x["num"] for x in self.history]
-        
-        mode = self.detect_mode(sizes)
-        runs = self.extract_runs(sizes)
-        
         signals = []
         
         def add_sig(engine, res):
@@ -311,39 +275,47 @@ class CSVMatcher:
                 'weight': w
             })
 
-        add_sig('Pattern', self.analyze_run(runs))
-        add_sig('ZScore', self.analyze_zscore(sizes))
-        
-        # Mode Override
-        if mode == "TREND" and runs[-1]['len'] >= 3:
-            add_sig('Trend', {'dir': runs[-1]['side'], 'conf': 0.75, 'key': "TREND_LOCK", 'weight': 2.0})
-        elif mode == "ZIGZAG":
-            add_sig('Trend', {'dir': 1-sizes[-1], 'conf': 0.65, 'key': "ZIGZAG_FLIP", 'weight': 1.5})
+        # 🔥 DYNAMIC LOGIC
+        if self.loss_streak >= 2:
+            # VENGEANCE MODE: No Blind Follow. Deep Markov + Z-Score + Exhaustion
+            add_sig('ZScore', self.analyze_zscore(sizes))
+            add_sig('Markov', self.analyze_markov6(sizes))
+            add_sig('Exhaustion', self.analyze_exhaustion(sizes))
+            
+            # If Vengeance engines fail, FORCE FLIP (Zigzag Vengeance)
+            if not signals:
+                add_sig('Trend', {'dir': 1 - sizes[-1], 'conf': 0.65, 'key': "Zigzag_Vengeance", 'weight': 2.0})
+        else:
+            # NORMAL MODE
+            add_sig('ZScore', self.analyze_zscore(sizes))
+            add_sig('Markov', self.analyze_markov6(sizes))
+            add_sig('Exhaustion', self.analyze_exhaustion(sizes))
+            
+            streak = 1
+            for i in range(len(sizes)-2, -1, -1):
+                if sizes[i] == sizes[-1]: streak += 1
+                else: break
+            if streak >= 3 and streak < 5:
+                add_sig('Trend', {'dir': sizes[-1], 'conf': 0.75, 'key': f"TrendLock({streak})", 'weight': 1.5})
 
         # Mixer
         log_odds = 0.0
         for s in signals:
             log_odds += (1 if s['dir'] == 1 else -1) * logit(s['conf']) * s['weight']
 
-        pred_size = 1 if log_odds > 0 else 0
-        confidence = int(min(85, max(52, 50 + abs(log_odds) * 10)))
-        
-        # Loss Streak Protection
-        if self.loss_streak >= 2:
-            safe_sigs = [s for s in signals if s['engine'] in ['ZScore', 'Trend']]
-            if safe_sigs:
-                safe_log_odds = sum((1 if s['dir'] == 1 else -1) * logit(s['conf']) * s['weight'] for s in safe_sigs)
-                pred_size = 1 if safe_log_odds > 0 else 0
-                confidence = 75
-                logic_tags = [s['key'] for s in safe_sigs]
-            else:
-                pred_size = sizes[-1]
-                logic_tags = ["SAFE_MODE_FOLLOW"]
+        if not signals:
+            pred_size = 1 - sizes[-1] # If totally blind, flip
+            confidence = 60
+            logic_tags = ["ForceFlip"]
         else:
+            pred_size = 1 if log_odds > 0 else 0
+            confidence = int(min(88, max(60, 50 + abs(log_odds) * 12)))
             logic_tags = [s['key'] for s in signals]
 
-        # Target Number (Exact HTML hxDigitScores Logic)
+        # Target Number (CSV Logic)
         target_num = self.get_best_number(self.history, pred_size)
+
+        mode = "DEEP_VENGEANCE" if self.loss_streak >= 2 else "NORMAL"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -355,7 +327,7 @@ class CSVMatcher:
             "sigs": [{"k": s['key'], "engine": s['engine'], "hit": 0} for s in signals]
         }
 
-PREDICTOR = CSVMatcher()
+PREDICTOR = DeepVengeance()
 
 # =========================
 # FORMATTING
@@ -377,7 +349,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V139 CSV-MATCHER (Exact Logic)</i>
+⚡ <i>V141 DEEP VENGEANCE</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -395,7 +367,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V139 CSV-Matcher started...")
+    log.info("V141 Deep Vengeance started...")
     last_processed_issue = None
 
     while True:
@@ -445,7 +417,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V139 CSV-Matcher is running!")
+    return web.Response(text="V141 Deep Vengeance is running!")
 
 async def main():
     CFG.validate()
