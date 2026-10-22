@@ -31,7 +31,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 6
-    bot_name: str = "V119 ULTIMATE OVERRIDE"
+    bot_name: str = "V121 ADAPTIVE DEEP LEARNING"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -53,21 +53,32 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v119_override")
+log = logging.getLogger("v121_adaptive")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
     def __init__(self, path: str):
         self.path = path
         with self._conn() as c:
+            # Predictions Table
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
                     status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT, logic TEXT, engine_probs TEXT, created_at REAL
                 )
             """)
-            try: c.execute("ALTER TABLE predictions ADD COLUMN engine_probs TEXT")
-            except sqlite3.OperationalError: pass
+            # Engine Weights Table (For 24/7 Learning)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS engine_weights (
+                    name TEXT PRIMARY KEY, weight REAL
+                )
+            """)
+            # Number Penalties Table
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS number_penalties (
+                    num INTEGER PRIMARY KEY, penalty REAL
+                )
+            """)
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=15)
@@ -110,16 +121,48 @@ class Storage:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
+    def load_weights(self):
+        with self._conn() as c:
+            rows = c.execute("SELECT name, weight FROM engine_weights").fetchall()
+            return {name: w for name, w in rows}
+
+    def save_weights(self, weights):
+        with self._conn() as c:
+            for name, w in weights.items():
+                c.execute("INSERT OR REPLACE INTO engine_weights (name, weight) VALUES (?, ?)", (name, w))
+
+    def load_number_penalties(self):
+        with self._conn() as c:
+            rows = c.execute("SELECT num, penalty FROM number_penalties").fetchall()
+            return {num: p for num, p in rows}
+
+    def save_number_penalties(self, penalties):
+        with self._conn() as c:
+            for num, p in penalties.items():
+                c.execute("INSERT OR REPLACE INTO number_penalties (num, penalty) VALUES (?, ?)", (num, p))
+
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V119 ULTIMATE PREDICTOR
+# V121 ADAPTIVE DEEP LEARNING
 # =========================
-class UltimateOverridePredictor:
+class AdaptiveDeepLearning:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
-        self.recent_results = [] # Track recent wins/losses
+        
+        # Load state from DB (24/7 Memory)
+        self.weights = STORE.load_weights()
+        self.number_penalties = STORE.load_number_penalties()
+        
+        # Default weights if DB is empty
+        for eng in ['pattern', 'markov', 'zscore', 'trendseq', 'fuzzy']:
+            if eng not in self.weights:
+                self.weights[eng] = 1.0
+
+        for n in range(10):
+            if n not in self.number_penalties:
+                self.number_penalties[n] = 1.0
 
     async def fetch_data(self, session):
         try:
@@ -144,8 +187,9 @@ class UltimateOverridePredictor:
         except Exception:
             return False
 
+    # --- ENGINE 1: DEEP PATTERN (10-Length) ---
     def engine_pattern(self, sizes):
-        for k in range(12, 3, -1):
+        for k in range(10, 3, -1):
             if len(sizes) < k + 1: continue
             pat = tuple(sizes[-k:])
             big, small = 0, 0
@@ -158,7 +202,9 @@ class UltimateOverridePredictor:
                 return (big + 1) / (total + 2), f"P{k}"
         return 0.5, "P_None"
 
-    def engine_markov(self, sizes, order=3):
+    # --- ENGINE 2: MARKOV-4 ---
+    def engine_markov(self, sizes):
+        order = 4
         if len(sizes) < order + 1: return 0.5, "M_None"
         state = tuple(sizes[-order:])
         big, small = 0, 0
@@ -168,28 +214,98 @@ class UltimateOverridePredictor:
                 else: small += 1
         total = big + small
         if total >= 2:
-            return (big + 1) / (total + 2), f"M{order}"
+            return (big + 1) / (total + 2), f"M4"
         return 0.5, "M_None"
 
-    def engine_trend(self, sizes):
-        if len(sizes) < 30: return 0.5, "T_None"
-        # SMA Crossover 5 vs 15
-        sma5 = sum(sizes[-5:]) / 5.0
-        sma15 = sum(sizes[-15:]) / 15.0
-        diff = sma5 - sma15
+    # --- ENGINE 3: Z-SCORE (Mean Reversion) ---
+    def engine_zscore(self, sizes):
+        if len(sizes) < 40: return 0.5, "Z_None"
+        w = sizes[-40:]
+        big_count = sum(w)
+        z = (big_count - 20) / math.sqrt(40 * 0.25)
         
-        if diff > 0.15: return 0.7, "Trend_Bull"
-        if diff < -0.15: return 0.3, "Trend_Bear"
-        return 0.5, "Trend_Neutral"
+        if z > 1.5: return 0.15, f"Z-Extreme({big_count}B)"
+        if z < -1.5: return 0.85, f"Z-Extreme({big_count}B)"
+        return 0.5, "Z_Neutral"
 
-    def engine_balance(self, sizes):
-        if len(sizes) < 30: return 0.5, "B_None"
-        big_count = sizes[-30:].count(1)
-        ratio = big_count / 30.0
-        # Mean Reversion
-        if ratio > 0.7: return 0.2, "Bal_Small" # Too many BIG, expect SMALL
-        if ratio < 0.3: return 0.8, "Bal_Big"   # Too many SMALL, expect BIG
-        return 0.5, "Bal_Neutral"
+    # --- ENGINE 4: TREND SEQUENCE (Adaptive) ---
+    def engine_trendseq(self, sizes):
+        if len(sizes) < 20: return 0.5, "T_None"
+        streak = 1
+        for i in range(len(sizes)-2, -1, -1):
+            if sizes[i] == sizes[-1]: streak += 1
+            else: break
+
+        # Search history for same streak length
+        breaks, conts = 0, 0
+        for i in range(len(sizes) - streak - 1):
+            if all(sizes[i+j] == sizes[-1] for j in range(streak)):
+                if i + streak < len(sizes):
+                    if sizes[i+streak] == sizes[-1]: conts += 1
+                    else: breaks += 1
+        
+        total = breaks + conts
+        if total >= 3:
+            if breaks > conts:
+                # Historically breaks, so we break
+                return (0.0 if sizes[-1] == 1 else 1.0), f"T-Break({breaks}/{total})"
+            else:
+                # Historically continues, so we continue
+                return (1.0 if sizes[-1] == 1 else 0.0), f"T-Cont({conts}/{total})"
+                
+        # Default momentum if no history
+        return (1.0 if sizes[-1] == 1 else 0.0), "T-Momentum"
+
+    # --- ENGINE 5: FUZZY PATTERN (80% Match) ---
+    def engine_fuzzy(self, sizes):
+        if len(sizes) < 12: return 0.5, "Fz_None"
+        target = sizes[-8:]
+        best_score = 0
+        next_val = 0.5
+        
+        for i in range(len(sizes) - 12):
+            window = sizes[i:i+8]
+            score = sum(1 for a, b in zip(target, window) if a == b)
+            if score >= 7:
+                best_score = score
+                next_val = sizes[i+8]
+                
+        if best_score >= 7:
+            return (0.8 if next_val == 1 else 0.2), f"Fz({best_score}/8)"
+        return 0.5, "Fz_None"
+
+    # ==========================================
+    # LEARNING MECHANISM (Update Weights)
+    # ==========================================
+    def update_learning(self, engine_probs_json, actual_size, pred_num, actual_num):
+        if not engine_probs_json: return
+        try:
+            probs = json.loads(engine_probs_json)
+            for name, p_big in probs.items():
+                if name in self.weights:
+                    pred_size = 1 if p_big >= 0.5 else 0
+                    
+                    # If engine was wrong, penalize weight
+                    if pred_size != actual_size:
+                        self.weights[name] = max(0.1, self.weights[name] - 0.1)
+                    else:
+                        self.weights[name] = min(3.0, self.weights[name] + 0.05)
+            
+            # Penalize Number if predicted wrong
+            if pred_num != actual_num:
+                self.number_penalties[pred_num] = max(0.2, self.number_penalties[pred_num] - 0.2)
+            else:
+                self.number_penalties[pred_num] = 1.0 # Reset penalty if hit
+
+            # Slowly recover penalties for other numbers
+            for n in self.number_penalties:
+                if n != pred_num:
+                    self.number_penalties[n] = min(1.0, self.number_penalties[n] + 0.05)
+
+            STORE.save_weights(self.weights)
+            STORE.save_number_penalties(self.number_penalties)
+        except Exception:
+            pass
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
@@ -197,41 +313,49 @@ class UltimateOverridePredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        # 1. Get Base Engine Votes
+        # Get raw engine outputs
         p_pat, l_pat = self.engine_pattern(sizes)
-        p_mark, l_mark = self.engine_markov(sizes, order=3)
-        p_trend, l_trend = self.engine_trend(sizes)
-        p_bal, l_bal = self.engine_balance(sizes)
+        p_mark, l_mark = self.engine_markov(sizes)
+        p_z, l_z = self.engine_zscore(sizes)
+        p_trend, l_trend = self.engine_trendseq(sizes)
+        p_fz, l_fz = self.engine_fuzzy(sizes)
 
-        # Combine (Equal Weights)
-        final_p_big = (p_pat * 0.35) + (p_mark * 0.25) + (p_trend * 0.20) + (p_bal * 0.20)
+        raw_probs = {'pattern': p_pat, 'markov': p_mark, 'zscore': p_z, 'trendseq': p_trend, 'fuzzy': p_fz}
+        final_probs = {}
+        logic_tags = []
         
-        # 2. Trend Lock Override
-        streak = 1
-        for i in range(len(sizes)-2, -1, -1):
-            if sizes[i] == sizes[-1]: streak += 1
-            else: break
+        weighted_sum = 0
+        total_w = 0
 
-        logic = f"{l_pat}+{l_mark}+{l_trend}"
-        if streak >= 4:
-            final_p_big = 1.0 if sizes[-1] == 1 else 0.0
-            logic = f"STRONG_TREND({streak}x)"
+        for name, p_big in raw_probs.items():
+            w = self.weights[name]
+            
+            # 🔥 ADAPTIVE INVERSION: If weight is too low, engine is failing. INVERT IT.
+            if w < 0.4:
+                final_probs[name] = 1.0 - p_big
+                logic_tags.append(f"INV_{name}")
+            else:
+                final_probs[name] = p_big
+                if p_big > 0.5: logic_tags.append(name)
 
+            weighted_sum += final_probs[name] * w
+            total_w += w
+
+        final_p_big = weighted_sum / total_w if total_w > 0 else 0.5
         pred_size = 1 if final_p_big >= 0.5 else 0
-
-        # 3. THE MAGIC: DYNAMIC INVERSION
-        if len(self.recent_results) >= 10:
-            recent_wins = sum(self.recent_results[-10:])
-            if recent_wins <= 4:
-                # If we are losing badly, INVERT the prediction
-                pred_size = 1 - pred_size
-                logic = "INVERTED_" + logic
-                final_p_big = 1.0 - final_p_big
-
         confidence = int(abs(final_p_big - 0.5) * 2 * 100)
-        confidence = min(85, max(52, confidence)) # Anti-Fake Confidence
 
-        # --- NUMBER MATRIX ---
+        # 🔥 CONTRARIAN OVERRIDE (If confused, invert)
+        if 48 <= confidence <= 55:
+            pred_size = 1 - pred_size
+            logic_tags.append("CONTRARIAN")
+            confidence = 65
+        
+        confidence = min(88, max(55, confidence))
+
+        # ==========================================
+        # DEEP NUMBER MATRIX (With Penalties)
+        # ==========================================
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         last_num = nums[-1]
         
@@ -253,25 +377,29 @@ class UltimateOverridePredictor:
             g_score = min(gaps[n], 30) / 30 * 100
             f_score = (freq.get(n, 0) / 50) * 100
             
+            # Base Score
             score = (t_score * 0.5) + (g_score * 0.3) + (f_score * 0.2)
-            if n == (last_num + 1) % 10 or n == (last_num - 1 + 10) % 10: score += 12
+            
+            # Neighbour Bonus
+            if n == (last_num + 1) % 10 or n == (last_num - 1 + 10) % 10: score += 15
+            
+            # 🔥 APPLY NUMBER PENALTY
+            score *= self.number_penalties[n]
                 
             if score > best_score:
                 best_score = score
                 best_num = n
 
-        engine_probs = {'pattern': p_pat, 'markov': p_mark, 'trend': p_trend, 'balance': p_bal}
-        
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "logic": logic,
-            "engine_probs": engine_probs
+            "logic": " + ".join(logic_tags[:3]),
+            "engine_probs": final_probs
         }
 
-PREDICTOR = UltimateOverridePredictor()
+PREDICTOR = AdaptiveDeepLearning()
 
 # =========================
 # FORMATTING
@@ -281,8 +409,6 @@ def format_prediction(p, recent_rows):
     for r in recent_rows:
         recent_text += f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
 
-    mode = "🚨 RECOVERY" if PREDICTOR.loss_streak > 0 else "🧠 NORMAL"
-
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
@@ -290,12 +416,11 @@ def format_prediction(p, recent_rows):
 
 📈 <b>Confidence</b>: {p['confidence']}%
 🧠 <b>Logic</b>: {h(p['logic'])}
-⚖️ <b>Mode</b>: {mode}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V119 ULTIMATE OVERRIDE</i>
+⚡ <i>V121 ADAPTIVE DEEP LEARNING</i>
 """
 
 async def send_msg(app, text):
@@ -308,7 +433,7 @@ async def send_msg(app, text):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V119 Ultimate loop started...")
+    log.info("V121 Adaptive loop started...")
     last_processed_issue = None
 
     while True:
@@ -318,17 +443,17 @@ async def worker_loop(app, session):
                 
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
-                    is_win = ("WIN" in res['status'] or "JACK" in res['status'])
+                    if "LOSS" in res['status']: PREDICTOR.loss_streak += 1
+                    else: PREDICTOR.loss_streak = 0
                     
-                    if is_win:
-                        PREDICTOR.loss_streak = 0
-                        PREDICTOR.recent_results.append(1)
-                    else:
-                        PREDICTOR.loss_streak += 1
-                        PREDICTOR.recent_results.append(0)
-                        
-                    if len(PREDICTOR.recent_results) > 20:
-                        PREDICTOR.recent_results.pop(0)
+                    # 🔥 UPDATE LEARNING BRAIN
+                    act_int = 1 if res['actual_size'] == 'BIG' else 0
+                    PREDICTOR.update_learning(
+                        res.get('engine_probs'), 
+                        act_int, 
+                        res.get('num'), 
+                        res.get('actual_num')
+                    )
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -336,7 +461,6 @@ async def worker_loop(app, session):
                 latest_issue = PREDICTOR.history[-1]["issue"]
                 next_issue = str(int(latest_issue) + 1)
                 
-                # 🔥 FIX: Prediction Miss Issue
                 if latest_issue != last_processed_issue:
                     if not STORE.prediction_exists(next_issue):
                         p = PREDICTOR.generate_prediction()
@@ -358,7 +482,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V119 Ultimate Override is running perfectly!")
+    return web.Response(text="V121 Adaptive Deep Learning is running!")
 
 async def main():
     CFG.validate()
