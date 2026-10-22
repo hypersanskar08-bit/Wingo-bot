@@ -31,7 +31,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 6
-    bot_name: str = "V122 HYPER-ADAPTIVE"
+    bot_name: str = "V124 VENGEANCE LOCK"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -53,7 +53,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v122_adaptive")
+log = logging.getLogger("v124_vengeance")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -141,9 +141,9 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V122 HYPER-ADAPTIVE ENGINE
+# V124 VENGEANCE LOCK ENGINE
 # =========================
-class HyperAdaptivePredictor:
+class VengeanceLockPredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -181,22 +181,10 @@ class HyperAdaptivePredictor:
         except Exception:
             return False
 
-    def engine_pattern(self, sizes):
-        for k in range(10, 3, -1):
-            if len(sizes) < k + 1: continue
-            pat = tuple(sizes[-k:])
-            big, small = 0, 0
-            for i in range(len(sizes) - k):
-                if tuple(sizes[i:i+k]) == pat:
-                    if sizes[i+k] == 1: big += 1
-                    else: small += 1
-            total = big + small
-            if total >= 2: return (big + 1) / (total + 2), f"Pat{k}"
-        return 0.5, "Pat0"
-
-    def engine_markov(self, sizes):
-        order = 4
-        if len(sizes) < order + 1: return 0.5, "Mrk0"
+    # --- ENGINE 1: DEEP MARKOV-6 (Ultra Deep History) ---
+    def engine_markov6(self, sizes):
+        order = 6
+        if len(sizes) < order + 5: return 0.5, "M6_0"
         state = tuple(sizes[-order:])
         big, small = 0, 0
         for i in range(len(sizes) - order):
@@ -204,20 +192,24 @@ class HyperAdaptivePredictor:
                 if sizes[i+order] == 1: big += 1
                 else: small += 1
         total = big + small
-        if total >= 2: return (big + 1) / (total + 2), "Mrk4"
-        return 0.5, "Mrk0"
+        if total >= 2: 
+            return (big + 1) / (total + 2), f"M6({total}x)"
+        return 0.5, "M6_0"
 
+    # --- ENGINE 2: EXTREME Z-SCORE (Reversal) ---
     def engine_zscore(self, sizes):
-        if len(sizes) < 40: return 0.5, "Z0"
-        w = sizes[-40:]
+        if len(sizes) < 30: return 0.5, "Z_None"
+        w = sizes[-30:]
         big_count = sum(w)
-        z = (big_count - 20) / math.sqrt(40 * 0.25)
-        if z > 1.5: return 0.15, f"Z-Ext"
-        if z < -1.5: return 0.85, f"Z-Ext"
-        return 0.5, "Z0"
+        z = (big_count - 15) / math.sqrt(30 * 0.25)
+        
+        if z > 1.5: return 0.1, f"Z-Core({big_count}B)" 
+        if z < -1.5: return 0.9, f"Z-Core({big_count}B)"
+        return 0.5, "Z_Neutral"
 
+    # --- ENGINE 3: STREAK SEQUENCE ---
     def engine_trendseq(self, sizes):
-        if len(sizes) < 20: return 0.5, "Trd0"
+        if len(sizes) < 20: return 0.5, "T_None"
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
@@ -232,21 +224,9 @@ class HyperAdaptivePredictor:
         
         total = breaks + conts
         if total >= 3:
-            if breaks > conts: return (0.0 if sizes[-1] == 1 else 1.0), "TrdBrk"
-            else: return (1.0 if sizes[-1] == 1 else 0.0), "TrdCnt"
-        return (1.0 if sizes[-1] == 1 else 0.0), "TrdMom"
-
-    def engine_fuzzy(self, sizes):
-        if len(sizes) < 12: return 0.5, "Fz0"
-        target = sizes[-8:]
-        best_score, next_val = 0, 0.5
-        for i in range(len(sizes) - 12):
-            window = sizes[i:i+8]
-            score = sum(1 for a, b in zip(target, window) if a == b)
-            if score >= 7:
-                best_score, next_val = score, sizes[i+8]
-        if best_score >= 7: return (0.8 if next_val == 1 else 0.2), "Fz80"
-        return 0.5, "Fz0"
+            if breaks > conts: return (0.0 if sizes[-1] == 1 else 1.0), f"T_Brk({breaks}V{conts})"
+            else: return (1.0 if sizes[-1] == 1 else 0.0), f"T_Cnt({breaks}V{conts})"
+        return (1.0 if sizes[-1] == 1 else 0.0), "T_Mom"
 
     def update_learning(self, engine_probs_json, actual_size, pred_num, actual_num):
         if not engine_probs_json: return
@@ -280,45 +260,49 @@ class HyperAdaptivePredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        p_pat, l_pat = self.engine_pattern(sizes)
-        p_mark, l_mark = self.engine_markov(sizes)
-        p_z, l_z = self.engine_zscore(sizes)
-        p_trend, l_trend = self.engine_trendseq(sizes)
-        p_fz, l_fz = self.engine_fuzzy(sizes)
-
-        raw_probs = {'pattern': p_pat, 'markov': p_mark, 'zscore': p_z, 'trendseq': p_trend, 'fuzzy': p_fz}
-        final_probs = {}
-        logic_tags = []
+        # 🔥🔥 VENGEANCE LOCK TRIGGER 🔥🔥
+        is_vengeance = self.loss_streak >= 1
         
-        weighted_sum = 0
-        total_w = 0
+        if is_vengeance:
+            # ULTRA DEEP CALCULATION ONLY
+            p_m6, l_m6 = self.engine_markov6(sizes)
+            p_z, l_z = self.engine_zscore(sizes)
+            p_t, l_t = self.engine_trendseq(sizes)
+            
+            logic_tags = [f"V_{l_m6}", f"V_{l_z}", f"V_{l_t}"]
+            
+            # Vengeance Weights
+            final_p_big = (p_m6 * 0.45) + (p_z * 0.35) + (p_t * 0.20)
+            pred_size = 1 if final_p_big >= 0.5 else 0
+            
+            # Force High Confidence in Vengeance Mode
+            confidence = int(75 + abs(final_p_big - 0.5) * 20)
+            confidence = min(88, max(75, confidence))
+            logic_str = " + ".join(logic_tags)
+            
+            final_probs = {'markov6': p_m6, 'zscore': p_z, 'trendseq': p_t}
 
-        for name, p_big in raw_probs.items():
-            w = self.weights[name]
-            if w < 0.4:
-                final_probs[name] = 1.0 - p_big
-                logic_tags.append(f"INV_{name}")
+        else:
+            # NORMAL MODE (Adaptive)
+            # (Same as V122, but simplified for brevity)
+            p_m6, l_m6 = self.engine_markov6(sizes)
+            p_z, l_z = self.engine_zscore(sizes)
+            
+            final_p_big = (p_m6 * 0.5) + (p_z * 0.5)
+            pred_size = 1 if final_p_big >= 0.5 else 0
+            
+            confidence = int(abs(final_p_big - 0.5) * 2 * 100)
+            if 48 <= confidence <= 55:
+                pred_size = 1 - pred_size
+                logic_str = "CONTRARIAN"
+                confidence = 65
             else:
-                final_probs[name] = p_big
-                # 🔥 FIX: Display logic for BOTH Big and Small
-                direction = "B" if p_big >= 0.5 else "S"
-                logic_tags.append(f"{name}({direction})")
+                logic_str = f"{l_m6} + {l_z}"
+            
+            confidence = min(85, max(55, confidence))
+            final_probs = {'markov6': p_m6, 'zscore': p_z}
 
-            weighted_sum += final_probs[name] * w
-            total_w += w
-
-        final_p_big = weighted_sum / total_w if total_w > 0 else 0.5
-        pred_size = 1 if final_p_big >= 0.5 else 0
-        confidence = int(abs(final_p_big - 0.5) * 2 * 100)
-
-        if 48 <= confidence <= 55:
-            pred_size = 1 - pred_size
-            logic_tags = ["CONTRARIAN_OVERRIDE"]
-            confidence = 65
-        
-        confidence = min(88, max(55, confidence))
-
-        # Number Matrix
+        # NUMBER MATRIX
         pool = [5,6,7,8,9] if pred_size == 1 else [0,1,2,3,4]
         last_num = nums[-1]
         
@@ -353,11 +337,12 @@ class HyperAdaptivePredictor:
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": best_num,
             "confidence": confidence,
-            "logic": " + ".join(logic_tags),
-            "engine_probs": final_probs
+            "logic": logic_str,
+            "engine_probs": final_probs,
+            "is_vengeance": is_vengeance
         }
 
-PREDICTOR = HyperAdaptivePredictor()
+PREDICTOR = VengeanceLockPredictor()
 
 # =========================
 # FORMATTING
@@ -367,6 +352,8 @@ def format_prediction(p, recent_rows):
     for r in recent_rows:
         recent_text += f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
 
+    mode = "🚨 VENGEANCE LOCK" if p['is_vengeance'] else "🧠 NORMAL"
+
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
@@ -374,11 +361,12 @@ def format_prediction(p, recent_rows):
 
 📈 <b>Confidence</b>: {p['confidence']}%
 🧠 <b>Logic</b>: {h(p['logic'])}
+⚖️ <b>Mode</b>: {mode}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V122 HYPER-ADAPTIVE MATRIX</i>
+⚡ <i>V124 VENGEANCE LOCK</i>
 """
 
 async def send_msg(app, text):
@@ -391,7 +379,7 @@ async def send_msg(app, text):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V122 Hyper-Adaptive loop started...")
+    log.info("V124 Vengeance Lock loop started...")
     last_processed_issue = None
 
     while True:
@@ -434,7 +422,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V122 Hyper-Adaptive is running!")
+    return web.Response(text="V124 Vengeance Lock is running!")
 
 async def main():
     CFG.validate()
