@@ -18,6 +18,7 @@ import aiohttp
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import TimedOut, NetworkError
 
 # =========================
 # CONFIG
@@ -30,8 +31,8 @@ class Config:
     db_path: str = "predictor.db"
     log_dir: str = "logs"
     fetch_every: float = 2.0
-    request_timeout: float = 6
-    bot_name: str = "V124 VENGEANCE LOCK"
+    request_timeout: float = 10.0 # Badha diya timeout
+    bot_name: str = "V125 ULTIMATE RECOVERY"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -53,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v124_vengeance")
+log = logging.getLogger("v125_ultimate")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -78,7 +79,7 @@ class Storage:
             """)
 
     def _conn(self):
-        c = sqlite3.connect(self.path, timeout=15)
+        c = sqlite3.connect(self.path, timeout=20)
         c.execute("PRAGMA journal_mode=TRUNCATE")
         return c
 
@@ -141,9 +142,9 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V124 VENGEANCE LOCK ENGINE
+# V125 ULTIMATE ENGINE
 # =========================
-class VengeanceLockPredictor:
+class UltimateRecoveryPredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -151,7 +152,7 @@ class VengeanceLockPredictor:
         self.weights = STORE.load_weights()
         self.number_penalties = STORE.load_number_penalties()
         
-        for eng in ['pattern', 'markov', 'zscore', 'trendseq', 'fuzzy']:
+        for eng in ['pattern', 'markov6', 'zscore', 'trendseq', 'numseq']:
             if eng not in self.weights:
                 self.weights[eng] = 1.0
         for n in range(10):
@@ -181,7 +182,6 @@ class VengeanceLockPredictor:
         except Exception:
             return False
 
-    # --- ENGINE 1: DEEP MARKOV-6 (Ultra Deep History) ---
     def engine_markov6(self, sizes):
         order = 6
         if len(sizes) < order + 5: return 0.5, "M6_0"
@@ -192,41 +192,30 @@ class VengeanceLockPredictor:
                 if sizes[i+order] == 1: big += 1
                 else: small += 1
         total = big + small
-        if total >= 2: 
-            return (big + 1) / (total + 2), f"M6({total}x)"
+        if total >= 2: return (big + 1) / (total + 2), f"M6({total}x)"
         return 0.5, "M6_0"
 
-    # --- ENGINE 2: EXTREME Z-SCORE (Reversal) ---
     def engine_zscore(self, sizes):
         if len(sizes) < 30: return 0.5, "Z_None"
         w = sizes[-30:]
         big_count = sum(w)
         z = (big_count - 15) / math.sqrt(30 * 0.25)
-        
         if z > 1.5: return 0.1, f"Z-Core({big_count}B)" 
         if z < -1.5: return 0.9, f"Z-Core({big_count}B)"
         return 0.5, "Z_Neutral"
 
-    # --- ENGINE 3: STREAK SEQUENCE ---
-    def engine_trendseq(self, sizes):
-        if len(sizes) < 20: return 0.5, "T_None"
-        streak = 1
-        for i in range(len(sizes)-2, -1, -1):
-            if sizes[i] == sizes[-1]: streak += 1
-            else: break
-
-        breaks, conts = 0, 0
-        for i in range(len(sizes) - streak - 1):
-            if all(sizes[i+j] == sizes[-1] for j in range(streak)):
-                if i + streak < len(sizes):
-                    if sizes[i+streak] == sizes[-1]: conts += 1
-                    else: breaks += 1
-        
-        total = breaks + conts
-        if total >= 3:
-            if breaks > conts: return (0.0 if sizes[-1] == 1 else 1.0), f"T_Brk({breaks}V{conts})"
-            else: return (1.0 if sizes[-1] == 1 else 0.0), f"T_Cnt({breaks}V{conts})"
-        return (1.0 if sizes[-1] == 1 else 0.0), "T_Mom"
+    def engine_numseq(self, nums):
+        if len(nums) < 15: return 0.5, "N_None"
+        target = tuple(nums[-3:])
+        big, small = 0, 0
+        for i in range(len(nums) - 3):
+            if tuple(nums[i:i+3]) == target:
+                if nums[i+3] >= 5: big += 1
+                else: small += 1
+        total = big + small
+        if total >= 2:
+            return (big + 1) / (total + 2), f"NumSeq({total}x)"
+        return 0.5, "N_None"
 
     def update_learning(self, engine_probs_json, actual_size, pred_num, actual_num):
         if not engine_probs_json: return
@@ -260,31 +249,24 @@ class VengeanceLockPredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        # 🔥🔥 VENGEANCE LOCK TRIGGER 🔥🔥
         is_vengeance = self.loss_streak >= 1
         
         if is_vengeance:
-            # ULTRA DEEP CALCULATION ONLY
+            # 🚨 VENGEANCE MODE
             p_m6, l_m6 = self.engine_markov6(sizes)
             p_z, l_z = self.engine_zscore(sizes)
-            p_t, l_t = self.engine_trendseq(sizes)
+            p_ns, l_ns = self.engine_numseq(nums)
             
-            logic_tags = [f"V_{l_m6}", f"V_{l_z}", f"V_{l_t}"]
-            
-            # Vengeance Weights
-            final_p_big = (p_m6 * 0.45) + (p_z * 0.35) + (p_t * 0.20)
+            final_p_big = (p_m6 * 0.4) + (p_z * 0.4) + (p_ns * 0.2)
             pred_size = 1 if final_p_big >= 0.5 else 0
             
-            # Force High Confidence in Vengeance Mode
-            confidence = int(75 + abs(final_p_big - 0.5) * 20)
-            confidence = min(88, max(75, confidence))
-            logic_str = " + ".join(logic_tags)
-            
-            final_probs = {'markov6': p_m6, 'zscore': p_z, 'trendseq': p_t}
-
+            # High Confidence Lock
+            confidence = int(80 + abs(final_p_big - 0.5) * 10)
+            confidence = min(88, max(78, confidence))
+            logic_str = f"V_{l_m6} + V_{l_z} + V_{l_ns}"
+            final_probs = {'markov6': p_m6, 'zscore': p_z, 'numseq': p_ns}
         else:
-            # NORMAL MODE (Adaptive)
-            # (Same as V122, but simplified for brevity)
+            # NORMAL MODE
             p_m6, l_m6 = self.engine_markov6(sizes)
             p_z, l_z = self.engine_zscore(sizes)
             
@@ -342,7 +324,7 @@ class VengeanceLockPredictor:
             "is_vengeance": is_vengeance
         }
 
-PREDICTOR = VengeanceLockPredictor()
+PREDICTOR = UltimateRecoveryPredictor()
 
 # =========================
 # FORMATTING
@@ -366,20 +348,30 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V124 VENGEANCE LOCK</i>
+⚡ <i>V125 ULTIMATE RECOVERY</i>
 """
 
-async def send_msg(app, text):
-    try:
-        await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
-    except Exception as e:
-        log.error(f"Send error: {e}")
+# 🔥🔥 ANTI-TIMEOUT SEND MESSAGE 🔥🔥
+async def send_msg(app, text, retries=3):
+    for attempt in range(retries):
+        try:
+            await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
+            return # Message sent successfully
+        except TimedOut:
+            log.warning(f"Timeout sending message (Attempt {attempt+1}/{retries})")
+            await asyncio.sleep(2) # Wait 2 seconds before retrying
+        except NetworkError as e:
+            log.warning(f"Network Error: {e} (Attempt {attempt+1}/{retries})")
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.error(f"Unexpected Send error: {e}")
+            break
 
 # =========================
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V124 Vengeance Lock loop started...")
+    log.info("V125 Ultimate loop started...")
     last_processed_issue = None
 
     while True:
@@ -422,7 +414,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V124 Vengeance Lock is running!")
+    return web.Response(text="V125 Ultimate is running!")
 
 async def main():
     CFG.validate()
@@ -435,15 +427,16 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", port).start()
     log.info(f"Web server running on port {port}")
 
-    app = Application.builder().token(CFG.telegram_token).build()
+    # Timeout settings for Telegram connection
+    request = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
     
-    async with app:
-        await app.start()
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        await app.updater.start_polling(drop_pending_updates=True)
+    async with request:
+        await request.start()
+        await request.bot.delete_webhook(drop_pending_updates=True)
+        await request.updater.start_polling(drop_pending_updates=True)
         
         async with aiohttp.ClientSession() as session:
-            bg_task = asyncio.create_task(worker_loop(app, session))
+            bg_task = asyncio.create_task(worker_loop(request, session))
             await asyncio.Event().wait()
 
 if __name__ == "__main__":
