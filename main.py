@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import random
 import sqlite3
 import time
 from collections import Counter
@@ -32,7 +31,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 6
-    bot_name: str = "V117 VENGEANCE OVERDRIVE"
+    bot_name: str = "V118 REVERSE APEX"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +53,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v117_vengeance")
+log = logging.getLogger("v118_reverse")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -114,9 +113,9 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V117 VENGEANCE PREDICTOR
+# V118 REVERSE APEX ENGINE
 # =========================
-class VengeancePredictor:
+class ReverseApexPredictor:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -242,6 +241,9 @@ class VengeancePredictor:
         if ent < 0.7: return (0.7 if p1 > 0.5 else 0.3), "Ent"
         return 0.5, "Ent_Rand"
 
+    # ==========================================
+    # NORMAL MODE (INVERTED)
+    # ==========================================
     def generate_normal_prediction(self, sizes, nums):
         raw_engines = {
             'hash': self.engine_hash(sizes),
@@ -302,44 +304,65 @@ class VengeancePredictor:
             matrix_p_big = 1.0 if pred_size == 1 else 0.0
             logic = "Momentum"
 
+        # 🔥🔥🔥 MAIN CHANGE: INVERT NORMAL PREDICTION 🔥🔥🔥
+        pred_size = 1 - pred_size
+        logic = "REVERSE_" + logic
+
         confidence = int(abs(matrix_p_big - 0.5) * 2 * 100)
         confidence = min(92, max(51, confidence))
         if streak >= 4: confidence = min(90, 65 + streak * 3)
 
         return pred_size, confidence, logic, final_engine_probs
 
+    # ==========================================
+    # VENGEANCE MODE (ULTRA DEEP)
+    # ==========================================
     def generate_vengeance_prediction(self, sizes, nums):
-        """Ultra-Aggressive Mode after 1 Loss"""
         logic_tags = []
         v_big, v_small = 0.0, 0.0
         
+        # 1. Streak & Trend
         streak = 1
         for i in range(len(sizes)-2, -1, -1):
             if sizes[i] == sizes[-1]: streak += 1
             else: break
             
-        # Rule 1: Streak Rider (Do not fight a strong trend)
-        if streak >= 4:
+        if streak >= 5:
+            if sizes[-1] == 1: v_big += 5.0
+            else: v_small += 5.0
+            logic_tags.append(f"V_MegaTrend({streak}x)")
+        elif streak == 4:
             if sizes[-1] == 1: v_big += 3.0
             else: v_small += 3.0
-            logic_tags.append(f"V_TrendRide({streak}x)")
+            logic_tags.append(f"V_StrongTrend({streak}x)")
         elif streak == 3:
-            if sizes[-1] == 1: v_big += 1.5
-            else: v_small += 1.5
-            logic_tags.append("V_WeakTrend")
-        else:
-            # Rule 2: Mean Reversion (Z-score) if no strong trend
-            big_count = sizes[-30:].count(1)
-            big_ratio = big_count / 30.0
-            if big_ratio > 0.65:
-                v_small += 2.5
-                logic_tags.append("V_DeepBalance(S)")
-            elif big_ratio < 0.35:
-                v_big += 2.5
-                logic_tags.append("V_DeepBalance(B)")
-                
-        # Rule 3: Deep Order-5 Markov
-        order = 5
+            # Deep check: Did 3-streaks usually break or continue?
+            breaks, conts = 0, 0
+            for i in range(len(sizes) - 3):
+                if sizes[i] == sizes[i+1] == sizes[i+2] == sizes[-1]:
+                    if sizes[i+3] == sizes[-1]: conts += 1
+                    else: breaks += 1
+            if breaks > conts:
+                if sizes[-1] == 1: v_small += 3.0
+                else: v_big += 3.0
+                logic_tags.append("V_StreakBreak")
+            else:
+                if sizes[-1] == 1: v_big += 2.0
+                else: v_small += 2.0
+                logic_tags.append("V_StreakCont")
+
+        # 2. Deep Mean Reversion (Over 50 periods)
+        big_count = sizes[-50:].count(1)
+        big_ratio = big_count / 50.0
+        if big_ratio > 0.70: 
+            v_small += 4.0
+            logic_tags.append("V_MassBalance(S)")
+        elif big_ratio < 0.30: 
+            v_big += 4.0
+            logic_tags.append("V_MassBalance(B)")
+            
+        # 3. Order-6 Markov (Ultra Deep History)
+        order = 6
         if len(sizes) > order:
             state = tuple(sizes[-order:])
             m_big, m_small = 0, 0
@@ -349,13 +372,27 @@ class VengeancePredictor:
                     else: m_small += 1
             if m_big + m_small > 0:
                 if m_big > m_small:
-                    v_big += 2.0
-                    logic_tags.append(f"V_Markov5({m_big}B/{m_small}S)")
+                    v_big += 3.0
+                    logic_tags.append(f"V_Mark6({m_big}B/{m_small}S)")
                 else:
-                    v_small += 2.0
-                    logic_tags.append(f"V_Markov5({m_big}B/{m_small}S)")
+                    v_small += 3.0
+                    logic_tags.append(f"V_Mark6({m_big}B/{m_small}S)")
 
-        # Final Decision
+        # 4. Number Sequence Pattern
+        last_nums = tuple(nums[-3:])
+        n_big, n_small = 0, 0
+        for i in range(len(nums) - 3):
+            if tuple(nums[i:i+3]) == last_nums:
+                if nums[i+3] >= 5: n_big += 1
+                else: n_small += 1
+        if n_big > n_small and n_big > 2:
+            v_big += 2.5
+            logic_tags.append("V_NumPat(B)")
+        elif n_small > n_big and n_small > 2:
+            v_small += 2.5
+            logic_tags.append("V_NumPat(S)")
+
+        # Final Vengeance Decision
         if v_big > v_small:
             pred_size = 1
             prob = v_big / (v_big + v_small)
@@ -364,11 +401,11 @@ class VengeancePredictor:
             prob = v_small / (v_big + v_small)
         else:
             pred_size = 0 if sizes[-1] == 1 else 1
-            prob = 0.6
-            logic_tags.append("V_Flip")
+            prob = 0.75
+            logic_tags.append("V_ChaosFlip")
             
-        # Extreme Confidence Calculation
-        confidence = int(70 + (prob * 20)) # Forced between 70% and 90%
+        confidence = int(75 + (prob * 20)) # 75% to 95%
+        confidence = min(95, confidence)
         
         final_engine_probs = {'vengeance': (1.0 if pred_size == 1 else 0.0)}
         return pred_size, confidence, " + ".join(logic_tags), final_engine_probs
@@ -379,7 +416,7 @@ class VengeancePredictor:
         sizes = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        # 🔥 CHOOSE MODE
+        # CHOOSE MODE
         if self.loss_streak >= 1:
             pred_size, confidence, logic, engine_probs = self.generate_vengeance_prediction(sizes, nums)
         else:
@@ -423,7 +460,7 @@ class VengeancePredictor:
             "engine_probs": engine_probs
         }
 
-PREDICTOR = VengeancePredictor()
+PREDICTOR = ReverseApexPredictor()
 
 # =========================
 # FORMATTING
@@ -433,7 +470,7 @@ def format_prediction(p, recent_rows):
     for r in recent_rows:
         recent_text += f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
 
-    mode = "🚨 VENGEANCE OVERDRIVE" if PREDICTOR.loss_streak > 0 else "🧠 NORMAL"
+    mode = "🚨 VENGEANCE OVERDRIVE" if PREDICTOR.loss_streak > 0 else "🔄 NORMAL (REVERSED)"
 
     return f"""
 📌 <b>Period No</b>: <code>{h(p['issue'][-4:])}</code>
@@ -447,7 +484,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V117 VENGEANCE OVERDRIVE</i>
+⚡ <i>V118 REVERSE APEX</i>
 """
 
 async def send_msg(app, text):
@@ -460,7 +497,7 @@ async def send_msg(app, text):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V117 Vengeance loop started...")
+    log.info("V118 Reverse Apex loop started...")
     while True:
         try:
             if await PREDICTOR.fetch_data(session):
@@ -499,7 +536,7 @@ async def worker_loop(app, session):
 # WEB SERVER & MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V117 Vengeance Overdrive is running perfectly!")
+    return web.Response(text="V118 Reverse Apex is running perfectly!")
 
 async def main():
     CFG.validate()
