@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V150 TITAN BREAKER"
+    bot_name: str = "V151 OMEGA REBORN"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v150")
+log = logging.getLogger("v151")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -64,7 +64,6 @@ class Storage:
 
     def _init_db(self):
         with self._conn() as c:
-            # Table create
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
@@ -72,12 +71,11 @@ class Storage:
                     mode TEXT, logic TEXT, sigs TEXT, created_at REAL
                 )
             """)
-            # 🔥 FIX: Auto-Migration for old DBs missing 'sigs'
+            # Fix for old database schema error
             try:
                 c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
-                log.info("Added 'sigs' column to existing database")
             except sqlite3.OperationalError:
-                pass # Column already exists
+                pass
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=20)
@@ -121,9 +119,9 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V150 TITAN BREAKER
+# V151 OMEGA ENGINE
 # =========================
-class TitanBreaker:
+class OmegaReborn:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -132,7 +130,7 @@ class TitanBreaker:
             'Markov': {'w': 2.0, 'l': 0},
             'ZScore': {'w': 1.5, 'l': 0},
             'CUSUM': {'w': 1.5, 'l': 0},
-            'Exhaustion': {'w': 2.0, 'l': 0}
+            'Chop': {'w': 1.5, 'l': 0}
         }
 
     async def fetch_data(self, session):
@@ -158,31 +156,29 @@ class TitanBreaker:
         except Exception:
             return False
 
+    # --- EXACT CSV LOGIC (JACK MAKER) ---
     def get_best_number(self, data, side):
-        d = [x['num'] for x in reversed(data[-80:])]
+        d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
         last_n = d[0]
-        trans = Counter()
-        for i in range(1, len(d)):
-            if d[i] == last_n: trans[d[i-1]] += 1
-        gaps = {i: 80 for i in range(10)}
-        for i in range(len(d)):
-            if gaps[d[i]] == 80: gaps[d[i]] = i
         freq = Counter(d[:30])
+        tm = Counter()
+        for i in range(1, len(d)):
+            tm[f"{d[i]}>{d[i-1]}"] += 1
         pool = [5, 6, 7, 8, 9] if side == 1 else [0, 1, 2, 3, 4]
         
-        best_num, best_score = pool[0], -999
-        for n in pool:
-            trans_score = trans.get(n, 0) * 4.0
-            gap_score = min(gaps[n], 30) * 1.5
-            freq_score = freq.get(n, 0) * 1.0
-            neigh_score = 3.0 if (n == (last_n + 1) % 10 or n == (last_n - 1 + 10) % 10) else 0
-            total = trans_score + gap_score + freq_score + neigh_score + (n * 0.01)
-            if total > best_score:
-                best_score = total
-                best_num = n
-        return best_num
+        scored = []
+        for num in pool:
+            gp = d.index(num) if num in pool else 60
+            gg = min(gp, 30)
+            tr = tm.get(f"{last_n}>{num}", 0)
+            nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
+            s = gg * 1.2 + freq.get(num, 0) * 1.5 + tr * 3 + nh
+            scored.append((s, num))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return scored[0][1] if scored else pool[0]
 
+    # --- MARKET REGIME ---
     def get_market_regime(self, seq):
         if len(seq) < 15: return "NORMAL"
         w = seq[-15:]
@@ -192,81 +188,7 @@ class TitanBreaker:
         if rate <= 0.40: return "TREND"
         return "NORMAL"
 
-    def signal_cusum(self, seq):
-        if len(seq) < 30: return 0
-        pos_sum, neg_sum = 0.0, 0.0
-        for s in seq[-30:]:
-            pos_sum = max(0, pos_sum + s - 0.6)
-            neg_sum = max(0, neg_sum - s + 0.4)
-        if pos_sum > 2.5: return 1
-        if neg_sum > 2.5: return 1
-        return 0
-    
-    def signal_exhaustion(self, seq):
-        streak = 1
-        for i in range(len(seq)-2, -1, -1):
-            if seq[i] == seq[-1]: streak += 1
-            else: break
-        if streak < 4: return 0
-        breaks, conts = 0, 0
-        for i in range(len(seq) - streak):
-            if all(seq[i+j] == seq[-1] for j in range(streak)):
-                if i + streak < len(seq):
-                    if seq[i+streak] == seq[-1]: conts += 1
-                    else: breaks += 1
-        total = breaks + conts
-        if total >= 2 and breaks / total >= 0.60: return 1
-        return 0
-    
-    def signal_volatility(self, seq):
-        if len(seq) < 10: return 0
-        w = seq[-10:]
-        last_side = seq[-1]
-        opposite_count = sum(1 for x in w[-5:] if x != last_side)
-        if opposite_count >= 1: return 1
-        return 0
-
-    def signal_ewma(self, seq):
-        if len(seq) < 20: return 0
-        alpha_s = 0.4
-        alpha_l = 0.1
-        ema_s = seq[-20]
-        ema_l = seq[-20]
-        for x in seq[-19:]:
-            ema_s = alpha_s * x + (1 - alpha_s) * ema_s
-            ema_l = alpha_l * x + (1 - alpha_l) * ema_l
-        diff = ema_s - ema_l
-        last_side = seq[-1]
-        if last_side == 1 and diff < -0.1: return 1
-        if last_side == 0 and diff > 0.1: return 1
-        return 0
-
-    def signal_antimarkov(self, seq):
-        order = 3
-        if len(seq) < order + 5: return 0
-        target = tuple(seq[-order:])
-        big, small = 0, 0
-        for i in range(len(seq) - order):
-            if tuple(seq[i:i+order]) == target:
-                if seq[i+order] == 1: big += 1
-                else: small += 1
-        total = big + small
-        if total >= 3:
-            if seq[-1] == 1 and small / total >= 0.70: return 1
-            if seq[-1] == 0 and big / total >= 0.70: return 1
-        return 0
-    
-    def calculate_break_score(self, seq):
-        signals = {
-            'CUSUM': self.signal_cusum(seq),
-            'Exhaustion': self.signal_exhaustion(seq),
-            'Volatility': self.signal_volatility(seq),
-            'EWMA': self.signal_ewma(seq),
-            'AntiMarkov': self.signal_antimarkov(seq)
-        }
-        total = sum(signals.values())
-        return total, signals
-
+    # --- DEEP MARKOV ---
     def analyze_markov(self, seq):
         for order in [5, 4, 3, 2]:
             if len(seq) < order + 5: continue
@@ -282,6 +204,7 @@ class TitanBreaker:
                 return (1 if p >= 0.5 else 0, max(p, 1-p)), f"M{order}"
         return None, ""
 
+    # --- Z-SCORE ---
     def analyze_zscore(self, seq):
         if len(seq) < 30: return None, ""
         w = seq[-30:]
@@ -301,47 +224,35 @@ class TitanBreaker:
         confidence = 60
         logic_tags = []
 
-        if regime == "ZIGZAG":
-            pred_size = 1 - last_size
-            confidence = 75
-            logic_tags = ["ZIGZAG_FLIP"]
+        # 🔥 FIX 1: MICRO-TREND LOCK (Sabse Important)
+        # Agar pichle 5 me 4 same side hain, toh trend ke against mat jao.
+        recent_5 = seq[-5:]
+        big_count = recent_5.count(1)
+        if big_count >= 4:
+            pred_size = 1
+            confidence = 80
+            logic_tags = ["MICRO_TREND_BIG"]
+        elif big_count <= 1:
+            pred_size = 0
+            confidence = 80
+            logic_tags = ["MICRO_TREND_SMALL"]
 
-        elif regime == "TREND":
-            streak = 1
-            for i in range(len(seq)-2, -1, -1):
-                if seq[i] == last_size: streak += 1
-                else: break
-
-            break_score, _ = self.calculate_break_score(seq)
-
-            if break_score >= 3:
-                pred_size = 1 - last_size
-                confidence = min(88, 70 + break_score * 3)
-                logic_tags = [f"BREAK({break_score}/5)"]
-                if break_score == 5:
-                    logic_tags = ["MEGA_BREAK(5/5)"]
-            elif break_score == 2:
-                pred_size = last_size
-                confidence = 60
-                logic_tags = [f"TREND_RIDE({streak}x)", f"Warn_Break({break_score}/5)"]
-            else:
-                pred_size = last_size
-                confidence = min(88, 70 + streak * 2)
-                logic_tags = [f"TREND_RIDE({streak}x)"]
-
+        # Agar micro-trend nahi hai, toh purana Omega logic chalega
         else:
-            signals = {}
-            zs, zs_tag = self.analyze_zscore(seq)
-            if zs: signals['ZScore'] = (zs, zs_tag)
-            mk, mk_tag = self.analyze_markov(seq)
-            if mk: signals['Markov'] = (mk, mk_tag)
-            
-            break_score, _ = self.calculate_break_score(seq)
-            if break_score >= 3:
+            if regime == "ZIGZAG":
                 pred_size = 1 - last_size
                 confidence = 75
-                logic_tags = ["NORMAL_BREAK"]
+                logic_tags = ["ZIGZAG_FLIP"]
+
             else:
+                signals = {}
+                zs, zs_tag = self.analyze_zscore(seq)
+                if zs: signals['ZScore'] = (zs, zs_tag)
+                
+                mk, mk_tag = self.analyze_markov(seq)
+                if mk: signals['Markov'] = (mk, mk_tag)
+
+                # Meta-Learner Mixer
                 log_odds = 0
                 for name, ((direction, conf), tag) in signals.items():
                     stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
@@ -359,7 +270,7 @@ class TitanBreaker:
                     confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
 
         target_num = self.get_best_number(self.history, pred_size)
-        mode = "VENGEANCE" if self.loss_streak >= 1 else "NORMAL"
+        mode = "OMEGA_REBORN"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -369,10 +280,10 @@ class TitanBreaker:
             "logic": " + ".join(logic_tags[:3]),
             "mode": mode,
             "regime": regime,
-            "sigs": list(self.engine_stats.keys()) # Safe default
+            "sigs": list(self.engine_stats.keys())
         }
 
-PREDICTOR = TitanBreaker()
+PREDICTOR = OmegaReborn()
 
 # =========================
 # FORMATTING
@@ -390,12 +301,11 @@ def format_prediction(p, recent_rows):
 📈 <b>Confidence</b>: {p['confidence']}%
 🧠 <b>Logic</b>: {h(p['logic'])}
 ⚖️ <b>Regime</b>: <b>{h(p['regime'])}</b>
-🔮 <b>Mode</b>: <b>{h(p['mode'])}</b>
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V150 TITAN BREAKER</i>
+⚡ <i>V151 OMEGA REBORN</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -413,7 +323,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V150 Titan Breaker started...")
+    log.info("V151 Omega Reborn started...")
     last_processed_issue = None
 
     while True:
@@ -426,7 +336,7 @@ async def worker_loop(app, session):
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
-                    # 🔥 FIX: Safely parse 'sigs' and avoid KeyError
+                    # Safely parse sigs
                     sigs_json = res.get('sigs')
                     if sigs_json:
                         try:
@@ -437,7 +347,7 @@ async def worker_loop(app, session):
                                     if res['win']: PREDICTOR.engine_stats[name]['w'] += 1
                                     else: PREDICTOR.engine_stats[name]['l'] += 1
                         except Exception:
-                            pass # Ignore if old DB has bad JSON
+                            pass
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -466,7 +376,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V150 Titan Breaker is running!")
+    return web.Response(text="V151 Omega Reborn is running!")
 
 async def main():
     CFG.validate()
@@ -482,7 +392,6 @@ async def main():
     
     async with app:
         await app.start()
-        # 🔥 FIX: Ensure webhook is deleted to clear old conflicts
         await app.bot.delete_webhook(drop_pending_updates=True)
         await app.updater.start_polling(drop_pending_updates=True)
         
@@ -492,4 +401,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
