@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import random
 import sqlite3
 import time
 from collections import Counter
@@ -33,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V161 HYBRID SYNC ENGINE"
+    bot_name: str = "V162 PATTERN-AI SYNC"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -55,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v161")
+log = logging.getLogger("v162")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -76,6 +75,11 @@ class Storage:
                 c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
             except sqlite3.OperationalError:
                 pass
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS model_weights (
+                    id INTEGER PRIMARY KEY, value REAL
+                )
+            """)
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=20)
@@ -115,20 +119,69 @@ class Storage:
         with self._conn() as c:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
+        
+    def save_weights(self, weights):
+        with self._conn() as c:
+            c.execute("DELETE FROM model_weights")
+            for i, w in enumerate(weights):
+                c.execute("INSERT INTO model_weights (id, value) VALUES (?, ?)", (i, w))
+                
+    def load_weights(self):
+        try:
+            with self._conn() as c:
+                rows = c.execute("SELECT value FROM model_weights ORDER BY id").fetchall()
+                return [r[0] for r in rows]
+        except Exception:
+            return None
 
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V161 HYBRID ENGINE (Patterns + Neural Net)
+# MATH HELPERS (Skew, Kurt, Autocorr)
 # =========================
-class HybridSyncEngine:
+def skewness(seq):
+    n = len(seq)
+    mean = sum(seq)/n
+    var = sum((x-mean)**2 for x in seq) / n
+    if var == 0: return 0
+    m3 = sum((x-mean)**3 for x in seq) / n
+    return m3 / (var**1.5)
+
+def kurtosis(seq):
+    n = len(seq)
+    mean = sum(seq)/n
+    var = sum((x-mean)**2 for x in seq) / n
+    if var == 0: return 0
+    m4 = sum((x-mean)**4 for x in seq) / n
+    return m4 / (var**2) - 3
+
+def autocorr(seq, lag):
+    n = len(seq)
+    if n <= lag: return 0
+    mean = sum(seq)/n
+    var = sum((x-mean)**2 for x in seq)
+    if var == 0: return 0
+    num = sum((seq[i]-mean)*(seq[i+lag]-mean) for i in range(n-lag))
+    return num / var
+
+# =========================
+# V162 ADVANCED NEURAL ENGINE
+# =========================
+class AdvancedPatternAI:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
+        self.lr = 0.05
         
-        # Weights for 20 features (Bias + Sizes + Markov + Math + Patterns)
-        self.weights = [random.uniform(-0.05, 0.05) for _ in range(20)]
-        self.lr = 0.05 
+        saved_weights = STORE.load_weights()
+        if saved_weights and len(saved_weights) == 28:
+            self.weights = saved_weights
+            self.warmed_up = True
+        else:
+            self.weights = [0.0] * 28
+            self.warmed_up = False
+            
+        self.save_counter = 0
 
     async def fetch_data(self, session):
         try:
@@ -153,92 +206,14 @@ class HybridSyncEngine:
         except Exception:
             return False
 
-    # --- 🔥 PATTERN EXTRACTION (Sync Logic) ---
-    def get_run_pattern_signal(self, seq):
-        runs = []
-        curr, count = seq[0], 1
-        for x in seq[1:]:
-            if x == curr: count += 1
-            else:
-                runs.append((curr, count))
-                curr, count = x, 1
-        runs.append((curr, count))
-        
-        n = len(runs)
-        if n < 3: return 0.0 # Neutral
-        
-        ongoing_side, ongoing_len = runs[-1]
-        
-        for k in [4, 3, 2]:
-            if n < k + 1: continue
-            target = [r[1] for r in runs[-k:]]
-            cont, brk = 0, 0
-            for j in range(k, n - 1):
-                cand = runs[j]
-                if cand[1] < ongoing_len: continue
-                ok = True
-                for t in range(k):
-                    if runs[j - k + t][1] != target[t]:
-                        ok = False
-                        break
-                if ok:
-                    if cand[1] > ongoing_len: cont += 1
-                    else: brk += 1
-                    
-            if cont + brk >= 2:
-                p_cont = (cont + 1) / (cont + brk + 2)
-                # Return a value between -1.0 and +1.0
-                if p_cont >= 0.5:
-                    return (1.0 if ongoing_side == 1 else -1.0) * p_cont
-                else:
-                    return (1.0 if 1 - ongoing_side == 1 else -1.0) * (1 - p_cont)
-        return 0.0
-
-    def get_gap_pattern_signal(self, nums):
-        N = len(nums)
-        if N < 10: return 0.0, -1
-        cur = N - 1
-        
-        # Simplified gap matching
-        for i in range(max(0, N - 15), N - 1):
-            if nums[i] != nums[cur]: continue
-            common = [0]
-            for d in range(1, 8):
-                if i - d >= 0 and nums[i-d] == nums[cur-d]:
-                    common.append(d)
-            if len(common) >= 3:
-                dist = Counter()
-                for j in range(max(common), N - 1):
-                    if all(nums[j - off] == nums[cur - off] for off in common):
-                        dist[nums[j+1]] += 1
-                if sum(dist.values()) >= 2:
-                    b_cnt = sum(v for k, v in dist.items() if k >= 5)
-                    s_cnt = sum(v for k, v in dist.items() if k < 5)
-                    p_big = (b_cnt + 1) / (b_cnt + s_cnt + 2)
-                    
-                    vote_side = 1 if p_big >= 0.5 else 0
-                    # Find best number
-                    pool = [5,6,7,8,9] if vote_side == 1 else [0,1,2,3,4]
-                    best_num = pool[0]
-                    max_c = 0
-                    for k, v in dist.items():
-                        if k in pool and v > max_c:
-                            max_c = v
-                            best_num = k
-                            
-                    signal = (1.0 if vote_side == 1 else -1.0) * max(p_big, 1 - p_big)
-                    return signal, best_num
-        return 0.0, -1
-
-    # --- 🔥 FEATURE EXTRACTION (Math + Patterns) ---
     def extract_features(self, seq, nums):
-        if len(seq) < 50: return None, -1
-        feat = [1.0] # Bias
+        if len(seq) < 50: return None
+        feat = [1.0] # 0. Bias
         
         # 1-5: Last 5 sizes
         for i in range(1, 6): feat.append(1.0 if seq[-i] == 1 else -1.0)
             
-        # 6-10: Markov Probabilities
+        # 6-10: Markov 2 to 6
         for order in [2, 3, 4, 5, 6]:
             target = tuple(seq[-order:])
             big, small = 0, 0
@@ -250,67 +225,210 @@ class HybridSyncEngine:
             p = (big + 1) / (total + 2) if total > 0 else 0.5
             feat.append((p - 0.5) * 2.0)
             
-        # 11-12: Z-Score
+        # 11: Z-Score (30)
         w30 = seq[-30:]
         z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
         feat.append(max(-2.0, min(2.0, z)) / 2.0)
         
-        # 13: CUSUM
+        # 12: CUSUM
         pos, neg = 0.0, 0.0
         for s in seq[-30:]:
             pos = max(0, pos + s - 0.6)
             neg = max(0, neg - s + 0.4)
         feat.append(max(-1.0, min(1.0, (pos - neg) / 3.0)))
         
-        # 14: Shannon Entropy
+        # 13: Entropy
         w20 = seq[-20:]
         p_big = sum(w20) / 20.0
         p_small = 1.0 - p_big
-        entropy = 0.0
-        if p_big > 0: entropy -= p_big * math.log2(p_big)
-        if p_small > 0: entropy -= p_small * math.log2(p_small)
-        feat.append((entropy - 0.5) * 2.0) 
+        ent = 0.0
+        if p_big > 0: ent -= p_big * math.log2(p_big)
+        if p_small > 0: ent -= p_small * math.log2(p_small)
+        feat.append((ent - 0.5) * 2.0)
         
-        # 15: Streak
+        # 14: Streak
         streak = 1
         for i in range(len(seq)-2, -1, -1):
             if seq[i] == seq[-1]: streak += 1
             else: break
         direction = 1.0 if seq[-1] == 1 else -1.0
         feat.append((min(10, streak) / 10.0) * direction)
-
-        # 16: Recent Momentum
+        
+        # 15: Momentum
         feat.append((sum(seq[-10:]) / 10.0 - 0.5) * 2.0)
         
-        # 🔥 17: RUN PATTERN SYNC
-        run_signal = self.get_run_pattern_signal(seq)
-        feat.append(run_signal)
+        # 16: Size Pattern (3-12)
+        sig_size_pattern = 0.0
+        for L in range(12, 2, -1):
+            if len(seq) < L + 5: continue
+            target = tuple(seq[-L:])
+            big, small = 0, 0
+            for i in range(len(seq) - L):
+                if tuple(seq[i:i+L]) == target:
+                    if seq[i+L] == 1: big += 1
+                    else: small += 1
+            total = big + small
+            if total >= 2:
+                p = (big + 1) / (total + 2)
+                sig_size_pattern = (p - 0.5) * 2.0
+                break
+        feat.append(sig_size_pattern)
         
-        # 🔥 18: GAP PATTERN SYNC
-        gap_signal, gap_num = self.get_gap_pattern_signal(nums)
-        feat.append(gap_signal)
+        # 17: Number Pattern (3-6)
+        sig_num_pattern = 0.0
+        for L in range(6, 2, -1):
+            if len(nums) < L + 5: continue
+            target = tuple(nums[-L:])
+            big, small = 0, 0
+            for i in range(len(nums) - L):
+                if tuple(nums[i:i+L]) == target:
+                    if nums[i+L] >= 5: big += 1
+                    else: small += 1
+            total = big + small
+            if total >= 1:
+                p = (big + 1) / (total + 2)
+                sig_num_pattern = (p - 0.5) * 2.0
+                break
+        feat.append(sig_num_pattern)
         
-        # 19: Recent 5 BIG count
+        # 18: Single Number Repetition (7-12)
+        sig_single = 0.0
+        if len(nums) >= 12:
+            recent_10 = nums[-10:]
+            freq = Counter(recent_10)
+            dominant, count = freq.most_common(1)[0]
+            if count >= 4:
+                follow_big, follow_small = 0, 0
+                for i in range(len(nums) - 10):
+                    w = nums[i:i+10]
+                    if w.count(dominant) >= count:
+                        if i+10 < len(nums):
+                            if nums[i+10] >= 5: follow_big += 1
+                            else: follow_small += 1
+                total = follow_big + follow_small
+                if total >= 2:
+                    p = (follow_big + 1) / (total + 2)
+                    sig_single = (p - 0.5) * 2.0
+        feat.append(sig_single)
+        
+        # 19: Trend Shift (After 6-Pattern)
+        sig_trend = 0.0
+        if len(seq) >= 15:
+            target = tuple(seq[-6:])
+            last_side = seq[-1]
+            follow_same, follow_opp = 0, 0
+            for i in range(len(seq) - 6):
+                if tuple(seq[i:i+6]) == target:
+                    if seq[i+6] == last_side: follow_same += 1
+                    else: follow_opp += 1
+            total = follow_same + follow_opp
+            if total >= 2:
+                p_same = (follow_same + 1) / (total + 2)
+                p_big = p_same if last_side == 1 else (1 - p_same)
+                sig_trend = (p_big - 0.5) * 2.0
+        feat.append(sig_trend)
+        
+        # 20-22: Autocorrelation
+        ac1 = max(-1, min(1, autocorr(seq[-30:], 1)))
+        ac2 = max(-1, min(1, autocorr(seq[-30:], 2)))
+        ac3 = max(-1, min(1, autocorr(seq[-30:], 3)))
+        feat.append(ac1)
+        feat.append(ac2)
+        feat.append(ac3)
+        
+        # 23: Skewness
+        sk = max(-2, min(2, skewness(seq[-30:])))
+        feat.append(sk / 2.0)
+        
+        # 24: Kurtosis
+        ku = max(-3, min(3, kurtosis(seq[-30:])))
+        feat.append(ku / 3.0)
+        
+        # 25: Variance
+        var_val = sum((x-0.5)**2 for x in seq[-30:]) / 30.0
+        std = math.sqrt(var_val)
+        feat.append(min(1.0, std * 2.0))
+        
+        # 26: Recent 5 Big count
         feat.append((sum(seq[-5:]) / 5.0 - 0.5) * 2.0)
         
-        # 20: Recent 5 SMALL count
+        # 27: Recent 5 Small count
         feat.append((sum(1 for x in seq[-5:] if x==0) / 5.0 - 0.5) * 2.0)
         
-        return feat, gap_num # Total 20 features
+        # Ensure 28 features
+        while len(feat) < 28: feat.append(0.0)
+        return feat[:28]
 
     def sigmoid(self, x):
         try: return 1 / (1 + math.exp(-max(-20, min(20, x))))
         except OverflowError: return 0.0 if x < 0 else 1.0
 
     def train_model(self, feat, actual_size):
-        if not feat or len(feat) != 20: return
+        if not feat or len(feat) != 28: return
         z = sum(w * f for w, f in zip(self.weights, feat))
         pred = self.sigmoid(z)
         
         error = actual_size - pred
-        for i in range(20):
+        for i in range(28):
             reg = 0.001 * self.weights[i]
             self.weights[i] += self.lr * (error * feat[i] - reg)
+            
+        self.save_counter += 1
+        if self.save_counter % 10 == 0:
+            STORE.save_weights(self.weights)
+
+    def get_best_number(self, data, side):
+        """Advance Pattern Number Prediction"""
+        nums = [x['num'] for x in data]
+        
+        # 1. Long Pattern (Single Number Repetition)
+        recent_10 = nums[-10:]
+        freq = Counter(recent_10)
+        dominant, count = freq.most_common(1)[0]
+        if count >= 4:
+            next_nums = []
+            for i in range(len(nums) - 10):
+                w = nums[i:i+10]
+                if w.count(dominant) >= count:
+                    if i+10 < len(nums):
+                        next_nums.append(nums[i+10])
+            if next_nums:
+                pool_next = [n for n in next_nums if (n >= 5) == (side == 1)]
+                if pool_next:
+                    return Counter(pool_next).most_common(1)[0][0]
+        
+        # 2. Short Pattern (Exact Match)
+        for L in [6, 5, 4, 3]:
+            if len(nums) < L + 5: continue
+            target = tuple(nums[-L:])
+            follows = []
+            for i in range(len(nums) - L):
+                if tuple(nums[i:i+L]) == target:
+                    if i+L < len(nums):
+                        follows.append(nums[i+L])
+            if follows:
+                pool_follows = [n for n in follows if (n >= 5) == (side == 1)]
+                if pool_follows:
+                    return Counter(pool_follows).most_common(1)[0][0]
+                    
+        # 3. CSV Logic Fallback
+        d = nums[::-1]
+        last_n = d[0]
+        freq30 = Counter(d[:30])
+        tm = Counter()
+        for i in range(1, len(d)): tm[f"{d[i]}>{d[i-1]}"] += 1
+        pool = [5, 6, 7, 8, 9] if side == 1 else [0, 1, 2, 3, 4]
+        
+        scored = []
+        for num in pool:
+            gp = d.index(num) if num in pool else 60
+            gg = min(gp, 30)
+            tr = tm.get(f"{last_n}>{num}", 0)
+            nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
+            s = gg * 1.2 + freq30.get(num, 0) * 1.5 + tr * 3 + nh
+            scored.append((s, num))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return scored[0][1]
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
@@ -318,34 +436,48 @@ class HybridSyncEngine:
         seq = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        feat, gap_num = self.extract_features(seq, nums)
+        if not self.warmed_up and len(self.history) >= 80:
+            print("Warmup training started...")
+            for _ in range(3):
+                for i in range(50, len(self.history)):
+                    p_seq = seq[:i]
+                    p_nums = nums[:i]
+                    p_feat = self.extract_features(p_seq, p_nums)
+                    if p_feat:
+                        z = sum(w * f for w, f in zip(self.weights, p_feat))
+                        pred = self.sigmoid(z)
+                        err = self.history[i]["size"] - pred
+                        for j in range(28):
+                            reg = 0.001 * self.weights[j]
+                            self.weights[j] += self.lr * (err * p_feat[j] - reg)
+            STORE.save_weights(self.weights)
+            self.warmed_up = True
+            print("Warmup done.")
+        
+        feat = self.extract_features(seq, nums)
         if not feat: return None
         
         z = sum(w * f for w, f in zip(self.weights, feat))
         p_big = self.sigmoid(z)
         
+        # Advanced Recovery Logic
+        if self.loss_streak >= 1:
+            pattern_signal = (feat[16] + feat[17] + feat[18] + feat[19]) / 4.0
+            p_big = p_big * 0.6 + (0.5 + pattern_signal / 2.0) * 0.4
+            
         pred_size = 1 if p_big >= 0.5 else 0
-        
         conf_val = p_big if pred_size == 1 else (1 - p_big)
         confidence = int(min(88, max(52, conf_val * 100)))
         
-        # Determine Logic
         logic_tags = []
-        if feat[16] != 0: logic_tags.append("RunPattern")
-        if feat[17] != 0: logic_tags.append("GapPattern")
-        if abs(feat[12]) > 0.5: logic_tags.append("CUSUM")
-        if abs(feat[11]) > 0.5: logic_tags.append("ZScore")
-        
+        if feat[16] != 0: logic_tags.append("SzPattern")
+        if feat[17] != 0: logic_tags.append("NumPattern")
+        if feat[18] != 0: logic_tags.append("SingleRep")
+        if feat[19] != 0: logic_tags.append("TrendShift")
         if not logic_tags: logic_tags.append("PureMath")
-        logic_tags.append("AI_Sync")
-
-        mode = "RECOVERY" if self.loss_streak >= 1 else "HYBRID_SYNC"
         
-        # Target Number: Use Gap Num if found, else CSV logic
-        if gap_num != -1 and (gap_num >= 5) == (pred_size == 1):
-            target_num = gap_num
-        else:
-            target_num = self.get_csv_number(nums, pred_size)
+        mode = "RECOVERY" if self.loss_streak >= 1 else "NEURAL_PATTERN"
+        target_num = self.get_best_number(self.history, pred_size)
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -357,26 +489,7 @@ class HybridSyncEngine:
             "sigs": logic_tags
         }
 
-    def get_csv_number(self, nums, side):
-        d = nums[::-1]
-        last_n = d[0]
-        freq = Counter(d[:30])
-        tm = Counter()
-        for i in range(1, len(d)): tm[f"{d[i]}>{d[i-1]}"] += 1
-        pool = [5, 6, 7, 8, 9] if side == 1 else [0, 1, 2, 3, 4]
-        
-        scored = []
-        for num in pool:
-            gp = d.index(num) if num in pool else 60
-            gg = min(gp, 30)
-            tr = tm.get(f"{last_n}>{num}", 0)
-            nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
-            s = gg * 1.2 + freq.get(num, 0) * 1.5 + tr * 3 + nh
-            scored.append((s, num))
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return scored[0][1]
-
-PREDICTOR = HybridSyncEngine()
+PREDICTOR = AdvancedPatternAI()
 
 # =========================
 # FORMATTING
@@ -398,7 +511,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V161 HYBRID SYNC ENGINE</i>
+⚡ <i>V162 PATTERN-AI SYNC</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -416,7 +529,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V161 Hybrid Sync started...")
+    log.info("V162 Advanced Pattern AI started...")
     last_processed_issue = None
 
     while True:
@@ -440,7 +553,7 @@ async def worker_loop(app, session):
                         if len(PREDICTOR.history) > 1:
                             past_seq = [x["size"] for x in PREDICTOR.history[:-1]]
                             past_nums = [x["num"] for x in PREDICTOR.history[:-1]]
-                            past_feat, _ = PREDICTOR.extract_features(past_seq, past_nums)
+                            past_feat = PREDICTOR.extract_features(past_seq, past_nums)
                             if past_feat:
                                 PREDICTOR.train_model(past_feat, PREDICTOR.history[-1]["size"])
 
@@ -463,7 +576,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V161 Hybrid Sync is running!")
+    return web.Response(text="V162 Advanced Pattern AI is running!")
 
 async def main():
     CFG.validate()
