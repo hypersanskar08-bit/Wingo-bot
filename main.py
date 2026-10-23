@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V146 ULTIMATE TITAN"
+    bot_name: str = "V147 HYPER-QUANTUM OMEGA"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v146")
+log = logging.getLogger("v147")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -111,21 +111,20 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V146 ULTIMATE TITAN
+# V147 OMEGA ENGINE
 # =========================
-class UltimateTitan:
+class OmegaEngine:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # 6 Engines for Meta-Learner
+        # Meta-Learner Weights
         self.engine_stats = {
-            'Run': {'w': 1, 'l': 0},
-            'Markov': {'w': 1, 'l': 0},
-            'ZScore': {'w': 1, 'l': 0},
-            'Entropy': {'w': 1, 'l': 0},
-            'CUSUM': {'w': 1, 'l': 0},
-            'Fuzzy': {'w': 1, 'l': 0}
+            'Markov': {'w': 2.0, 'l': 0},
+            'ZScore': {'w': 1.5, 'l': 0},
+            'Chop': {'w': 1.5, 'l': 0},
+            'EWMA': {'w': 1.0, 'l': 0},
+            'Run': {'w': 1.0, 'l': 0}
         }
 
     async def fetch_data(self, session):
@@ -151,145 +150,90 @@ class UltimateTitan:
         except Exception:
             return False
 
-    # --- EXACT CSV LOGIC: hxDigitScores (JACK MAKER) ---
+    # --- EXACT CSV LOGIC: hxDigitScores ---
     def get_best_number(self, data, side):
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
-        
         last_n = d[0]
         freq = Counter(d[:30])
-        
         tm = Counter()
         for i in range(1, len(d)):
             tm[f"{d[i]}>{d[i-1]}"] += 1
-            
         pool = [5, 6, 7, 8, 9] if side == 1 else [0, 1, 2, 3, 4]
-        
         scored = []
         for num in pool:
             gp = d.index(num) if num in pool else 60
             gg = min(gp, 30)
             tr = tm.get(f"{last_n}>{num}", 0)
             nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
-            
             s = gg * 1.2 + freq.get(num, 0) * 1.5 + tr * 3 + nh
             scored.append((s, num))
-            
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
-    # --- ENGINE 1: RUN PATTERN ---
-    def analyze_run(self, seq):
-        runs = []
-        curr, count = seq[0], 1
-        for x in seq[1:]:
-            if x == curr: count += 1
-            else:
-                runs.append((curr, count))
-                curr, count = x, 1
-        runs.append((curr, count))
+    # --- ENGINE 1: BAYESIAN MARKOV (Multi-Order) ---
+    def analyze_markov(self, seq):
+        # Check orders from 6 down to 2
+        best_order, best_conf = 0, 0.5
+        best_dir = None
         
-        n = len(runs)
-        if n < 3: return None
-        
-        ongoing_side, ongoing_len = runs[-1]
-        
-        for k in [4, 3, 2]:
-            if n < k + 1: continue
-            target = [r[1] for r in runs[-k:]]
-            cont, brk = 0, 0
+        for order in [6, 5, 4, 3, 2]:
+            if len(seq) < order + 5: continue
+            target = tuple(seq[-order:])
+            big, small = 0, 0
+            for i in range(len(seq) - order):
+                if tuple(seq[i:i+order]) == target:
+                    if seq[i+order] == 1: big += 1
+                    else: small += 1
+            total = big + small
             
-            for j in range(k, n - 1):
-                cand = runs[j]
-                if cand[1] < ongoing_len: continue
-                ok = True
-                for t in range(k):
-                    if runs[j - k + t][1] != target[t]:
-                        ok = False
-                        break
-                if ok:
-                    if cand[1] > ongoing_len: cont += 1
-                    else: brk += 1
-                    
-            if cont + brk >= 2:
-                p_cont = (cont + 1) / (cont + brk + 2)
-                return (ongoing_side, p_cont) if p_cont >= 0.5 else (1 - ongoing_side, 1 - p_cont)
-        return None
-
-    # --- ENGINE 2: DEEP MARKOV (Multi-Order) ---
-    def analyze_markov(self, seq, order):
-        if len(seq) < order + 5: return None
-        target = tuple(seq[-order:])
-        big, small = 0, 0
-        for i in range(len(seq) - order):
-            if tuple(seq[i:i+order]) == target:
-                if seq[i+order] == 1: big += 1
-                else: small += 1
-        total = big + small
-        if total >= 2:
+            # Bayesian Smoothing
             p = (big + 1) / (total + 2)
-            return (1, p) if p >= 0.5 else (0, 1-p)
-        return None
+            conf = max(p, 1-p)
+            
+            # Weigh confidence by sample size (Laplace)
+            weighted_conf = conf * (total / (total + 5))
+            
+            if weighted_conf > best_conf:
+                best_conf = weighted_conf
+                best_order = order
+                best_dir = 1 if p >= 0.5 else 0
+                
+        if best_order > 0:
+            return (best_dir, best_conf * 1.2), f"M{best_order}"
+        return None, ""
 
-    # --- ENGINE 3: Z-SCORE (Mean Reversion) ---
+    # --- ENGINE 2: Z-SCORE (Mean Reversion) ---
     def analyze_zscore(self, seq):
-        if len(seq) < 30: return None
+        if len(seq) < 30: return None, ""
         w = seq[-30:]
         big_c = sum(w)
         z = (big_c - 15) / math.sqrt(30 * 0.25)
-        if z > 1.8: return (0, 0.8)
-        if z < -1.8: return (1, 0.8)
-        return None
+        if z > 1.6: return (0, 0.8), "ZScore(S)"
+        if z < -1.6: return (1, 0.8), "ZScore(B)"
+        return None, ""
 
-    # --- ENGINE 4: SHANNON ENTROPY (Chaos Detector) ---
-    def analyze_entropy(self, seq):
-        if len(seq) < 20: return None
-        w = seq[-20:]
-        p1 = sum(w) / 20.0
-        p0 = 1 - p1
-        ent = 0
-        if p1 > 0: ent -= p1 * math.log2(p1)
-        if p0 > 0: ent -= p0 * math.log2(p0)
-        
-        # High entropy = chaotic, expect flip. Low entropy = trending.
-        if ent > 0.95: # Chaos
-            return (1 - seq[-1], 0.65)
-        elif ent < 0.5 and p1 > 0.5: # Strong Big Trend
-            return (1, 0.70)
-        elif ent < 0.5 and p1 < 0.5: # Strong Small Trend
-            return (0, 0.70)
-        return None
+    # --- ENGINE 3: CHOP SHIELD (Zigzag Detector) ---
+    def analyze_chop(self, seq):
+        if len(seq) < 15: return None, ""
+        w = seq[-15:]
+        switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
+        if switches >= 10:
+            return (1 - seq[-1], 0.75), "ChopFlip"
+        return None, ""
 
-    # --- ENGINE 5: CUSUM (Trend Shift Detector) ---
-    def analyze_cusum(self, seq):
-        if len(seq) < 30: return None
-        target = 0.5
-        pos_sum, neg_sum = 0.0, 0.0
-        for s in seq[-30:]:
-            pos_sum = max(0, pos_sum + s - target - 0.1)
-            neg_sum = max(0, neg_sum - s + target - 0.1)
-            
-        if pos_sum > 2.5: return (0, 0.75) # Shifted to BIG too much, expect SMALL
-        if neg_sum > 2.5: return (1, 0.75)
-        return None
-
-    # --- ENGINE 6: FUZZY N-GRAM (Hamming Distance) ---
-    def analyze_fuzzy(self, seq):
-        if len(seq) < 10: return None
-        target = seq[-6:]
-        best_match = None
-        max_matches = 0
-        
-        for i in range(len(seq) - 7):
-            window = seq[i:i+6]
-            matches = sum(1 for a, b in zip(target, window) if a == b)
-            if matches >= 5 and matches > max_matches:
-                max_matches = matches
-                best_match = seq[i+6]
-                
-        if best_match is not None:
-            return (best_match, 0.65 + (max_matches - 5) * 0.1)
-        return None
+    # --- ENGINE 4: EWMA (Trend Direction) ---
+    def analyze_ewma(self, seq):
+        if len(seq) < 20: return None, ""
+        alpha = 0.3
+        ema = seq[-20]
+        for x in seq[-19:]:
+            ema = alpha * x + (1 - alpha) * ema
+        sma = sum(seq[-20:]) / 20
+        diff = ema - sma
+        if diff > 0.15: return (1, 0.65), "EWMA(B)"
+        if diff < -0.15: return (0, 0.65), "EWMA(S)"
+        return None, ""
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
@@ -297,64 +241,57 @@ class UltimateTitan:
         seq = [x["size"] for x in self.history]
         signals = {}
         
-        # 🔥 1 LOSS = ULTRA VENGEANCE
-        if self.loss_streak >= 1:
-            zs = self.analyze_zscore(seq)
-            if zs: signals['V_ZScore'] = zs
-            
-            cu = self.analyze_cusum(seq)
-            if cu: signals['V_CUSUM'] = cu
-            
-            for order in [6, 5, 4]:
-                mk = self.analyze_markov(seq, order)
-                if mk:
-                    signals[f'V_Markov{order}'] = mk
-                    break
-                    
-            en = self.analyze_entropy(seq)
-            if en: signals['V_Entropy'] = en
-            
-            # If still no signals, Force Check Majority
-            if not signals:
-                big_c = sum(seq[-20:])
-                signals['SafeMajority'] = (1 if big_c >= 10 else 0, 0.55)
+        # 1. Always run ZScore and Chop (They are reliable)
+        zs, zs_tag = self.analyze_zscore(seq)
+        if zs: signals['ZScore'] = (zs, zs_tag)
+        
+        ch, ch_tag = self.analyze_chop(seq)
+        if ch: signals['Chop'] = (ch, ch_tag)
 
-        # NORMAL MODE
+        # 2. Mode Based Engines
+        if self.loss_streak == 0:
+            # NORMAL MODE
+            mk, mk_tag = self.analyze_markov(seq)
+            if mk: signals['Markov'] = (mk, mk_tag)
+            
+            ew, ew_tag = self.analyze_ewma(seq)
+            if ew: signals['EWMA'] = (ew, ew_tag)
         else:
-            rn = self.analyze_run(seq)
-            if rn: signals['Run'] = rn
+            # ULTRA VENGEANCE MODE (No Run Pattern, Only Deep Math)
+            mk, mk_tag = self.analyze_markov(seq)
+            if mk: signals['Markov'] = (mk, mk_tag)
             
-            fz = self.analyze_fuzzy(seq)
-            if fz: signals['Fuzzy'] = fz
-            
-            mk = self.analyze_markov(seq, 4)
-            if mk: signals['Markov4'] = mk
-            
-            zs = self.analyze_zscore(seq)
-            if zs: signals['ZScore'] = zs
+            ew, ew_tag = self.analyze_ewma(seq)
+            if ew: signals['EWMA'] = (ew, ew_tag)
 
-        # Meta-Learner Mixer
-        total_w = 0
+        # 3. Meta-Learner Mixer
         log_odds = 0
         logic_tags = []
         
-        for name, (direction, conf) in signals.items():
-            stats = self.engine_stats.get(name.split('_')[-1], {'w': 1, 'l': 0})
+        for name, ((direction, conf), tag) in signals.items():
+            stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
             acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
-            weight = max(0.5, acc * 2.5)
-            weight *= (conf / 0.5)
+            weight = max(0.2, acc * 2.5) # Engines with bad history get 0.2 weight
             
+            # Apply weight to log odds
             log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
-            total_w += weight
-            logic_tags.append(name)
+            logic_tags.append(tag)
 
-        pred_size = 1 if log_odds > 0 else 0
-        confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
+        # 4. Final Decision
+        if not signals:
+            # Absolute Fallback (Majority)
+            big_c = sum(seq[-20:])
+            pred_size = 1 if big_c >= 10 else 0
+            confidence = 55
+            logic_tags = ["MajorityFallback"]
+        else:
+            pred_size = 1 if log_odds > 0 else 0
+            confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
 
-        # Target Number
+        # 5. Target Number
         target_num = self.get_best_number(self.history, pred_size)
 
-        mode = "ULTRA_VENGEANCE" if self.loss_streak >= 1 else "NORMAL"
+        mode = "OMEGA_VENGEANCE" if self.loss_streak >= 1 else "NORMAL"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -366,7 +303,7 @@ class UltimateTitan:
             "sigs": list(signals.keys())
         }
 
-PREDICTOR = UltimateTitan()
+PREDICTOR = OmegaEngine()
 
 # =========================
 # FORMATTING
@@ -388,7 +325,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V146 ULTIMATE TITAN</i>
+⚡ <i>V147 HYPER-QUANTUM OMEGA</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -406,7 +343,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V146 Ultimate Titan started...")
+    log.info("V147 Omega started...")
     last_processed_issue = None
 
     while True:
@@ -455,7 +392,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V146 Ultimate Titan is running!")
+    return web.Response(text="V147 Omega is running!")
 
 async def main():
     CFG.validate()
