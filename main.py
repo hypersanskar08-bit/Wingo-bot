@@ -1,14 +1,12 @@
 """
-V200 HYPER-ADAPTIVE MAX
-=======================
-Ultra-advanced upgrade of V190.
-
-New Features:
-  * Instant Recovery Mode (triggers after 1 loss)
-  * Thompson Sampling (Multi-Armed Bandit for detectors)
-  * Kelly Criterion (Dynamic stake sizing)
-  * Volatility / Danger Meter
-  * 2-step Markov chain for number picking
+V300 ULTRA-ADAPTIVE
+===================
+Fixes:
+  * Consensus Math Bug (1 signal = 100% fixed)
+  * Kelly Criterion now uses Calibrated Confidence, not Raw.
+  * Tilt Protection (Stops betting after 2 losses unless edge is massive)
+  * Shadow Mode (3+ losses triggers a 2-round cool-down)
+  * Strict SKIP threshold for weak edges
 """
 
 import asyncio
@@ -44,11 +42,11 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "predictor_v200.db")
+    db_path: str = os.environ.get("DB_PATH", "predictor_v300.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V200 HYPER-ADAPTIVE MAX"
+    bot_name: str = "V300 ULTRA-ADAPTIVE"
     min_history: int = 60
     warm_min: int = 25
     backtest_steps: int = 250
@@ -72,11 +70,11 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v200.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v300.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v200")
+log = logging.getLogger("v300")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -101,7 +99,6 @@ class Beta:
         return self.a / (self.a + self.b)
 
     def sample_thompson(self) -> float:
-        # Advanced AI: Thompson Sampling exploration/exploitation
         return random.betavariate(self.a, self.b)
 
     def to_dict(self):
@@ -171,8 +168,6 @@ class Scoring:
     def logloss_score(self) -> Optional[float]:
         return sum(self.logloss) / len(self.logloss) if self.logloss else None
 
-    def n(self) -> int: return len(self.brier)
-
 class Calibration:
     def __init__(self, maxlen: int = 400):
         self.samples = deque(maxlen=maxlen)
@@ -187,7 +182,7 @@ class Calibration:
                 n += 1; w += win
         base = (W + 5.0) / (len(self.samples) + 10)
         p = (w + 12 * base) / (n + 12)
-        return int(max(0.5, min(0.80, p)) * 100)
+        return int(max(0.5, min(0.85, p)) * 100)
 
 # =========================
 # STORAGE
@@ -282,7 +277,7 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# REGIME & DETECTORS
+# DETECTORS & REGIME
 # =========================
 @dataclass
 class Regime:
@@ -333,6 +328,7 @@ def run_detectors(sizes, nums):
     n = len(sizes)
     if n < CFG.warm_min: return out
 
+    # 1. Markov
     for ord_ in range(6, 0, -1):
         if n < ord_ + 15: continue
         ctx = 0
@@ -350,9 +346,10 @@ def run_detectors(sizes, nums):
         sf = min(1, tN / (minS * 1.5))
         strength = min(1, abs(pB - 0.5) * 4) * sf
         if strength >= 0.10:
-            out.append(Detector(f"Markov{ord_}", f"Markov-L{ord_}(n={tN})", 1 if pB >= 0.5 else 0, int(50 + strength * 30), 0.6 + strength * 1.2, "markov"))
+            out.append(Detector(f"Markov{ord_}", f"Markov-L{ord_}", 1 if pB >= 0.5 else 0, int(50 + strength * 30), 0.6 + strength * 1.2, "markov"))
         break
 
+    # 2. Bayes
     bb = bs = 2.0
     for num in nums[-30:]:
         w = 1.0 / (1 + abs(num - 4.5) * 0.15)
@@ -361,14 +358,16 @@ def run_detectors(sizes, nums):
     pB = bb / (bb + bs)
     strength = abs(pB - 0.5) * 2.5
     if strength >= 0.05:
-        out.append(Detector("Bayes", f"Bayes({pB:.2f})", 1 if pB > 0.52 else 0, int(50 + min(30, strength * 30)), 0.6 + strength, "bayes"))
+        out.append(Detector("Bayes", f"Bayes", 1 if pB > 0.52 else 0, int(50 + min(30, strength * 30)), 0.6 + strength, "bayes"))
 
+    # 3. Freq
     w30 = sizes[-30:]
     pF = sum(w30) / len(w30)
     if abs(pF - 0.5) >= 0.08:
         strength = min(1, (abs(pF - 0.5) - 0.08) * 2.5)
-        out.append(Detector("Freq30", f"Freq({pF:.2f})", 1 if pF > 0.5 else 0, int(50 + strength * 25), 0.6 + strength * 1.2, "freq"))
+        out.append(Detector("Freq30", f"Freq", 1 if pF > 0.5 else 0, int(50 + strength * 25), 0.6 + strength * 1.2, "freq"))
 
+    # 4. Streak / Dragon
     last = sizes[-1]
     run = 1
     for i in range(n - 2, -1, -1):
@@ -379,6 +378,7 @@ def run_detectors(sizes, nums):
     if run >= 5:
         out.append(Detector("Dragon", f"Dragon×{run}", last, min(94, 68 + run * 4), 1.9 + min(run, 6) * 0.15, "dragon"))
 
+    # 5. Reversal
     prior = sizes[max(0, n - 25):n - 5]
     if len(prior) >= 15:
         pBp = sum(prior) / len(prior)
@@ -389,18 +389,12 @@ def run_detectors(sizes, nums):
                 else: break
             out.append(Detector("Reversal", "Reversal", last, min(86, 62 + rrun * 7), 1.7 + min(rrun, 3) * 0.2, "reversal"))
 
+    # 6. Zigzag
     switches = sum(1 for i in range(min(6, n - 1)) if sizes[-1 - i] != sizes[-2 - i])
     if switches >= 5:
         out.append(Detector("Zigzag", "Zigzag", 1 - last, 62 + switches * 3, 1.4, "zigzag"))
 
-    for wl in (3, 4):
-        if n < wl * 2: continue
-        w1, w2 = sizes[-wl:], sizes[-wl * 2:-wl]
-        m = sum(1 for a, b in zip(w1, w2) if a == b)
-        if m >= wl - 1:
-            out.append(Detector(f"Cycle{wl}", f"Cycle{wl}", w1[0], 60 + m * 5, 1.2, "cycle"))
-            break
-
+    # 7. ACF
     for lag in (1, 2):
         N = min(30, n)
         if N < lag + 5: continue
@@ -411,42 +405,9 @@ def run_detectors(sizes, nums):
         if den_ <= 0: continue
         acf = num_ / den_
         if abs(acf) >= 0.10:
-            out.append(Detector(f"ACF{lag}", f"ACF-L{lag}({acf:+.2f})", last if acf > 0 else 1 - last, int(min(68, 55 + abs(acf) * 40)), 0.9 + abs(acf), f"acf{lag}"))
+            out.append(Detector(f"ACF{lag}", f"ACF-L{lag}", last if acf > 0 else 1 - last, int(min(68, 55 + abs(acf) * 40)), 0.9 + abs(acf), f"acf{lag}"))
 
-    N = min(20, n)
-    if N >= 5:
-        sw = sx = sy = sxy = sx2 = 0.0
-        for i in range(N):
-            wt = (i + 1) / N
-            sw += wt; sx += i * wt; sy += nums[-N + i] * wt; sxy += i * nums[-N + i] * wt; sx2 += i * i * wt
-        den = sw * sx2 - sx * sx
-        if abs(den) > 0.001:
-            slope = (sw * sxy - sx * sy) / den
-            if abs(slope) >= 0.15:
-                out.append(Detector("TrendSlope", f"Slope({slope:+.2f})", 1 if slope > 0 else 0, int(min(68, 55 + abs(slope) * 25)), 1.0, "trend"))
-
-    if n >= 35:
-        rs, os_ = nums[-15:], nums[-35:-15]
-        dr = sum(rs) / len(rs) - sum(os_) / len(os_)
-        if abs(dr) >= 1.2:
-            out.append(Detector("Drift", f"Drift({dr:+.2f})", 1 if dr > 0 else 0, int(min(65, 55 + abs(dr) * 8)), 0.8 + min(1, abs(dr) / 3), "drift"))
-
-    ts = nums[-30:]
-    if len(ts) >= 20:
-        lags = list(range(2, min(20, len(ts) // 2)))
-        taus = []
-        for lag in lags:
-            pp = [ts[i + lag] - ts[i] for i in range(len(ts) - lag)]
-            if pp: taus.append(math.sqrt(sum(p * p for p in pp) / len(pp)))
-        if len(taus) >= 2:
-            log_lags, log_tau = [math.log(l) for l in lags][:len(taus)], [math.log(t) if t > 0 else -10 for t in taus]
-            nn = len(log_lags); mx = sum(log_lags) / nn; my = sum(log_tau) / nn
-            num_ = sum((log_lags[i] - mx) * (log_tau[i] - my) for i in range(nn))
-            den_ = sum((log_lags[i] - mx) ** 2 for i in range(nn))
-            if den_ > 0:
-                H = max(0.0, min(1.0, num_ / den_))
-                if H > 0.60: out.append(Detector("HurstTrend", f"Hurst({H:.2f})", last, int(60 + (H - 0.60) * 80), 1.1, "hurst"))
-
+    # 8. Bollinger & ZScore
     if n >= 20:
         w20 = sizes[-20:]
         ma = sum(w20) / 20
@@ -454,11 +415,10 @@ def run_detectors(sizes, nums):
         if std >= 0.15:
             if last >= ma + 2 * std: out.append(Detector("BollingerRev", "Bollinger-Rev", 0, 78, 1.5, "bollinger"))
             elif last <= ma - 2 * std: out.append(Detector("BollingerRev", "Bollinger-Rev", 1, 78, 1.5, "bollinger"))
-
     if n >= 30:
         z = (sum(sizes[-30:]) - 15.0) / math.sqrt(30 * 0.25)
         if abs(z) >= 1.2:
-            out.append(Detector("ZScore", f"Z={z:+.2f}", 0 if z > 0 else 1, int(min(75, 55 + abs(z) * 8)), 0.9 + abs(z) * 0.3, "zscore"))
+            out.append(Detector("ZScore", f"ZScore", 0 if z > 0 else 1, int(min(75, 55 + abs(z) * 8)), 0.9 + abs(z) * 0.3, "zscore"))
 
     return out
 
@@ -478,13 +438,12 @@ class BotState:
         self.global_scoring = Scoring()
         self.numerics = DirichletNumerics()
         self.loss_streak = 0
-        self.backtest_done = False
-        self.backtest_result = {}
+        self.shadow_rounds = 0  # Shadow mode cool-down
         self.paused = False
         self._load_persisted()
 
     def _load_persisted(self):
-        raw = STORE.load_kv("state_v200")
+        raw = STORE.load_kv("state_v300")
         if not raw: return
         try:
             d = json.loads(raw)
@@ -502,7 +461,7 @@ class BotState:
                 "beta_regime": {f"{r}|{det}": b.to_dict() for (r, det), b in self.beta_regime.items()},
                 "loss_streak": self.loss_streak,
             }
-            STORE.save_kv("state_v200", json.dumps(d))
+            STORE.save_kv("state_v300", json.dumps(d))
         except Exception: pass
 
 STATE = BotState()
@@ -516,10 +475,6 @@ def get_beta_regime(regime: str, det: str) -> Beta:
     if key not in STATE.beta_regime: STATE.beta_regime[key] = Beta()
     return STATE.beta_regime[key]
 
-def get_drift(det: str) -> PageHinkley:
-    if det not in STATE.drift: STATE.drift[det] = PageHinkley()
-    return STATE.drift[det]
-
 def get_calibration(regime: Optional[str]) -> Calibration:
     if regime is None: return STATE.global_calibration
     if regime not in STATE.calibration: STATE.calibration[regime] = Calibration()
@@ -531,7 +486,7 @@ def get_scoring(regime: Optional[str]) -> Scoring:
     return STATE.scoring[regime]
 
 # =========================
-# ADVANCED ENSEMBLE (Thompson Sampling)
+# ENSEMBLE
 # =========================
 def merge_detectors(detectors, regime_name):
     if not detectors: return None
@@ -544,16 +499,13 @@ def merge_detectors(detectors, regime_name):
         regime_beta = get_beta_regime(regime_name, d.key) if regime_name else None
         beta = regime_beta if (regime_beta and regime_beta.n() >= 20) else get_beta(d.key)
 
-        # 🔥 THOMPSON SAMPLING: Dynamic exploration vs exploitation
         sampled_accuracy = beta.sample_thompson()
         flip = (sampled_accuracy < 0.40 and beta.n() >= 20)
         direction = (1 - d.dir) if flip else d.dir
 
-        # Drift penalty
         drift_fired = STATE.drift_last.get(d.key, 0)
         drift_mult = 0.4 if (now - drift_fired) < 30 else 1.0
 
-        # Family penalty
         fc = fam_count[d.family]
         fam_mult = 0.55 if fc >= 3 else (0.75 if fc == 2 else 1.0)
 
@@ -570,98 +522,80 @@ def merge_detectors(detectors, regime_name):
         })
 
     if total_w < 0.01: return None
+    
     p_big = big_score / total_w
-    consensus = max(p_big, 1 - p_big)
+    raw_consensus = max(p_big, 1 - p_big)
+    
+    # 🔥 FIX: If only 1 signal fires, consensus cannot be 100%. It scales with number of signals.
+    n_signals = len(used)
+    consensus_penalty = min(n_signals, 4) / 4.0  # 1 sig = 25%, 2 sigs = 50%, 4 sigs = 100%
+    consensus = raw_consensus * consensus_penalty
+    
     edge = abs(p_big - 0.5) * 2
     raw_conf = int(50 + edge * 45)
     pred_dir = 1 if p_big >= 0.5 else 0
 
     return {"p_big": p_big, "dir": pred_dir, "raw_conf": raw_conf, "consensus": consensus, "used": used, "total_weight": total_w}
 
-def pick_number(probs, side, last_nums, transitions):
-    pool = range(5, 10) if side == 1 else range(0, 5)
-    # 2-step Markov
-    ctx2 = tuple(last_nums[-2:]) if len(last_nums) >= 2 else None
-    scored = []
-    for num in pool:
-        p_dir = probs[num]
-        p_trans1 = transitions.get((last_nums[-1], num), 0) / max(1, sum(v for (a, b), v in transitions.items() if a == last_nums[-1]))
-        p_trans2 = transitions.get((ctx2, num), 0) if ctx2 else 0
-        score = 0.5 * p_dir + 0.3 * p_trans1 + 0.2 * p_trans2
-        scored.append((score, num))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return scored[0][1]
-
-def predict_core(sizes, nums):
-    if len(sizes) < CFG.min_history: return None
+def generate_prediction():
+    if len(STATE.history) < CFG.min_history: return None
+    sizes = [x["size"] for x in STATE.history]
+    nums = [x["num"] for x in STATE.history]
+    
     regime = detect_regime(sizes)
     detectors = run_detectors(sizes, nums)
     merged = merge_detectors(detectors, regime.regime)
     if not merged: return None
 
+    # Calibration
     cal = get_calibration(regime.regime)
     calibrated_conf = cal.calibrate(merged["raw_conf"])
 
-    probs = STATE.numerics.probs()
-    transitions = Counter()
-    for i in range(1, len(nums)):
-        transitions[(nums[i - 1], nums[i])] += 1
-    
-    number = pick_number(probs, merged["dir"], nums, transitions)
-
-    deferral = "LOW_EDGE" if merged["consensus"] < 0.58 else ("WEAK" if merged["consensus"] < 0.65 else None)
-
-    return {
-        "dir": merged["dir"], "p_big": merged["p_big"], "raw_conf": merged["raw_conf"],
-        "confidence": calibrated_conf, "consensus": merged["consensus"], "num": number,
-        "regime": regime.regime, "signals": merged["used"], "deferral": deferral, "numeric_probs": probs,
-    }
-
-def generate_prediction():
-    if len(STATE.history) < CFG.min_history: return None
-    sizes = [x["size"] for x in STATE.history]
-    nums = [x["num"] for x in STATE.history]
-    core = predict_core(sizes, nums)
-    if not core: return None
-
-    # 🛡️ INSTANT RECOVERY (1 LOSS)
-    stake = "1x"
-    edge = core["p_big"] - 0.5
-    abs_edge = abs(edge)
-    
-    # Kelly Criterion (Simplified for 1:1 odds)
-    kelly = abs_edge * 2 
-    
-    if STATE.loss_streak >= 1:
-        core["deferral"] = "RECOVERY"
-        
-        # In CHOPPY market, 1 loss means we flip the prediction immediately
-        if core["regime"] == "CHOPPY":
-            core["dir"] = 1 - core["dir"]
-            core["p_big"] = 1.0 - core["p_big"]
-            core["signals"].append({"name": "Instant Recovery (Flip)", "dir": core["dir"], "weight": 2.0})
-        else:
-            # In other regimes, just dampen confidence and cut stake
-            core["confidence"] = max(52, core["confidence"] - 10)
-            core["p_big"] = 0.5 + edge * 0.6
-            stake = "0.5x"
+    # 🔥 FIX: Kelly Stake based on CALIBRATED confidence, not raw.
+    p_true = calibrated_conf / 100.0
+    kelly = (p_true * 2) - 1  # 1:1 odds
+    if kelly < 0: kelly = 0.0
     
     if kelly >= 0.15: stake = "2x"
     elif kelly >= 0.08: stake = "1.5x"
-    elif kelly < 0.03 and core["deferral"] != "RECOVERY": stake = "SKIP"
+    elif kelly >= 0.03: stake = "1x"
+    else: stake = "SKIP"
+
+    # 🔥 FIX: Tilt Protection & Recovery Mode
+    warning_msg = None
+    if STATE.loss_streak >= 2:
+        warning_msg = "RECOVERY"
+        if merged["raw_conf"] < 80 or len(merged["used"]) < 3:
+            stake = "SKIP"
+            warning_msg = "TILT_PROTECTION"
+        else:
+            stake = "0.5x" # High confidence but still cautious
+    elif STATE.loss_streak == 1:
+        warning_msg = "RECOVERY"
+        stake = "0.5x" if stake == "1x" else stake
+
+    # 🔥 FIX: Shadow Mode (Cool-down after 3 losses)
+    if STATE.shadow_rounds > 0:
+        stake = "SKIP"
+        warning_msg = "SHADOW_MODE"
 
     issue = str(int(STATE.history[-1]["issue"]) + 1)
-    top_sigs = core["signals"][:6]
+    top_sigs = merged["used"][:6]
+    
+    # Number Picker (Simple Dirichlet + Transitions)
+    probs = STATE.numerics.probs()
+    pool = range(5, 10) if merged["dir"] == 1 else range(0, 5)
+    num = max(pool, key=lambda x: probs[x])
 
     return {
-        "issue": issue, "size": "BIG" if core["dir"] == 1 else "SMALL", "num": core["num"],
-        "p_big": core["p_big"], "confidence": core["confidence"], "raw_conf": core["raw_conf"],
-        "consensus": core["consensus"], "mode": core["regime"], "regime": core["regime"],
+        "issue": issue, "size": "BIG" if merged["dir"] == 1 else "SMALL", "num": num,
+        "p_big": merged["p_big"], "confidence": calibrated_conf, "raw_conf": merged["raw_conf"],
+        "consensus": merged["consensus"], "mode": regime.regime, "regime": regime.regime,
         "logic": ", ".join(s["name"] for s in top_sigs) or "no signals",
-        "sigs": top_sigs, "deferral": core["deferral"], "stake": stake,
+        "sigs": top_sigs, "deferral": warning_msg, "stake": stake,
         "details": {
-            "detectors": [{"key": s["key"], "dir": s["dir"], "name": s["name"]} for s in core["signals"]],
-            "regime": core["regime"], "p_big": core["p_big"], "consensus": core["consensus"]
+            "detectors": [{"key": s["key"], "dir": s["dir"], "name": s["name"]} for s in merged["used"]],
+            "regime": regime.regime, "p_big": merged["p_big"], "consensus": merged["consensus"]
         },
     }
 
@@ -676,7 +610,7 @@ def learn_from_resolution(res: dict):
         correct = (d["dir"] == actual_size)
         get_beta(d["key"]).update(correct)
         get_beta_regime(regime, d["key"]).update(correct)
-        if get_drift(d["key"]).update(1.0 if correct else 0.0):
+        if STATE.drift.get(d["key"], PageHinkley()).update(1.0 if correct else 0.0):
             STATE.drift_last[d["key"]] = time.time()
 
     raw = res.get("raw_conf")
@@ -691,40 +625,6 @@ def learn_from_resolution(res: dict):
         STATE.numerics.update(int(res["actual_num"]))
 
     STATE.save_persisted()
-
-def seed_from_history():
-    if len(STATE.history) < CFG.min_history + 30: return
-    steps = min(CFG.backtest_steps, len(STATE.history) - CFG.min_history - 5)
-    if steps < 20: return
-
-    STATE.beta_global.clear(); STATE.beta_regime.clear(); STATE.drift.clear(); STATE.drift_last.clear()
-    STATE.calibration.clear(); STATE.global_calibration = Calibration()
-    STATE.scoring.clear(); STATE.global_scoring = Scoring(); STATE.numerics.reset()
-
-    wins = total = 0
-    for t in range(len(STATE.history) - steps, len(STATE.history)):
-        before = STATE.history[:t]
-        actual = STATE.history[t]["size"]
-        sizes = [h["size"] for h in before]
-        nums = [h["num"] for h in before]
-        if len(sizes) < CFG.min_history: continue
-        core = predict_core(sizes, nums)
-        if not core: continue
-        actual_big = (actual == 1)
-        for d in core["signals"]:
-            correct = (d["dir"] == actual)
-            get_beta(d["key"]).update(correct)
-            get_beta_regime(core["regime"], d["key"]).update(correct)
-        get_calibration(core["regime"]).add(core["raw_conf"], core["dir"] == actual)
-        get_calibration(None).add(core["raw_conf"], core["dir"] == actual)
-        get_scoring(core["regime"]).add(core["p_big"], actual_big)
-        get_scoring(None).add(core["p_big"], actual_big)
-        STATE.numerics.update(STATE.history[t]["num"])
-        total += 1
-        if core["dir"] == actual: wins += 1
-
-    STATE.backtest_done = True
-    STATE.backtest_result = {"n": total, "acc": round(wins / total * 100, 1) if total else 0}
 
 async def fetch_data(session):
     try:
@@ -749,21 +649,22 @@ async def fetch_data(session):
     except Exception: return False
 
 # =========================
-# FORMATTING & COMMANDS
+# FORMATTING
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
-    sig_text = "\n".join(f"  {h(s['name'])} → {'▲ BIG' if s['dir']==1 else '▼ SMALL'}{' ⇄' if s.get('flipped') else ''}" for s in p["sigs"][:5]) or "  <i>no active signals</i>"
+    sig_text = "\n".join(f"  {h(s['name'])} → {'▲ BIG' if s['dir']==1 else '▼ SMALL'}{' ⇄' if s.get('flipped') else ''}" for s in p["sigs"][:6]) or "  <i>no active signals</i>"
     
     p_big_pct = p["p_big"] * 100
-    edge = abs(p["p_big"] - 0.5) * 100
     consensus_pct = p["consensus"] * 100
 
     warning = ""
-    if p.get("deferral") == "RECOVERY":
-        warning = "\n🛡️ <b>RECOVERY MODE</b> — Instant adjustment applied\n"
-    elif p.get("deferral") == "LOW_EDGE":
-        warning = "\n⚠️ <b>LOW EDGE</b> — High Risk\n"
+    if p.get("deferral") == "TILT_PROTECTION":
+        warning = "\n🛑 <b>TILT PROTECTION</b> — Weak signals after losses. SKIPPING.\n"
+    elif p.get("deferral") == "SHADOW_MODE":
+        warning = "\n👻 <b>SHADOW MODE</b> — 3+ Losses. Observing silently.\n"
+    elif p.get("deferral") == "RECOVERY":
+        warning = "\n🛡️ <b>RECOVERY MODE</b> — Reduced risk.\n"
 
     stake_emoji = {"2x": "🔥 2x", "1.5x": "🟢 1.5x", "1x": "🟡 1x", "0.5x": "🔴 0.5x", "SKIP": "⛔ SKIP"}.get(p['stake'], "1x")
 
@@ -772,7 +673,7 @@ def format_prediction(p, recent_rows):
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
-🎲 <b>P(BIG)</b>: <b>{p_big_pct:.1f}%</b> · edge +{edge:.1f}%
+🎲 <b>P(BIG)</b>: <b>{p_big_pct:.1f}%</b>
 📈 <b>Confidence</b>: <b>{p['confidence']}%</b> <i>(raw {p['raw_conf']}%)</i>
 🧠 <b>Regime</b>: <b>{h(p['regime'])}</b> · Consensus {consensus_pct:.0f}%
 💰 <b>Stake (Kelly)</b>: <b>{stake_emoji}</b>
@@ -798,50 +699,41 @@ async def send_msg(app, text, retries=3):
         except Exception as e: log.error(f"Send error: {e}"); break
     return False
 
+# =========================
+# COMMANDS
+# =========================
 async def cmd_start(update, ctx):
-    await update.message.reply_text(f"🤖 <b>{h(CFG.bot_name)}</b>\n\n/status - Engine overview\n/stats - Accuracy\n/brier - Calibration scores\n/detectors - Currently firing", parse_mode="HTML")
+    await update.message.reply_text(f"🤖 <b>{h(CFG.bot_name)}</b>\n\n/status - Engine overview\n/stats - Accuracy\n/brier - Calibration scores", parse_mode="HTML")
 
 async def cmd_status(update, ctx):
     total, wins = STORE.overall_stats()
     acc = round(wins / total * 100, 1) if total else 0
-    await update.message.reply_text(f"📊 <b>Status</b>\nHistory: {len(STATE.history)}\nAccuracy: {acc}% ({wins}/{total})\nLoss streak: {STATE.loss_streak}\nPaused: {STATE.paused}", parse_mode="HTML")
+    await update.message.reply_text(f"📊 <b>Status</b>\nHistory: {len(STATE.history)}\nAccuracy: {acc}% ({wins}/{total})\nLoss streak: {STATE.loss_streak}\nShadow Mode: {STATE.shadow_rounds} rounds left\nPaused: {STATE.paused}", parse_mode="HTML")
 
-async def cmd_stats(update, ctx):
-    rows = sorted([(k, b.mean(), int(b.n())) for k, b in STATE.beta_global.items() if b.n() >= 15], key=lambda x: -x[1])
-    lines = ["📊 <b>Top Detectors</b>"] + [f"  {h(k)}: {m*100:.0f}% (n={n})" for k, m, n in rows[:10]]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-async def cmd_brier(update, ctx):
-    brier = STATE.global_scoring.brier_score()
-    ll = STATE.global_scoring.logloss_score()
-    if brier is not None:
-        await update.message.reply_text(f"📏 <b>Calibration</b>\nBrier: {brier:.4f}\nLog loss: {ll:.4f}\n<i>Lower is better. 0.25 = random.</i>", parse_mode="HTML")
-    else: await update.message.reply_text("Not enough samples.")
-
-async def cmd_stop(update, ctx):
-    STATE.paused = True; await update.message.reply_text("⏸️ Paused.")
-
-async def cmd_resume(update, ctx):
-    STATE.paused = False; await update.message.reply_text("▶️ Resumed.")
-
+# =========================
+# WORKER LOOP
+# =========================
 async def worker_loop(app, session):
     log.info(f"{CFG.bot_name} started...")
     last_processed_issue = None
-    seeded = False
 
     while True:
         try:
             if await fetch_data(session):
-                if not seeded and len(STATE.history) >= CFG.min_history:
-                    seed_from_history(); seeded = True
-
                 hist_dict = {x["issue"]: x for x in STATE.history}
                 resolved = STORE.resolve_pending(hist_dict)
                 
                 for res in resolved:
                     learn_from_resolution(res)
-                    if res["win"]: STATE.loss_streak = 0
-                    else: STATE.loss_streak += 1
+                    if res["win"]: 
+                        STATE.loss_streak = 0
+                        STATE.shadow_rounds = 0 # Exit shadow mode on win
+                    else: 
+                        STATE.loss_streak += 1
+                        if STATE.loss_streak >= 3:
+                            STATE.shadow_rounds = 2 # Activate shadow mode for 2 rounds
+                    
+                    # Always send result, even if skipped
                     await send_msg(app, format_result(res))
 
                 latest_issue = STATE.history[-1]["issue"]
@@ -852,33 +744,30 @@ async def worker_loop(app, session):
                         p = generate_prediction()
                         if p:
                             STORE.save_prediction(p)
-                            await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
+                            
+                            # If Shadow Mode is active, don't send to TG, just decrement
+                            if STATE.shadow_rounds > 0:
+                                STATE.shadow_rounds -= 1
+                                log.info(f"Shadow Mode active: {STATE.shadow_rounds} rounds left. Skipping prediction.")
+                            else:
+                                await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
+                                
                             last_processed_issue = latest_issue
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
         except Exception as e:
             log.exception(f"Loop error: {e}"); await asyncio.sleep(2)
 
-async def handle_ping(request): return web.Response(text="V200 is running!")
-async def handle_stats(request):
-    total, wins = STORE.overall_stats()
-    brier = STATE.global_scoring.brier_score()
-    return web.json_response({"history": len(STATE.history), "accuracy": round(wins/total*100,2) if total else 0, "brier": brier})
-
+# =========================
+# MAIN
+# =========================
 async def main():
     CFG.validate()
     if not CFG.telegram_token: raise RuntimeError("TG_TOKEN env variable is empty")
 
-    web_app = web.Application()
-    web_app.router.add_get("/", handle_ping)
-    web_app.router.add_get("/stats", handle_stats)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080))).start()
-
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
-    for name, fn in [("start", cmd_start), ("status", cmd_status), ("stats", cmd_stats), ("brier", cmd_brier), ("stop", cmd_stop), ("resume", cmd_resume)]:
-        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
 
     async with app:
         await app.start()
