@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V144 OMNI-MATRIX"
+    bot_name: str = "V145 VENGEANCE MATRIX"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v144")
+log = logging.getLogger("v145")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -111,9 +111,9 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V144 OMNI-MATRIX
+# V145 VENGEANCE MATRIX
 # =========================
-class OmniMatrix:
+class VengeanceMatrix:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -217,8 +217,8 @@ class OmniMatrix:
                 return (ongoing_side, p_cont) if p_cont >= 0.5 else (1 - ongoing_side, 1 - p_cont)
         return None
 
-    # --- ENGINE 2: DEEP MARKOV (Order 4 or 6) ---
-    def analyze_markov(self, seq, order=4):
+    # --- ENGINE 2: DEEP MARKOV (Multi-Order) ---
+    def analyze_markov(self, seq, order):
         if len(seq) < order + 5: return None
         target = tuple(seq[-order:])
         big, small = 0, 0
@@ -233,22 +233,40 @@ class OmniMatrix:
         return None
 
     # --- ENGINE 3: Z-SCORE (Mean Reversion) ---
-    def analyze_zscore(self, seq):
+    def analyze_zscore(self, seq, threshold=1.8):
         if len(seq) < 30: return None
         w = seq[-30:]
         big_c = sum(w)
         z = (big_c - 15) / math.sqrt(30 * 0.25)
-        if z > 1.8: return (0, 0.8) # Expect SMALL
-        if z < -1.8: return (1, 0.8) # Expect BIG
+        if z > threshold: return (0, 0.75 + min(0.1, abs(z)*0.05))
+        if z < -threshold: return (1, 0.75 + min(0.1, abs(z)*0.05))
         return None
 
-    # --- ENGINE 4: CHOP DETECTOR (Zigzag) ---
+    # --- ENGINE 4: EXHAUSTION (Streak Break) ---
+    def analyze_exhaustion(self, seq):
+        streak = 1
+        for i in range(len(seq)-2, -1, -1):
+            if seq[i] == seq[-1]: streak += 1
+            else: break
+            
+        if streak >= 4:
+            breaks, conts = 0, 0
+            for i in range(len(seq)-streak):
+                if all(seq[i+j] == seq[-1] for j in range(streak)):
+                    if i+streak < len(seq):
+                        if seq[i+streak] == seq[-1]: conts += 1
+                        else: breaks += 1
+            if breaks + conts >= 2:
+                if breaks > conts: return (1-seq[-1], 0.75)
+                else: return (seq[-1], 0.75)
+        return None
+
     def analyze_chop(self, seq):
         if len(seq) < 15: return None
         w = seq[-15:]
         switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
         if switches >= 10:
-            return (1 - seq[-1], 0.65) # Force Flip
+            return (1 - seq[-1], 0.65)
         return None
 
     def generate_prediction(self):
@@ -257,54 +275,64 @@ class OmniMatrix:
         seq = [x["size"] for x in self.history]
         signals = {}
         
-        # 1. Check Common Engines
-        zs = self.analyze_zscore(seq)
-        if zs: signals['ZScore'] = zs
-        
+        # Common Engines
         ch = self.analyze_chop(seq)
         if ch: signals['Chop'] = ch
 
-        # 2. Mode-Based Activation
         if self.loss_streak == 0:
-            # Normal Mode
+            # NORMAL MODE
+            zs = self.analyze_zscore(seq)
+            if zs: signals['ZScore'] = zs
             rn = self.analyze_run(seq)
             if rn: signals['Run'] = rn
             mk = self.analyze_markov(seq, 4)
-            if mk: signals['Markov'] = mk
-        elif self.loss_streak == 1:
-            # 1 Loss = Vengeance Mode (Kill Run, Boost Markov-6)
-            mk = self.analyze_markov(seq, 6)
-            if mk: signals['Markov'] = mk
+            if mk: signals['Markov4'] = mk
+            
         else:
-            # 2+ Losses = Absolute Safe Mode (Only Markov-6 + ZScore)
-            mk = self.analyze_markov(seq, 6)
-            if mk: signals['Markov'] = mk
+            # 🔥 SUPER DEEP VENGEANCE MODE (No BlindFlip)
+            # Level 1: Extreme Z-Score
+            zs = self.analyze_zscore(seq, threshold=1.2) # Lower threshold for vengeance
+            if zs: signals['V_ZScore'] = zs
+            
+            # Level 2: Deep Markov (6 down to 2)
+            for order in [6, 5, 4, 3, 2]:
+                mk = self.analyze_markov(seq, order)
+                if mk:
+                    signals[f'V_Markov{order}'] = mk
+                    break # Deepest match found
+                    
+            # Level 3: Exhaustion / Streak Ride
+            ex = self.analyze_exhaustion(seq)
+            if ex: signals['V_Exhaustion'] = ex
+            
+            # Level 4: Safe Majority (If no strong pattern, follow the 30-round trend)
+            if not signals:
+                big_c = sum(seq[-30:])
+                if big_c >= 15:
+                    signals['SafeMajority'] = (1, 0.55)
+                else:
+                    signals['SafeMajority'] = (0, 0.55)
 
-        # 3. Dynamic Weighting (Meta-Learner)
+        # Dynamic Weighting (Meta-Learner)
         total_w = 0
         log_odds = 0
         logic_tags = []
         
         for name, (direction, conf) in signals.items():
-            stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
+            stats = self.engine_stats.get(name.split('_')[-1], {'w': 1, 'l': 0}) # strip V_ prefix
             acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
-            weight = max(0.5, acc * 2) # Base weight
-            weight *= (conf / 0.5)     # Confidence multiplier
+            weight = max(0.5, acc * 2)
+            weight *= (conf / 0.5)
             
             log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
             total_w += weight
             logic_tags.append(name)
 
-        # 4. Final Decision
-        if not signals:
-            pred_size = 1 - seq[-1] # Force Flip if blind
-            confidence = 55
-            logic_tags = ["BlindFlip"]
-        else:
-            pred_size = 1 if log_odds > 0 else 0
-            confidence = int(min(88, max(55, 50 + abs(log_odds) * 10)))
+        # Final Decision
+        pred_size = 1 if log_odds > 0 else 0
+        confidence = int(min(88, max(58, 50 + abs(log_odds) * 10)))
 
-        # 5. Target Number
+        # Target Number
         target_num = self.get_best_number(self.history, pred_size)
 
         mode = "SAFE_MODE" if self.loss_streak >= 2 else "VENGEANCE" if self.loss_streak == 1 else "NORMAL"
@@ -319,7 +347,7 @@ class OmniMatrix:
             "sigs": list(signals.keys())
         }
 
-PREDICTOR = OmniMatrix()
+PREDICTOR = VengeanceMatrix()
 
 # =========================
 # FORMATTING
@@ -341,7 +369,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V144 OMNI-MATRIX</i>
+⚡ <i>V145 VENGEANCE MATRIX</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -359,7 +387,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V144 Omni-Matrix started...")
+    log.info("V145 Vengeance Matrix started...")
     last_processed_issue = None
 
     while True:
@@ -372,13 +400,13 @@ async def worker_loop(app, session):
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
-                    # Update Meta-Learner
                     try:
                         sigs = json.loads(res['sigs'])
                         for s in sigs:
-                            if s in PREDICTOR.engine_stats:
-                                if res['win']: PREDICTOR.engine_stats[s]['w'] += 1
-                                else: PREDICTOR.engine_stats[s]['l'] += 1
+                            name = s.split('_')[-1]
+                            if name in PREDICTOR.engine_stats:
+                                if res['win']: PREDICTOR.engine_stats[name]['w'] += 1
+                                else: PREDICTOR.engine_stats[name]['l'] += 1
                     except: pass
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
@@ -408,7 +436,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V144 Omni-Matrix is running!")
+    return web.Response(text="V145 Vengeance Matrix is running!")
 
 async def main():
     CFG.validate()
