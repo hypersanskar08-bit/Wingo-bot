@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V145 VENGEANCE MATRIX"
+    bot_name: str = "V146 ULTIMATE TITAN"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v145")
+log = logging.getLogger("v146")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -111,19 +111,21 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V145 VENGEANCE MATRIX
+# V146 ULTIMATE TITAN
 # =========================
-class VengeanceMatrix:
+class UltimateTitan:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # Meta-Learner Stats (Dynamic Weights)
+        # 6 Engines for Meta-Learner
         self.engine_stats = {
             'Run': {'w': 1, 'l': 0},
             'Markov': {'w': 1, 'l': 0},
             'ZScore': {'w': 1, 'l': 0},
-            'Chop': {'w': 1, 'l': 0}
+            'Entropy': {'w': 1, 'l': 0},
+            'CUSUM': {'w': 1, 'l': 0},
+            'Fuzzy': {'w': 1, 'l': 0}
         }
 
     async def fetch_data(self, session):
@@ -176,24 +178,21 @@ class VengeanceMatrix:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
-    # --- ENGINE 1: RUN PATTERN (HTML Logic) ---
+    # --- ENGINE 1: RUN PATTERN ---
     def analyze_run(self, seq):
         runs = []
-        curr = seq[0]
-        count = 1
+        curr, count = seq[0], 1
         for x in seq[1:]:
             if x == curr: count += 1
             else:
                 runs.append((curr, count))
-                curr = x
-                count = 1
+                curr, count = x, 1
         runs.append((curr, count))
         
         n = len(runs)
         if n < 3: return None
         
-        ongoing_side = runs[-1][0]
-        ongoing_len = runs[-1][1]
+        ongoing_side, ongoing_len = runs[-1]
         
         for k in [4, 3, 2]:
             if n < k + 1: continue
@@ -233,40 +232,63 @@ class VengeanceMatrix:
         return None
 
     # --- ENGINE 3: Z-SCORE (Mean Reversion) ---
-    def analyze_zscore(self, seq, threshold=1.8):
+    def analyze_zscore(self, seq):
         if len(seq) < 30: return None
         w = seq[-30:]
         big_c = sum(w)
         z = (big_c - 15) / math.sqrt(30 * 0.25)
-        if z > threshold: return (0, 0.75 + min(0.1, abs(z)*0.05))
-        if z < -threshold: return (1, 0.75 + min(0.1, abs(z)*0.05))
+        if z > 1.8: return (0, 0.8)
+        if z < -1.8: return (1, 0.8)
         return None
 
-    # --- ENGINE 4: EXHAUSTION (Streak Break) ---
-    def analyze_exhaustion(self, seq):
-        streak = 1
-        for i in range(len(seq)-2, -1, -1):
-            if seq[i] == seq[-1]: streak += 1
-            else: break
-            
-        if streak >= 4:
-            breaks, conts = 0, 0
-            for i in range(len(seq)-streak):
-                if all(seq[i+j] == seq[-1] for j in range(streak)):
-                    if i+streak < len(seq):
-                        if seq[i+streak] == seq[-1]: conts += 1
-                        else: breaks += 1
-            if breaks + conts >= 2:
-                if breaks > conts: return (1-seq[-1], 0.75)
-                else: return (seq[-1], 0.75)
-        return None
-
-    def analyze_chop(self, seq):
-        if len(seq) < 15: return None
-        w = seq[-15:]
-        switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
-        if switches >= 10:
+    # --- ENGINE 4: SHANNON ENTROPY (Chaos Detector) ---
+    def analyze_entropy(self, seq):
+        if len(seq) < 20: return None
+        w = seq[-20:]
+        p1 = sum(w) / 20.0
+        p0 = 1 - p1
+        ent = 0
+        if p1 > 0: ent -= p1 * math.log2(p1)
+        if p0 > 0: ent -= p0 * math.log2(p0)
+        
+        # High entropy = chaotic, expect flip. Low entropy = trending.
+        if ent > 0.95: # Chaos
             return (1 - seq[-1], 0.65)
+        elif ent < 0.5 and p1 > 0.5: # Strong Big Trend
+            return (1, 0.70)
+        elif ent < 0.5 and p1 < 0.5: # Strong Small Trend
+            return (0, 0.70)
+        return None
+
+    # --- ENGINE 5: CUSUM (Trend Shift Detector) ---
+    def analyze_cusum(self, seq):
+        if len(seq) < 30: return None
+        target = 0.5
+        pos_sum, neg_sum = 0.0, 0.0
+        for s in seq[-30:]:
+            pos_sum = max(0, pos_sum + s - target - 0.1)
+            neg_sum = max(0, neg_sum - s + target - 0.1)
+            
+        if pos_sum > 2.5: return (0, 0.75) # Shifted to BIG too much, expect SMALL
+        if neg_sum > 2.5: return (1, 0.75)
+        return None
+
+    # --- ENGINE 6: FUZZY N-GRAM (Hamming Distance) ---
+    def analyze_fuzzy(self, seq):
+        if len(seq) < 10: return None
+        target = seq[-6:]
+        best_match = None
+        max_matches = 0
+        
+        for i in range(len(seq) - 7):
+            window = seq[i:i+6]
+            matches = sum(1 for a, b in zip(target, window) if a == b)
+            if matches >= 5 and matches > max_matches:
+                max_matches = matches
+                best_match = seq[i+6]
+                
+        if best_match is not None:
+            return (best_match, 0.65 + (max_matches - 5) * 0.1)
         return None
 
     def generate_prediction(self):
@@ -275,67 +297,64 @@ class VengeanceMatrix:
         seq = [x["size"] for x in self.history]
         signals = {}
         
-        # Common Engines
-        ch = self.analyze_chop(seq)
-        if ch: signals['Chop'] = ch
-
-        if self.loss_streak == 0:
-            # NORMAL MODE
+        # 🔥 1 LOSS = ULTRA VENGEANCE
+        if self.loss_streak >= 1:
             zs = self.analyze_zscore(seq)
-            if zs: signals['ZScore'] = zs
-            rn = self.analyze_run(seq)
-            if rn: signals['Run'] = rn
-            mk = self.analyze_markov(seq, 4)
-            if mk: signals['Markov4'] = mk
-            
-        else:
-            # 🔥 SUPER DEEP VENGEANCE MODE (No BlindFlip)
-            # Level 1: Extreme Z-Score
-            zs = self.analyze_zscore(seq, threshold=1.2) # Lower threshold for vengeance
             if zs: signals['V_ZScore'] = zs
             
-            # Level 2: Deep Markov (6 down to 2)
-            for order in [6, 5, 4, 3, 2]:
+            cu = self.analyze_cusum(seq)
+            if cu: signals['V_CUSUM'] = cu
+            
+            for order in [6, 5, 4]:
                 mk = self.analyze_markov(seq, order)
                 if mk:
                     signals[f'V_Markov{order}'] = mk
-                    break # Deepest match found
+                    break
                     
-            # Level 3: Exhaustion / Streak Ride
-            ex = self.analyze_exhaustion(seq)
-            if ex: signals['V_Exhaustion'] = ex
+            en = self.analyze_entropy(seq)
+            if en: signals['V_Entropy'] = en
             
-            # Level 4: Safe Majority (If no strong pattern, follow the 30-round trend)
+            # If still no signals, Force Check Majority
             if not signals:
-                big_c = sum(seq[-30:])
-                if big_c >= 15:
-                    signals['SafeMajority'] = (1, 0.55)
-                else:
-                    signals['SafeMajority'] = (0, 0.55)
+                big_c = sum(seq[-20:])
+                signals['SafeMajority'] = (1 if big_c >= 10 else 0, 0.55)
 
-        # Dynamic Weighting (Meta-Learner)
+        # NORMAL MODE
+        else:
+            rn = self.analyze_run(seq)
+            if rn: signals['Run'] = rn
+            
+            fz = self.analyze_fuzzy(seq)
+            if fz: signals['Fuzzy'] = fz
+            
+            mk = self.analyze_markov(seq, 4)
+            if mk: signals['Markov4'] = mk
+            
+            zs = self.analyze_zscore(seq)
+            if zs: signals['ZScore'] = zs
+
+        # Meta-Learner Mixer
         total_w = 0
         log_odds = 0
         logic_tags = []
         
         for name, (direction, conf) in signals.items():
-            stats = self.engine_stats.get(name.split('_')[-1], {'w': 1, 'l': 0}) # strip V_ prefix
+            stats = self.engine_stats.get(name.split('_')[-1], {'w': 1, 'l': 0})
             acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
-            weight = max(0.5, acc * 2)
+            weight = max(0.5, acc * 2.5)
             weight *= (conf / 0.5)
             
             log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
             total_w += weight
             logic_tags.append(name)
 
-        # Final Decision
         pred_size = 1 if log_odds > 0 else 0
-        confidence = int(min(88, max(58, 50 + abs(log_odds) * 10)))
+        confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
 
         # Target Number
         target_num = self.get_best_number(self.history, pred_size)
 
-        mode = "SAFE_MODE" if self.loss_streak >= 2 else "VENGEANCE" if self.loss_streak == 1 else "NORMAL"
+        mode = "ULTRA_VENGEANCE" if self.loss_streak >= 1 else "NORMAL"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -347,7 +366,7 @@ class VengeanceMatrix:
             "sigs": list(signals.keys())
         }
 
-PREDICTOR = VengeanceMatrix()
+PREDICTOR = UltimateTitan()
 
 # =========================
 # FORMATTING
@@ -369,7 +388,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V145 VENGEANCE MATRIX</i>
+⚡ <i>V146 ULTIMATE TITAN</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -387,7 +406,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V145 Vengeance Matrix started...")
+    log.info("V146 Ultimate Titan started...")
     last_processed_issue = None
 
     while True:
@@ -436,7 +455,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V145 Vengeance Matrix is running!")
+    return web.Response(text="V146 Ultimate Titan is running!")
 
 async def main():
     CFG.validate()
