@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V142 HYPER-QUANTUM PRO"
+    bot_name: str = "V144 OMNI-MATRIX"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v142")
+log = logging.getLogger("v144")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -66,11 +66,6 @@ class Storage:
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
                     status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT, 
                     mode TEXT, logic TEXT, sigs TEXT, created_at REAL
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS vault (
-                    pat_key TEXT PRIMARY KEY, wins INTEGER, total INTEGER
                 )
             """)
 
@@ -113,50 +108,22 @@ class Storage:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
-    def update_vault(self, key, hit):
-        with self._conn() as c:
-            row = c.execute("SELECT wins, total FROM vault WHERE pat_key=?", (key,)).fetchone()
-            if row:
-                c.execute("UPDATE vault SET wins=?, total=? WHERE pat_key=?", (row[0]+hit, row[1]+1, key))
-            else:
-                c.execute("INSERT INTO vault (pat_key, wins, total) VALUES (?, ?, ?)", (key, hit, 1))
-                
-    def get_vault(self):
-        with self._conn() as c:
-            rows = c.execute("SELECT pat_key, wins, total FROM vault").fetchall()
-            return {k: (w, t) for k, w, t in rows}
-
 STORE = Storage(CFG.db_path)
 
 # =========================
-# UTILS & MATH
+# V144 OMNI-MATRIX
 # =========================
-def bayes_conf(wins, total):
-    if total == 0: return 0.5
-    return (wins + 1) / (total + 2)
-
-def sample_weight(total):
-    return total / (total + 5)
-
-def logit(p):
-    p = max(0.03, min(0.97, p))
-    return math.log(p / (1 - p))
-
-# =========================
-# V142 HYPER-QUANTUM PRO
-# =========================
-class HyperQuantumPro:
+class OmniMatrix:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
-        self.vault = STORE.get_vault()
         
+        # Meta-Learner Stats (Dynamic Weights)
         self.engine_stats = {
-            'RunPattern': {'wins': 0, 'total': 0},
-            'Markov': {'wins': 0, 'total': 0},
-            'ZScore': {'wins': 0, 'total': 0},
-            'Trend': {'wins': 0, 'total': 0},
-            'Exhaustion': {'wins': 0, 'total': 0}
+            'Run': {'w': 1, 'l': 0},
+            'Markov': {'w': 1, 'l': 0},
+            'ZScore': {'w': 1, 'l': 0},
+            'Chop': {'w': 1, 'l': 0}
         }
 
     async def fetch_data(self, session):
@@ -182,19 +149,7 @@ class HyperQuantumPro:
         except Exception:
             return False
 
-    def get_engine_weight(self, name):
-        stats = self.engine_stats[name]
-        if stats['total'] < 5: return 1.0
-        acc = stats['wins'] / stats['total']
-        return max(0.2, acc * 2)
-
-    def vault_mult(self, key):
-        if key not in self.vault: return 1.0
-        wins, total = self.vault[key]
-        acc = (wins + 1) / (total + 2)
-        return max(0.6, min(1.5, 1 + (acc - 0.5) * 4))
-
-    # --- EXACT CSV LOGIC: hxDigitScores ---
+    # --- EXACT CSV LOGIC: hxDigitScores (JACK MAKER) ---
     def get_best_number(self, data, side):
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
@@ -221,149 +176,138 @@ class HyperQuantumPro:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
-    # --- HTML RUN PATTERN LOGIC ---
-    def extract_runs(self, seq):
+    # --- ENGINE 1: RUN PATTERN (HTML Logic) ---
+    def analyze_run(self, seq):
         runs = []
-        if not seq: return runs
-        curr, length = seq[0], 1
+        curr = seq[0]
+        count = 1
         for x in seq[1:]:
-            if x == curr: length += 1
+            if x == curr: count += 1
             else:
-                runs.append({"side": curr, "len": length})
-                curr, length = x, 1
-        runs.append({"side": curr, "len": length})
-        return runs
-
-    def analyze_run(self, runs):
-        if len(runs) < 3: return None
-        ongoing = runs[-1]
-        best = None
+                runs.append((curr, count))
+                curr = x
+                count = 1
+        runs.append((curr, count))
         
-        for k in range(min(13, len(runs)), 2, -1):
-            window = runs[-k:]
-            prefix = window[:-1]
+        n = len(runs)
+        if n < 3: return None
+        
+        ongoing_side = runs[-1][0]
+        ongoing_len = runs[-1][1]
+        
+        for k in [4, 3, 2]:
+            if n < k + 1: continue
+            target = [r[1] for r in runs[-k:]]
             cont, brk = 0, 0
-            for j in range(k, len(runs) - 1):
+            
+            for j in range(k, n - 1):
                 cand = runs[j]
-                if cand['len'] < ongoing['len']: continue
+                if cand[1] < ongoing_len: continue
                 ok = True
-                for t in range(k - 1):
-                    if runs[j - (k - 1) + t]['len'] != prefix[t]['len']:
+                for t in range(k):
+                    if runs[j - k + t][1] != target[t]:
                         ok = False
                         break
                 if ok:
-                    if cand['len'] > ongoing['len']: cont += 1
+                    if cand[1] > ongoing_len: cont += 1
                     else: brk += 1
-            total = cont + brk
-            if total >= 3:
-                p_cont = bayes_conf(cont, total)
-                adj_p = 0.5 + (p_cont - 0.5) * sample_weight(total)
-                dir = ongoing['side'] if adj_p >= 0.5 else 1 - ongoing['side']
-                best = {
-                    'dir': dir,
-                    'conf': max(adj_p, 1 - adj_p),
-                    'key': f"Run{k}:{dir}",
-                    'weight': 1.5
-                }
-                break
-        return best
+                    
+            if cont + brk >= 2:
+                p_cont = (cont + 1) / (cont + brk + 2)
+                return (ongoing_side, p_cont) if p_cont >= 0.5 else (1 - ongoing_side, 1 - p_cont)
+        return None
 
-    # --- DEEP SIZE ENGINES ---
-    def analyze_markov6(self, sizes):
-        order = 6
-        if len(sizes) < order + 5: return None
-        state = tuple(sizes[-order:])
+    # --- ENGINE 2: DEEP MARKOV (Order 4 or 6) ---
+    def analyze_markov(self, seq, order=4):
+        if len(seq) < order + 5: return None
+        target = tuple(seq[-order:])
         big, small = 0, 0
-        for i in range(len(sizes) - order):
-            if tuple(sizes[i:i+order]) == state:
-                if sizes[i+order] == 1: big += 1
+        for i in range(len(seq) - order):
+            if tuple(seq[i:i+order]) == target:
+                if seq[i+order] == 1: big += 1
                 else: small += 1
         total = big + small
         if total >= 2:
-            p = bayes_conf(big, total)
-            return {'dir': 1 if p >= 0.5 else 0, 'conf': max(p, 1-p), 'key': f"Markov6", 'weight': 1.5}
+            p = (big + 1) / (total + 2)
+            return (1, p) if p >= 0.5 else (0, 1-p)
         return None
 
-    def analyze_zscore(self, sizes):
-        if len(sizes) < 30: return None
-        w = sizes[-30:]
+    # --- ENGINE 3: Z-SCORE (Mean Reversion) ---
+    def analyze_zscore(self, seq):
+        if len(seq) < 30: return None
+        w = seq[-30:]
         big_c = sum(w)
         z = (big_c - 15) / math.sqrt(30 * 0.25)
-        if z > 1.8:
-            return {'dir': 0, 'conf': 0.8, 'key': "ZScore_Extreme", 'weight': 2.0}
-        if z < -1.8:
-            return {'dir': 1, 'conf': 0.8, 'key': "ZScore_Extreme", 'weight': 2.0}
+        if z > 1.8: return (0, 0.8) # Expect SMALL
+        if z < -1.8: return (1, 0.8) # Expect BIG
         return None
 
-    def analyze_exhaustion(self, sizes):
-        streak = 1
-        for i in range(len(sizes)-2, -1, -1):
-            if sizes[i] == sizes[-1]: streak += 1
-            else: break
-            
-        if streak >= 5:
-            return {'dir': 1 - sizes[-1], 'conf': 0.75, 'key': f"Exhaustion({streak}x)", 'weight': 2.5}
+    # --- ENGINE 4: CHOP DETECTOR (Zigzag) ---
+    def analyze_chop(self, seq):
+        if len(seq) < 15: return None
+        w = seq[-15:]
+        switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
+        if switches >= 10:
+            return (1 - seq[-1], 0.65) # Force Flip
         return None
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
         
-        sizes = [x["size"] for x in self.history]
-        runs = self.extract_runs(sizes)
-        signals = []
+        seq = [x["size"] for x in self.history]
+        signals = {}
         
-        def add_sig(engine, res):
-            if not res: return
-            w = res['weight'] * self.get_engine_weight(engine) * self.vault_mult(res['key'])
-            signals.append({
-                'engine': engine,
-                'dir': res['dir'],
-                'conf': res['conf'],
-                'key': res['key'],
-                'weight': w
-            })
+        # 1. Check Common Engines
+        zs = self.analyze_zscore(seq)
+        if zs: signals['ZScore'] = zs
+        
+        ch = self.analyze_chop(seq)
+        if ch: signals['Chop'] = ch
 
-        # 🔥 1 LOSS = VENGEANCE MODE
-        if self.loss_streak >= 1:
-            # No Pattern, No Trend. Only Pure Math.
-            add_sig('ZScore', self.analyze_zscore(sizes))
-            add_sig('Markov', self.analyze_markov6(sizes))
-            add_sig('Exhaustion', self.analyze_exhaustion(sizes))
-            
-            if not signals:
-                add_sig('Trend', {'dir': 1 - sizes[-1], 'conf': 0.65, 'key': "Zigzag_Vengeance", 'weight': 2.0})
+        # 2. Mode-Based Activation
+        if self.loss_streak == 0:
+            # Normal Mode
+            rn = self.analyze_run(seq)
+            if rn: signals['Run'] = rn
+            mk = self.analyze_markov(seq, 4)
+            if mk: signals['Markov'] = mk
+        elif self.loss_streak == 1:
+            # 1 Loss = Vengeance Mode (Kill Run, Boost Markov-6)
+            mk = self.analyze_markov(seq, 6)
+            if mk: signals['Markov'] = mk
         else:
-            # SUPER ADVANCED NORMAL MODE
-            add_sig('RunPattern', self.analyze_run(runs))
-            add_sig('ZScore', self.analyze_zscore(sizes))
-            add_sig('Markov', self.analyze_markov6(sizes))
-            add_sig('Exhaustion', self.analyze_exhaustion(sizes))
+            # 2+ Losses = Absolute Safe Mode (Only Markov-6 + ZScore)
+            mk = self.analyze_markov(seq, 6)
+            if mk: signals['Markov'] = mk
+
+        # 3. Dynamic Weighting (Meta-Learner)
+        total_w = 0
+        log_odds = 0
+        logic_tags = []
+        
+        for name, (direction, conf) in signals.items():
+            stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
+            acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
+            weight = max(0.5, acc * 2) # Base weight
+            weight *= (conf / 0.5)     # Confidence multiplier
             
-            streak = 1
-            for i in range(len(sizes)-2, -1, -1):
-                if sizes[i] == sizes[-1]: streak += 1
-                else: break
-            if streak >= 3 and streak < 5:
-                add_sig('Trend', {'dir': sizes[-1], 'conf': 0.75, 'key': f"TrendLock({streak})", 'weight': 1.5})
+            log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
+            total_w += weight
+            logic_tags.append(name)
 
-        # Mixer
-        log_odds = 0.0
-        for s in signals:
-            log_odds += (1 if s['dir'] == 1 else -1) * logit(s['conf']) * s['weight']
-
+        # 4. Final Decision
         if not signals:
-            pred_size = 1 - sizes[-1]
-            confidence = 60
-            logic_tags = ["ForceFlip"]
+            pred_size = 1 - seq[-1] # Force Flip if blind
+            confidence = 55
+            logic_tags = ["BlindFlip"]
         else:
             pred_size = 1 if log_odds > 0 else 0
-            confidence = int(min(88, max(60, 50 + abs(log_odds) * 12)))
-            logic_tags = [s['key'] for s in signals]
+            confidence = int(min(88, max(55, 50 + abs(log_odds) * 10)))
 
-        # Target Number (CSV Logic)
+        # 5. Target Number
         target_num = self.get_best_number(self.history, pred_size)
 
-        mode = "DEEP_VENGEANCE" if self.loss_streak >= 1 else "HYPER_NORMAL"
+        mode = "SAFE_MODE" if self.loss_streak >= 2 else "VENGEANCE" if self.loss_streak == 1 else "NORMAL"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -372,10 +316,10 @@ class HyperQuantumPro:
             "confidence": confidence,
             "logic": " + ".join(logic_tags[:3]),
             "mode": mode,
-            "sigs": [{"k": s['key'], "engine": s['engine'], "hit": 0} for s in signals]
+            "sigs": list(signals.keys())
         }
 
-PREDICTOR = HyperQuantumPro()
+PREDICTOR = OmniMatrix()
 
 # =========================
 # FORMATTING
@@ -397,7 +341,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V142 HYPER-QUANTUM PRO</i>
+⚡ <i>V144 OMNI-MATRIX</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -415,7 +359,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V142 Hyper-Quantum Pro started...")
+    log.info("V144 Omni-Matrix started...")
     last_processed_issue = None
 
     while True:
@@ -428,15 +372,14 @@ async def worker_loop(app, session):
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
+                    # Update Meta-Learner
                     try:
                         sigs = json.loads(res['sigs'])
                         for s in sigs:
-                            STORE.update_vault(s['k'], 1 if res['win'] else 0)
-                            if s['engine'] in PREDICTOR.engine_stats:
-                                PREDICTOR.engine_stats[s['engine']]['total'] += 1
-                                if res['win']: PREDICTOR.engine_stats[s['engine']]['wins'] += 1
+                            if s in PREDICTOR.engine_stats:
+                                if res['win']: PREDICTOR.engine_stats[s]['w'] += 1
+                                else: PREDICTOR.engine_stats[s]['l'] += 1
                     except: pass
-                    PREDICTOR.vault = STORE.get_vault()
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -465,7 +408,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V142 Hyper-Quantum Pro is running!")
+    return web.Response(text="V144 Omni-Matrix is running!")
 
 async def main():
     CFG.validate()
