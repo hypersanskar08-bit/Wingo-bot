@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V170 ULTIMATE ADVANCED AI"
+    bot_name: str = "V172 HURST-ADAPTIVE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v170")
+log = logging.getLogger("v172")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -75,14 +75,6 @@ class Storage:
                 c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
             except sqlite3.OperationalError:
                 pass
-            # Expert Weights
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS expert_stats (
-                    name TEXT PRIMARY KEY, wins INTEGER, losses INTEGER
-                )
-            """)
-            for eng in ['Trend', 'CUSUM', 'Pattern', 'Math', 'Markov']:
-                c.execute("INSERT OR IGNORE INTO expert_stats (name, wins, losses) VALUES (?, 0, 0)", (eng,))
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=20)
@@ -123,41 +115,12 @@ class Storage:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
-    def update_expert(self, name, is_win):
-        with self._conn() as c:
-            if is_win:
-                c.execute("UPDATE expert_stats SET wins = wins + 1 WHERE name = ?", (name,))
-            else:
-                c.execute("UPDATE expert_stats SET losses = losses + 1 WHERE name = ?", (name,))
-                
-    def get_weights(self):
-        weights = {}
-        with self._conn() as c:
-            rows = c.execute("SELECT name, wins, losses FROM expert_stats").fetchall()
-            for name, w, l in rows:
-                total = w + l
-                if total < 3:
-                    weights[name] = 1.0
-                else:
-                    acc = w / total
-                    weights[name] = max(0.2, min(2.5, acc * 2.5))
-        return weights
-
 STORE = Storage(CFG.db_path)
 
 # =========================
-# MATH HELPERS
+# V172 HURST-ADAPTIVE ENGINE
 # =========================
-def wilson_lb(wins, total, z=1.64):
-    if total == 0: return 0
-    p = wins / total
-    d = 1 + z*z / total
-    return (p + z*z/(2*total) - z * math.sqrt(p*(1-p)/total + z*z/(4*total*total))) / d
-
-# =========================
-# V170 ULTIMATE ADVANCED ENGINE
-# =========================
-class UltimateAdvancedAI:
+class HurstAdaptive:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -185,8 +148,39 @@ class UltimateAdvancedAI:
         except Exception:
             return False
 
+    # 🔥 1. HURST EXPONENT (Fractal Analysis)
+    def get_hurst(self, ts):
+        lags = range(2, min(20, len(ts)//2))
+        tau = []
+        for lag in lags:
+            pp = [ts[i+lag] - ts[i] for i in range(len(ts)-lag)]
+            if not pp: continue
+            tau.append(math.sqrt(sum(p*p for p in pp) / len(pp)))
+            
+        if len(tau) < 2 or all(t == 0 for t in tau): return 0.5
+        
+        log_lags = [math.log(l) for l in lags][:len(tau)]
+        log_tau = [math.log(t) if t > 0 else -10 for t in tau]
+        
+        n = len(log_lags)
+        m_x = sum(log_lags) / n
+        m_y = sum(log_tau) / n
+        num = sum((log_lags[i] - m_x) * (log_tau[i] - m_y) for i in range(n))
+        den = sum((log_lags[i] - m_x)**2 for i in range(n))
+        
+        if den == 0: return 0.5
+        h_val = num / den
+        return max(0.0, min(1.0, h_val))
+
+    # 🔥 2. BOLLINGER BANDS
+    def get_bollinger(self, seq, window=20):
+        if len(seq) < window: return 0.5, 0.5
+        w = seq[-window:]
+        ma = sum(w) / window
+        std = math.sqrt(sum((x - ma)**2 for x in w) / window)
+        return ma, std
+
     def get_best_number(self, data, side):
-        # CSV fallback logic
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
         last_n = d[0]
@@ -208,139 +202,107 @@ class UltimateAdvancedAI:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
-    # 🔥 EXPERT 1: CUSUM (Trend Shift Detector)
-    def expert_cusum(self, seq):
-        if len(seq) < 20: return None
-        pos, neg = 0.0, 0.0
-        target, k, h_thresh = 0.5, 0.1, 2.0
-        
-        for s in seq[-30:]:
-            pos = max(0, pos + s - target - k)
-            neg = max(0, neg - s + target - k)
-            
-        if pos > h_thresh:
-            return 1, min(0.90, 0.60 + pos * 0.05), "CUSUM_Shift(B)" # Shifted to BIG
-        if neg > h_thresh:
-            return 0, min(0.90, 0.60 + neg * 0.05), "CUSUM_Shift(S)" # Shifted to SMALL
-        return None
-
-    # 🔥 EXPERT 2: PATTERN MATCHER (Length 3-12)
-    def expert_pattern(self, seq, nums):
-        best_sig = None
-        best_score = 0
-        
-        # Size Patterns (Length 6 to 12)
-        for L in range(12, 5, -1):
-            if len(seq) < L + 5: continue
-            target = tuple(seq[-L:])
-            big, small = 0, 0
-            for i in range(len(seq) - L):
-                if tuple(seq[i:i+L]) == target:
-                    if i+L < len(seq):
-                        if seq[i+L] == 1: big += 1
-                        else: small += 1
-            total = big + small
-            if total >= 3:
-                lb = wilson_lb(max(big, small), total)
-                if lb > 0.60 and lb > best_score:
-                    best_score = lb
-                    best_sig = (1 if big > small else 0, lb, f"SzPat{L}")
-                    
-        # Number Patterns (Length 3 to 5)
-        for L in range(5, 2, -1):
-            if len(nums) < L + 5: continue
-            target = tuple(nums[-L:])
-            big, small = 0, 0
-            for i in range(len(nums) - L):
-                if tuple(nums[i:i+L]) == target:
-                    if i+L < len(nums):
-                        if nums[i+L] >= 5: big += 1
-                        else: small += 1
-            total = big + small
-            if total >= 2:
-                lb = wilson_lb(max(big, small), total)
-                if lb > 0.60 and lb > best_score:
-                    best_score = lb
-                    best_sig = (1 if big > small else 0, lb, f"NumPat{L}")
-                    
-        return best_sig
-
-    # 🔥 EXPERT 3: MATH (Z-Score / Autocorr)
-    def expert_math(self, seq):
-        if len(seq) < 30: return None
-        w30 = seq[-30:]
-        z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
-        if z > 1.8: return 0, 0.75, "ZScore(S)"
-        if z < -1.8: return 1, 0.75, "ZScore(B)"
-        return None
-
     def generate_prediction(self):
         if len(self.history) < 50: return None
         
         seq = [x["size"] for x in self.history]
-        nums = [x["num"] for x in self.history]
-        weights = STORE.get_weights()
+        last_size = seq[-1]
         
-        signals = []
+        # Calculate Indicators
+        h_val = self.get_hurst(seq[-30:])
+        ma, std = self.get_bollinger(seq)
+        upper_band = ma + 2 * std
+        lower_band = ma - 2 * std
         
-        c_res = self.expert_cusum(seq)
-        if c_res: signals.append(('CUSUM', c_res))
-        
-        p_res = self.expert_pattern(seq, nums)
-        if p_res: signals.append(('Pattern', p_res))
-        
-        m_res = self.expert_math(seq)
-        if m_res: signals.append(('Math', m_res))
+        pred_size = last_size
+        confidence = 60
+        logic_tags = []
+        mode = "NORMAL"
 
         # ==========================================
-        # 🔥 RECOVERY MODE (High Priority)
+        # 🔥 1. RECOVERY MODE (Loss Hone Par)
         # ==========================================
         if self.loss_streak >= 1:
-            # Never use Z-Score in recovery. Only trust CUSUM Shift or Pattern.
-            valid_sigs = [s for s in signals if s[0] in ['CUSUM', 'Pattern']]
-            if valid_sigs:
-                best = max(valid_sigs, key=lambda x: x[1][1] * weights.get(x[0], 1.0))
-                tag = "REC_" + best[1][2]
-                return self._build_response(best[1][0], best[1][1], tag, "RECOVERY")
+            mode = "RECOVERY"
+            # In recovery, if Hurst is high, follow trend. If low, use mean reversion.
+            if h_val > 0.55:
+                pred_size = last_size
+                confidence = 75
+                logic_tags = ["REC_Trend_Cont"]
             else:
-                # If no signal, FORCE FLIP from last result (since 1 loss means last was wrong)
-                pred = 1 - seq[-1]
-                return self._build_response(pred, 0.75, "REC_ForceFlip", "RECOVERY")
+                if last_size >= upper_band:
+                    pred_size = 0
+                    confidence = 80
+                    logic_tags = ["REC_Bollinger_Rev"]
+                elif last_size <= lower_band:
+                    pred_size = 1
+                    confidence = 80
+                    logic_tags = ["REC_Bollinger_Rev"]
+                else:
+                    # Extreme Z-score
+                    w30 = seq[-30:]
+                    z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
+                    if z > 1.5: pred_size, confidence, logic_tags = 0, 75, ["REC_ZScore_S"]
+                    elif z < -1.5: pred_size, confidence, logic_tags = 1, 75, ["REC_ZScore_B"]
+                    else: pred_size, confidence, logic_tags = 1 - last_size, 65, ["REC_Flip"]
+                    
+        # ==========================================
+        # 🔥 2. TRENDING MARKET (Hurst > 0.55)
+        # ==========================================
+        elif h_val > 0.55:
+            mode = "TRENDING"
+            # Follow the trend
+            pred_size = last_size
+            confidence = min(85, 65 + (h_val - 0.55) * 100)
+            logic_tags = [f"Trend_Follow(H={h_val:.2f})"]
 
         # ==========================================
-        # 🔥 NORMAL MODE (Meta-Learner Mixer)
+        # 🔥 3. MEAN REVERTING MARKET (Hurst < 0.45)
         # ==========================================
-        if not signals:
-            # Absolute Fallback: Majority of last 10
-            pred = 1 if sum(seq[-10:]) >= 5 else 0
-            return self._build_response(pred, 0.55, "MajorityFallback", "NORMAL")
+        elif h_val < 0.45:
+            mode = "MEAN_REVERSION"
+            # Use Bollinger Bands
+            if last_size >= upper_band:
+                pred_size = 0
+                confidence = 78
+                logic_tags = [f"Bollinger_Rev(H={h_val:.2f})"]
+            elif last_size <= lower_band:
+                pred_size = 1
+                confidence = 78
+                logic_tags = [f"Bollinger_Rev(H={h_val:.2f})"]
+            else:
+                # Use Z-score
+                w30 = seq[-30:]
+                z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
+                if z > 1.0: pred_size, confidence, logic_tags = 0, 70, [f"ZScore_S(H={h_val:.2f})"]
+                elif z < -1.0: pred_size, confidence, logic_tags = 1, 70, [f"ZScore_B(H={h_val:.2f})"]
+                else: pred_size, confidence, logic_tags = last_size, 55, ["Random_Walk"]
 
-        log_odds = 0
-        logic_tags = []
-        
-        for name, (direction, conf, tag) in signals:
-            weight = weights.get(name, 1.0)
-            log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
-            logic_tags.append(tag)
+        # ==========================================
+        # 🔥 4. NEUTRAL MARKET (0.45 <= Hurst <= 0.55)
+        # ==========================================
+        else:
+            mode = "NEUTRAL"
+            # Wait for confirmation (MA Crossover)
+            ma5 = sum(seq[-5:]) / 5.0
+            ma20 = sum(seq[-20:]) / 20.0
+            if ma5 > ma20: pred_size, confidence, logic_tags = 1, 60, ["MA_Crossover_B"]
+            elif ma5 < ma20: pred_size, confidence, logic_tags = 0, 60, ["MA_Crossover_S"]
+            else: pred_size, confidence, logic_tags = last_size, 55, ["Neutral_Momentum"]
 
-        pred_size = 1 if log_odds > 0 else 0
-        confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
-
-        return self._build_response(pred_size, confidence/100, " + ".join(logic_tags[:2]), "NORMAL")
-
-    def _build_response(self, pred_size, conf, tag, mode):
         target_num = self.get_best_number(self.history, pred_size)
+        
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": target_num,
-            "confidence": int(min(90, max(55, conf * 100))),
-            "logic": tag,
+            "confidence": int(min(88, max(55, confidence))),
+            "logic": " + ".join(logic_tags),
             "mode": mode,
-            "sigs": [tag]
+            "sigs": logic_tags
         }
 
-PREDICTOR = UltimateAdvancedAI()
+PREDICTOR = HurstAdaptive()
 
 # =========================
 # FORMATTING
@@ -362,7 +324,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V170 ULTIMATE ADVANCED AI</i>
+⚡ <i>V172 HURST-ADAPTIVE ENGINE</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -380,7 +342,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V170 Ultimate Advanced AI started...")
+    log.info("V172 Hurst Adaptive started...")
     last_processed_issue = None
 
     while True:
@@ -392,16 +354,6 @@ async def worker_loop(app, session):
                 for res in resolved:
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
-                    
-                    try:
-                        sigs = json.loads(res.get('sigs') or '[]')
-                        for s in sigs:
-                            for eng in ['Trend', 'CUSUM', 'Pattern', 'Math', 'Markov']:
-                                if eng in s:
-                                    STORE.update_expert(eng, res['win'])
-                                    break
-                    except Exception:
-                        pass
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -430,7 +382,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V170 Ultimate is running!")
+    return web.Response(text="V172 Hurst Adaptive is running!")
 
 async def main():
     CFG.validate()
