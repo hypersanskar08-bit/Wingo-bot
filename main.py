@@ -31,8 +31,8 @@ class Config:
     db_path: str = "predictor.db"
     log_dir: str = "logs"
     fetch_every: float = 2.0
-    request_timeout: float = 10.0
-    bot_name: str = "V169 QUANTUM TITAN"
+    request_timeout: float = 15.0
+    bot_name: str = "V170 ULTIMATE ADVANCED AI"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v169")
+log = logging.getLogger("v170")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -75,12 +75,13 @@ class Storage:
                 c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
             except sqlite3.OperationalError:
                 pass
+            # Expert Weights
             c.execute("""
                 CREATE TABLE IF NOT EXISTS expert_stats (
                     name TEXT PRIMARY KEY, wins INTEGER, losses INTEGER
                 )
             """)
-            for eng in ['Trend', 'Chop', 'Pattern', 'Math', 'Markov']:
+            for eng in ['Trend', 'CUSUM', 'Pattern', 'Math', 'Markov']:
                 c.execute("INSERT OR IGNORE INTO expert_stats (name, wins, losses) VALUES (?, 0, 0)", (eng,))
 
     def _conn(self):
@@ -145,9 +146,18 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V169 QUANTUM TITAN
+# MATH HELPERS
 # =========================
-class QuantumTitan:
+def wilson_lb(wins, total, z=1.64):
+    if total == 0: return 0
+    p = wins / total
+    d = 1 + z*z / total
+    return (p + z*z/(2*total) - z * math.sqrt(p*(1-p)/total + z*z/(4*total*total))) / d
+
+# =========================
+# V170 ULTIMATE ADVANCED ENGINE
+# =========================
+class UltimateAdvancedAI:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -175,21 +185,8 @@ class QuantumTitan:
         except Exception:
             return False
 
-    def get_market_regime(self, seq):
-        """Detect Strong Trend, Chop or Neutral"""
-        if len(seq) < 10: return "NEUTRAL"
-        ma10 = sum(seq[-10:]) / 10.0
-        
-        if ma10 >= 0.7: return "STRONG_BIG"
-        if ma10 <= 0.3: return "STRONG_SMALL"
-        
-        w15 = seq[-15:]
-        switches = sum(1 for i in range(1, 15) if w15[i] != w15[i-1])
-        if switches >= 10: return "CHOP"
-        
-        return "NEUTRAL"
-
     def get_best_number(self, data, side):
+        # CSV fallback logic
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
         last_n = d[0]
@@ -211,26 +208,29 @@ class QuantumTitan:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
-    # 🔥 EXPERTS
-    def expert_trend(self, seq, regime):
-        if regime == "STRONG_BIG": return 1, 0.85, "Regime_Big"
-        if regime == "STRONG_SMALL": return 0, 0.85, "Regime_Small"
+    # 🔥 EXPERT 1: CUSUM (Trend Shift Detector)
+    def expert_cusum(self, seq):
+        if len(seq) < 20: return None
+        pos, neg = 0.0, 0.0
+        target, k, h_thresh = 0.5, 0.1, 2.0
         
-        streak = 1
-        for i in range(len(seq)-2, -1, -1):
-            if seq[i] == seq[-1]: streak += 1
-            else: break
-        if streak >= 3:
-            return seq[-1], min(0.9, 0.65 + streak * 0.05), f"Trend({streak}x)"
+        for s in seq[-30:]:
+            pos = max(0, pos + s - target - k)
+            neg = max(0, neg - s + target - k)
+            
+        if pos > h_thresh:
+            return 1, min(0.90, 0.60 + pos * 0.05), "CUSUM_Shift(B)" # Shifted to BIG
+        if neg > h_thresh:
+            return 0, min(0.90, 0.60 + neg * 0.05), "CUSUM_Shift(S)" # Shifted to SMALL
         return None
 
-    def expert_chop(self, seq, regime):
-        if regime == "CHOP":
-            return 1 - seq[-1], 0.75, "ChopFlip"
-        return None
-
+    # 🔥 EXPERT 2: PATTERN MATCHER (Length 3-12)
     def expert_pattern(self, seq, nums):
-        for L in range(12, 2, -1):
+        best_sig = None
+        best_score = 0
+        
+        # Size Patterns (Length 6 to 12)
+        for L in range(12, 5, -1):
             if len(seq) < L + 5: continue
             target = tuple(seq[-L:])
             big, small = 0, 0
@@ -241,15 +241,33 @@ class QuantumTitan:
                         else: small += 1
             total = big + small
             if total >= 3:
-                p = (big+1)/(total+2)
-                if p >= 0.65 or p <= 0.35:
-                    return (1 if p >= 0.5 else 0), max(p, 1-p), f"Pat{L}"
-        return None
+                lb = wilson_lb(max(big, small), total)
+                if lb > 0.60 and lb > best_score:
+                    best_score = lb
+                    best_sig = (1 if big > small else 0, lb, f"SzPat{L}")
+                    
+        # Number Patterns (Length 3 to 5)
+        for L in range(5, 2, -1):
+            if len(nums) < L + 5: continue
+            target = tuple(nums[-L:])
+            big, small = 0, 0
+            for i in range(len(nums) - L):
+                if tuple(nums[i:i+L]) == target:
+                    if i+L < len(nums):
+                        if nums[i+L] >= 5: big += 1
+                        else: small += 1
+            total = big + small
+            if total >= 2:
+                lb = wilson_lb(max(big, small), total)
+                if lb > 0.60 and lb > best_score:
+                    best_score = lb
+                    best_sig = (1 if big > small else 0, lb, f"NumPat{L}")
+                    
+        return best_sig
 
-    def expert_math(self, seq, regime):
-        # 🔥 Z-Score is DISABLED in Strong Trend
-        if regime in ["STRONG_BIG", "STRONG_SMALL"]: return None
-        
+    # 🔥 EXPERT 3: MATH (Z-Score / Autocorr)
+    def expert_math(self, seq):
+        if len(seq) < 30: return None
         w30 = seq[-30:]
         z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
         if z > 1.8: return 0, 0.75, "ZScore(S)"
@@ -261,46 +279,41 @@ class QuantumTitan:
         
         seq = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
-        regime = self.get_market_regime(seq)
         weights = STORE.get_weights()
         
         signals = []
         
-        t_res = self.expert_trend(seq, regime)
-        if t_res: signals.append(('Trend', t_res))
-        
-        c_res = self.expert_chop(seq, regime)
-        if c_res: signals.append(('Chop', c_res))
+        c_res = self.expert_cusum(seq)
+        if c_res: signals.append(('CUSUM', c_res))
         
         p_res = self.expert_pattern(seq, nums)
         if p_res: signals.append(('Pattern', p_res))
         
-        m_res = self.expert_math(seq, regime)
+        m_res = self.expert_math(seq)
         if m_res: signals.append(('Math', m_res))
 
         # ==========================================
         # 🔥 RECOVERY MODE (High Priority)
         # ==========================================
         if self.loss_streak >= 1:
-            # In recovery, never use Z-score. Only trust Trend or Pattern.
-            valid_sigs = [s for s in signals if s[0] in ['Trend', 'Pattern']]
+            # Never use Z-Score in recovery. Only trust CUSUM Shift or Pattern.
+            valid_sigs = [s for s in signals if s[0] in ['CUSUM', 'Pattern']]
             if valid_sigs:
                 best = max(valid_sigs, key=lambda x: x[1][1] * weights.get(x[0], 1.0))
                 tag = "REC_" + best[1][2]
                 return self._build_response(best[1][0], best[1][1], tag, "RECOVERY")
             else:
-                # Fallback to highest confidence signal available
-                if signals:
-                    best = max(signals, key=lambda x: x[1][1] * weights.get(x[0], 1.0))
-                    return self._build_response(best[1][0], best[1][1], "REC_"+best[1][2], "RECOVERY")
-                else:
-                    return self._build_response(seq[-1], 0.55, "REC_NoSignal", "RECOVERY")
+                # If no signal, FORCE FLIP from last result (since 1 loss means last was wrong)
+                pred = 1 - seq[-1]
+                return self._build_response(pred, 0.75, "REC_ForceFlip", "RECOVERY")
 
         # ==========================================
         # 🔥 NORMAL MODE (Meta-Learner Mixer)
         # ==========================================
         if not signals:
-            return self._build_response(seq[-1], 0.55, "Fallback", "NORMAL")
+            # Absolute Fallback: Majority of last 10
+            pred = 1 if sum(seq[-10:]) >= 5 else 0
+            return self._build_response(pred, 0.55, "MajorityFallback", "NORMAL")
 
         log_odds = 0
         logic_tags = []
@@ -321,13 +334,13 @@ class QuantumTitan:
             "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": target_num,
-            "confidence": int(min(88, max(52, conf * 100))),
+            "confidence": int(min(90, max(55, conf * 100))),
             "logic": tag,
             "mode": mode,
             "sigs": [tag]
         }
 
-PREDICTOR = QuantumTitan()
+PREDICTOR = UltimateAdvancedAI()
 
 # =========================
 # FORMATTING
@@ -349,7 +362,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V169 QUANTUM TITAN</i>
+⚡ <i>V170 ULTIMATE ADVANCED AI</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -367,7 +380,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V169 Quantum Titan started...")
+    log.info("V170 Ultimate Advanced AI started...")
     last_processed_issue = None
 
     while True:
@@ -383,7 +396,7 @@ async def worker_loop(app, session):
                     try:
                         sigs = json.loads(res.get('sigs') or '[]')
                         for s in sigs:
-                            for eng in ['Trend', 'Chop', 'Pattern', 'Math', 'Markov']:
+                            for eng in ['Trend', 'CUSUM', 'Pattern', 'Math', 'Markov']:
                                 if eng in s:
                                     STORE.update_expert(eng, res['win'])
                                     break
@@ -417,7 +430,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V169 Quantum Titan is running!")
+    return web.Response(text="V170 Ultimate is running!")
 
 async def main():
     CFG.validate()
