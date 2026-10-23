@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import random
 import sqlite3
 import time
 from collections import Counter
@@ -33,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V156 NEURAL APEX"
+    bot_name: str = "V158 PURE MATHEMATICAL"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -55,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v156")
+log = logging.getLogger("v158")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -119,22 +118,17 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V156 NEURAL APEX ENGINE (Fixed)
+# V158 PURE MATH ENGINE
 # =========================
-class NeuralApex:
+class PureMathEngine:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        self.engine_stats = {
-            'NeuralNet': {'w': 1, 'l': 0},
-            'DeepMarkov': {'w': 1, 'l': 0},
-            'CUSUM': {'w': 1, 'l': 0}
-        }
-        
-        # 🧠 Neural Network Weights (13 features)
-        self.weights = [0.0] * 13
-        self.lr = 0.1 # Learning rate
+        # 16 Mathematical Weights for Logistic Regression
+        # We start with 0 and let the Gradient Descent calculate them
+        self.weights = [0.0] * 16
+        self.lr = 0.05 # Learning Rate for Gradient Descent
 
     async def fetch_data(self, session):
         try:
@@ -159,79 +153,17 @@ class NeuralApex:
         except Exception:
             return False
 
-    def extract_features(self, seq):
-        if len(seq) < 30: return None
-        feat = [1.0] # Bias
+    # --- 1. PURE MATHEMATICAL FEATURES (16 Variables) ---
+    def extract_math_features(self, seq):
+        if len(seq) < 50: return None
+        feat = [1.0] # Bias (x0)
         
-        # 1. Last 5 sizes
+        # x1-x5: Last 5 sizes (1 for Big, 0 for Small)
         for i in range(1, 6):
-            feat.append(1.0 if seq[-i] == 1 else -1.0)
+            feat.append(float(seq[-i]))
             
-        # 2. Current Streak
-        streak = 1
-        for i in range(len(seq)-2, -1, -1):
-            if seq[i] == seq[-1]: streak += 1
-            else: break
-        feat.append(min(streak, 10) / 10.0)
-        
-        # 3. Z-Score
-        w = seq[-30:]
-        z = (sum(w) - 15) / math.sqrt(30 * 0.25)
-        feat.append(max(-2.0, min(2.0, z)) / 2.0)
-        
-        # 4. CUSUM
-        pos, neg = 0.0, 0.0
-        for s in seq[-30:]:
-            pos = max(0, pos + s - 0.6)
-            neg = max(0, neg - s + 0.4)
-        feat.append(min(1.0, pos / 3.0))
-        feat.append(min(1.0, neg / 3.0))
-        
-        # 5. Last 10 Big Count
-        feat.append(sum(seq[-10:]) / 10.0)
-        
-        # 6. Momentum
-        feat.append(sum(1 for x in seq[-5:] if x == 1) / 5.0)
-        
-        # 7. Volatility
-        switches = sum(1 for i in range(1, 10) if seq[-i] != seq[-i-1])
-        feat.append(switches / 9.0)
-        
-        # Ensure we have exactly 13 features
-        while len(feat) < 13: feat.append(0.0)
-        return feat[:13]
-
-    def sigmoid(self, x):
-        try:
-            return 1 / (1 + math.exp(-max(-20, min(20, x))))
-        except OverflowError:
-            return 0.0 if x < 0 else 1.0
-
-    def neural_predict(self, seq):
-        feat = self.extract_features(seq)
-        if not feat: return None, None
-        
-        z = sum(w * f for w, f in zip(self.weights, feat))
-        p_big = self.sigmoid(z)
-        
-        if 0.45 <= p_big <= 0.55: return None, None
-        
-        dir = 1 if p_big > 0.5 else 0
-        conf = max(p_big, 1 - p_big)
-        return (dir, conf), feat
-
-    def train_neural(self, feat, actual_size):
-        if not feat or len(feat) != 13: return
-        z = sum(w * f for w, f in zip(self.weights, feat))
-        pred = self.sigmoid(z)
-        
-        error = actual_size - pred
-        for i in range(13):
-            self.weights[i] += self.lr * error * feat[i]
-
-    def deep_markov(self, seq):
-        for order in [4, 3, 2]:
-            if len(seq) < order + 5: continue
+        # x6-x10: Markov Probabilities (Order 2, 3, 4, 5, 6)
+        for order in [2, 3, 4, 5, 6]:
             target = tuple(seq[-order:])
             big, small = 0, 0
             for i in range(len(seq) - order):
@@ -239,21 +171,71 @@ class NeuralApex:
                     if seq[i+order] == 1: big += 1
                     else: small += 1
             total = big + small
-            if total >= 3:
-                p = (big + 1) / (total + 2)
-                return (1 if p >= 0.5 else 0, max(p, 1-p)), f"Markov{order}"
-        return None, ""
-
-    def cusum_shift(self, seq):
-        if len(seq) < 30: return None, ""
+            # Laplace smoothing for pure probability
+            p = (big + 1) / (total + 2) if total > 0 else 0.5
+            feat.append(p)
+            
+        # x11: Z-Score (Last 30)
+        w30 = seq[-30:]
+        mean30 = sum(w30) / 30.0
+        variance = sum((x - mean30)**2 for x in w30) / 30.0
+        std_dev = math.sqrt(variance) if variance > 0 else 0.01
+        z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
+        feat.append(max(-3.0, min(3.0, z)) / 3.0) # Normalized Z-Score
+        
+        # x12: Z-Score (Last 50)
+        w50 = seq[-50:]
+        z50 = (sum(w50) - 25.0) / math.sqrt(50 * 0.25)
+        feat.append(max(-3.0, min(3.0, z50)) / 3.0)
+        
+        # x13-x14: CUSUM (Cumulative Sum)
         pos, neg = 0.0, 0.0
         for s in seq[-30:]:
             pos = max(0, pos + s - 0.6)
             neg = max(0, neg - s + 0.4)
-        if pos > 2.5: return (0, 0.8), "CUSUM_Shift(S)"
-        if neg > 2.5: return (1, 0.8), "CUSUM_Shift(B)"
-        return None, ""
+        feat.append(min(1.0, pos / 3.0))
+        feat.append(min(1.0, neg / 3.0))
+        
+        # x15: Shannon Entropy (Last 20)
+        w20 = seq[-20:]
+        p_big = sum(w20) / 20.0
+        p_small = 1.0 - p_big
+        entropy = 0.0
+        if p_big > 0: entropy -= p_big * math.log2(p_big)
+        if p_small > 0: entropy -= p_small * math.log2(p_small)
+        feat.append(entropy) # 0 to 1
+        
+        # x16: Trend Streak (Normalized)
+        streak = 1
+        for i in range(len(seq)-2, -1, -1):
+            if seq[i] == seq[-1]: streak += 1
+            else: break
+        feat.append(min(10, streak) / 10.0)
+        
+        return feat
 
+    def sigmoid(self, x):
+        try: return 1 / (1 + math.exp(-max(-20, min(20, x))))
+        except OverflowError: return 0.0 if x < 0 else 1.0
+
+    # --- 2. GRADIENT DESCENT TRAINING ---
+    def train_model(self, feat, actual_size):
+        if not feat or len(feat) != 16: return
+        z = sum(w * f for w, f in zip(self.weights, feat))
+        pred = self.sigmoid(z)
+        
+        # Pure math: Gradient Descent Update
+        error = actual_size - pred
+        for i in range(16):
+            self.weights[i] += self.lr * error * feat[i]
+
+    # --- 3. PURE CALCULATION PREDICTION ---
+    def calculate_prediction(self, feat):
+        if not feat: return 0.5
+        z = sum(w * f for w, f in zip(self.weights, feat))
+        return self.sigmoid(z)
+
+    # --- 4. JACK NUMBER LOGIC (CSV EXACT) ---
     def get_best_number(self, data, side):
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
@@ -280,47 +262,37 @@ class NeuralApex:
         if len(self.history) < 50: return None
         
         seq = [x["size"] for x in self.history]
-        signals = {}
         
-        # 1. Fetch Signals
-        nn_res, feat = self.neural_predict(seq)
-        if nn_res: signals['NeuralNet'] = (nn_res, "NeuralNet")
+        # 1. Extract 16 Math Features
+        feat = self.extract_math_features(seq)
+        if not feat: return None
         
-        mk, mk_tag = self.deep_markov(seq)
-        if mk: signals['DeepMarkov'] = (mk, mk_tag)
+        # 2. Calculate Probability (0.0 to 1.0)
+        p_big = self.calculate_prediction(feat)
         
-        cu, cu_tag = self.cusum_shift(seq)
-        if cu: signals['CUSUM'] = (cu, cu_tag)
-
-        # 2. Meta-Learner Mixer
-        log_odds = 0
+        # 3. Decision based on pure probability
+        pred_size = 1 if p_big >= 0.5 else 0
+        
+        # Confidence is the pure mathematical probability
+        # We cap it between 52% and 88% to avoid fake 99% claims
+        conf_val = p_big if pred_size == 1 else (1 - p_big)
+        confidence = int(min(88, max(52, conf_val * 100)))
+        
+        # 4. Logic Tags (For UI)
         logic_tags = []
+        if p_big > 0.6: logic_tags.append("Math_Strong_Big")
+        elif p_big < 0.4: logic_tags.append("Math_Strong_Small")
+        else: logic_tags.append("Math_Neutral")
         
-        for name, ((direction, conf), tag) in signals.items():
-            stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
-            acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
-            weight = max(0.2, acc * 2.5)
-            
-            # Recovery mode boost
-            if self.loss_streak >= 1 and name in ['CUSUM', 'DeepMarkov']:
-                weight *= 2.0
-            if self.loss_streak == 0 and name == 'NeuralNet':
-                weight *= 1.5
-                
-            log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
-            logic_tags.append(tag)
-
-        # 3. Final Decision
-        if not signals:
-            pred_size = 1 if sum(seq[-20:]) >= 10 else 0
-            confidence = 55
-            logic_tags = ["SafeMajority"]
-            mode = "NORMAL"
-        else:
-            pred_size = 1 if log_odds > 0 else 0
-            confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
-            mode = "RECOVERY" if self.loss_streak >= 1 else "NEURAL_MODE"
-
+        # Add dominant feature to logic
+        z = sum(w * f for w, f in zip(self.weights, feat))
+        max_w_idx = self.weights.index(max(self.weights))
+        if max_w_idx == 11 or max_w_idx == 12: logic_tags.append("ZScore_Dominant")
+        elif max_w_idx == 15: logic_tags.append("Streak_Dominant")
+        elif 6 <= max_w_idx <= 10: logic_tags.append("Markov_Dominant")
+        
+        mode = "RECOVERY" if self.loss_streak >= 1 else "PURE_MATH"
+        
         target_num = self.get_best_number(self.history, pred_size)
 
         return {
@@ -328,13 +300,12 @@ class NeuralApex:
             "size": "BIG" if pred_size == 1 else "SMALL",
             "num": target_num,
             "confidence": confidence,
-            "logic": " + ".join(logic_tags[:3]),
+            "logic": " + ".join(logic_tags),
             "mode": mode,
-            "sigs": list(signals.keys()),
-            "feat": feat
+            "sigs": logic_tags
         }
 
-PREDICTOR = NeuralApex()
+PREDICTOR = PureMathEngine()
 
 # =========================
 # FORMATTING
@@ -356,7 +327,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V156 NEURAL APEX</i>
+⚡ <i>V158 PURE MATHEMATICAL</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -374,7 +345,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V156 Neural Apex started...")
+    log.info("V158 Pure Math started...")
     last_processed_issue = None
 
     while True:
@@ -387,17 +358,6 @@ async def worker_loop(app, session):
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
-                    sigs_json = res.get('sigs')
-                    if sigs_json:
-                        try:
-                            sigs = json.loads(sigs_json)
-                            for s in sigs:
-                                if s in PREDICTOR.engine_stats:
-                                    if res['win']: PREDICTOR.engine_stats[s]['w'] += 1
-                                    else: PREDICTOR.engine_stats[s]['l'] += 1
-                        except Exception:
-                            pass
-                    
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
 
@@ -406,12 +366,12 @@ async def worker_loop(app, session):
                 
                 if latest_issue != last_processed_issue:
                     if not STORE.prediction_exists(next_issue):
-                        # Train Neural Net on the *previous* result before predicting next
+                        # 🧠 PURE MATH TRAINING: Learn from the immediate past result
                         if len(PREDICTOR.history) > 1:
                             past_seq = [x["size"] for x in PREDICTOR.history[:-1]]
-                            past_feat = PREDICTOR.extract_features(past_seq)
+                            past_feat = PREDICTOR.extract_math_features(past_seq)
                             if past_feat:
-                                PREDICTOR.train_neural(past_feat, PREDICTOR.history[-1]["size"])
+                                PREDICTOR.train_model(past_feat, PREDICTOR.history[-1]["size"])
 
                         p = PREDICTOR.generate_prediction()
                         if p:
@@ -432,7 +392,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V156 Neural Apex is running!")
+    return web.Response(text="V158 Pure Math is running!")
 
 async def main():
     CFG.validate()
