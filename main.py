@@ -33,7 +33,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V160 PURE MATH AI"
+    bot_name: str = "V161 HYBRID SYNC ENGINE"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -55,7 +55,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v160")
+log = logging.getLogger("v161")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -119,15 +119,15 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V160 PURE MATH ENGINE (FIXED)
+# V161 HYBRID ENGINE (Patterns + Neural Net)
 # =========================
-class PureMathEngine:
+class HybridSyncEngine:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # 16 Weights, initialized with random small values to avoid starting bias
-        self.weights = [random.uniform(-0.1, 0.1) for _ in range(16)]
+        # Weights for 20 features (Bias + Sizes + Markov + Math + Patterns)
+        self.weights = [random.uniform(-0.05, 0.05) for _ in range(20)]
         self.lr = 0.05 
 
     async def fetch_data(self, session):
@@ -153,15 +153,92 @@ class PureMathEngine:
         except Exception:
             return False
 
-    def extract_math_features(self, seq):
-        if len(seq) < 50: return None
+    # --- 🔥 PATTERN EXTRACTION (Sync Logic) ---
+    def get_run_pattern_signal(self, seq):
+        runs = []
+        curr, count = seq[0], 1
+        for x in seq[1:]:
+            if x == curr: count += 1
+            else:
+                runs.append((curr, count))
+                curr, count = x, 1
+        runs.append((curr, count))
+        
+        n = len(runs)
+        if n < 3: return 0.0 # Neutral
+        
+        ongoing_side, ongoing_len = runs[-1]
+        
+        for k in [4, 3, 2]:
+            if n < k + 1: continue
+            target = [r[1] for r in runs[-k:]]
+            cont, brk = 0, 0
+            for j in range(k, n - 1):
+                cand = runs[j]
+                if cand[1] < ongoing_len: continue
+                ok = True
+                for t in range(k):
+                    if runs[j - k + t][1] != target[t]:
+                        ok = False
+                        break
+                if ok:
+                    if cand[1] > ongoing_len: cont += 1
+                    else: brk += 1
+                    
+            if cont + brk >= 2:
+                p_cont = (cont + 1) / (cont + brk + 2)
+                # Return a value between -1.0 and +1.0
+                if p_cont >= 0.5:
+                    return (1.0 if ongoing_side == 1 else -1.0) * p_cont
+                else:
+                    return (1.0 if 1 - ongoing_side == 1 else -1.0) * (1 - p_cont)
+        return 0.0
+
+    def get_gap_pattern_signal(self, nums):
+        N = len(nums)
+        if N < 10: return 0.0, -1
+        cur = N - 1
+        
+        # Simplified gap matching
+        for i in range(max(0, N - 15), N - 1):
+            if nums[i] != nums[cur]: continue
+            common = [0]
+            for d in range(1, 8):
+                if i - d >= 0 and nums[i-d] == nums[cur-d]:
+                    common.append(d)
+            if len(common) >= 3:
+                dist = Counter()
+                for j in range(max(common), N - 1):
+                    if all(nums[j - off] == nums[cur - off] for off in common):
+                        dist[nums[j+1]] += 1
+                if sum(dist.values()) >= 2:
+                    b_cnt = sum(v for k, v in dist.items() if k >= 5)
+                    s_cnt = sum(v for k, v in dist.items() if k < 5)
+                    p_big = (b_cnt + 1) / (b_cnt + s_cnt + 2)
+                    
+                    vote_side = 1 if p_big >= 0.5 else 0
+                    # Find best number
+                    pool = [5,6,7,8,9] if vote_side == 1 else [0,1,2,3,4]
+                    best_num = pool[0]
+                    max_c = 0
+                    for k, v in dist.items():
+                        if k in pool and v > max_c:
+                            max_c = v
+                            best_num = k
+                            
+                    signal = (1.0 if vote_side == 1 else -1.0) * max(p_big, 1 - p_big)
+                    return signal, best_num
+        return 0.0, -1
+
+    # --- 🔥 FEATURE EXTRACTION (Math + Patterns) ---
+    def extract_features(self, seq, nums):
+        if len(seq) < 50: return None, -1
         feat = [1.0] # Bias
         
-        # 1. Last 5 sizes (-1 for Small, +1 for Big)
-        for i in range(1, 6):
-            feat.append(1.0 if seq[-i] == 1 else -1.0)
+        # 1-5: Last 5 sizes
+        for i in range(1, 6): feat.append(1.0 if seq[-i] == 1 else -1.0)
             
-        # 2. Markov Probabilities centered (-1 to +1)
+        # 6-10: Markov Probabilities
         for order in [2, 3, 4, 5, 6]:
             target = tuple(seq[-order:])
             big, small = 0, 0
@@ -171,21 +248,21 @@ class PureMathEngine:
                     else: small += 1
             total = big + small
             p = (big + 1) / (total + 2) if total > 0 else 0.5
-            feat.append((p - 0.5) * 2.0) # Centered
+            feat.append((p - 0.5) * 2.0)
             
-        # 3. Z-Score (Normalized)
+        # 11-12: Z-Score
         w30 = seq[-30:]
         z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
         feat.append(max(-2.0, min(2.0, z)) / 2.0)
         
-        # 4. CUSUM (Combined & Centered)
+        # 13: CUSUM
         pos, neg = 0.0, 0.0
         for s in seq[-30:]:
             pos = max(0, pos + s - 0.6)
             neg = max(0, neg - s + 0.4)
         feat.append(max(-1.0, min(1.0, (pos - neg) / 3.0)))
         
-        # 5. Shannon Entropy (-1 to +1)
+        # 14: Shannon Entropy
         w20 = seq[-20:]
         p_big = sum(w20) / 20.0
         p_small = 1.0 - p_big
@@ -194,7 +271,7 @@ class PureMathEngine:
         if p_small > 0: entropy -= p_small * math.log2(p_small)
         feat.append((entropy - 0.5) * 2.0) 
         
-        # 6. Trend Streak (Directional)
+        # 15: Streak
         streak = 1
         for i in range(len(seq)-2, -1, -1):
             if seq[i] == seq[-1]: streak += 1
@@ -202,40 +279,90 @@ class PureMathEngine:
         direction = 1.0 if seq[-1] == 1 else -1.0
         feat.append((min(10, streak) / 10.0) * direction)
 
-        # 7. Recent Momentum (Last 10)
+        # 16: Recent Momentum
         feat.append((sum(seq[-10:]) / 10.0 - 0.5) * 2.0)
         
-        return feat # Length is 16
+        # 🔥 17: RUN PATTERN SYNC
+        run_signal = self.get_run_pattern_signal(seq)
+        feat.append(run_signal)
+        
+        # 🔥 18: GAP PATTERN SYNC
+        gap_signal, gap_num = self.get_gap_pattern_signal(nums)
+        feat.append(gap_signal)
+        
+        # 19: Recent 5 BIG count
+        feat.append((sum(seq[-5:]) / 5.0 - 0.5) * 2.0)
+        
+        # 20: Recent 5 SMALL count
+        feat.append((sum(1 for x in seq[-5:] if x==0) / 5.0 - 0.5) * 2.0)
+        
+        return feat, gap_num # Total 20 features
 
     def sigmoid(self, x):
         try: return 1 / (1 + math.exp(-max(-20, min(20, x))))
         except OverflowError: return 0.0 if x < 0 else 1.0
 
     def train_model(self, feat, actual_size):
-        # 🔥 FIX: Feature length is 16, not 15
-        if not feat or len(feat) != 16: return
-        
+        if not feat or len(feat) != 20: return
         z = sum(w * f for w, f in zip(self.weights, feat))
         pred = self.sigmoid(z)
         
         error = actual_size - pred
-        for i in range(16): # 🔥 FIX: Loop 16 times
+        for i in range(20):
             reg = 0.001 * self.weights[i]
             self.weights[i] += self.lr * (error * feat[i] - reg)
 
-    def calculate_prediction(self, feat):
-        if not feat: return 0.5
+    def generate_prediction(self):
+        if len(self.history) < 50: return None
+        
+        seq = [x["size"] for x in self.history]
+        nums = [x["num"] for x in self.history]
+        
+        feat, gap_num = self.extract_features(seq, nums)
+        if not feat: return None
+        
         z = sum(w * f for w, f in zip(self.weights, feat))
-        return self.sigmoid(z)
+        p_big = self.sigmoid(z)
+        
+        pred_size = 1 if p_big >= 0.5 else 0
+        
+        conf_val = p_big if pred_size == 1 else (1 - p_big)
+        confidence = int(min(88, max(52, conf_val * 100)))
+        
+        # Determine Logic
+        logic_tags = []
+        if feat[16] != 0: logic_tags.append("RunPattern")
+        if feat[17] != 0: logic_tags.append("GapPattern")
+        if abs(feat[12]) > 0.5: logic_tags.append("CUSUM")
+        if abs(feat[11]) > 0.5: logic_tags.append("ZScore")
+        
+        if not logic_tags: logic_tags.append("PureMath")
+        logic_tags.append("AI_Sync")
 
-    def get_best_number(self, data, side):
-        d = [x['num'] for x in reversed(data[-60:])]
-        if not d: return 0
+        mode = "RECOVERY" if self.loss_streak >= 1 else "HYBRID_SYNC"
+        
+        # Target Number: Use Gap Num if found, else CSV logic
+        if gap_num != -1 and (gap_num >= 5) == (pred_size == 1):
+            target_num = gap_num
+        else:
+            target_num = self.get_csv_number(nums, pred_size)
+
+        return {
+            "issue": str(int(self.history[-1]["issue"]) + 1),
+            "size": "BIG" if pred_size == 1 else "SMALL",
+            "num": target_num,
+            "confidence": confidence,
+            "logic": " + ".join(logic_tags[:3]),
+            "mode": mode,
+            "sigs": logic_tags
+        }
+
+    def get_csv_number(self, nums, side):
+        d = nums[::-1]
         last_n = d[0]
         freq = Counter(d[:30])
         tm = Counter()
-        for i in range(1, len(d)):
-            tm[f"{d[i]}>{d[i-1]}"] += 1
+        for i in range(1, len(d)): tm[f"{d[i]}>{d[i-1]}"] += 1
         pool = [5, 6, 7, 8, 9] if side == 1 else [0, 1, 2, 3, 4]
         
         scored = []
@@ -246,50 +373,10 @@ class PureMathEngine:
             nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
             s = gg * 1.2 + freq.get(num, 0) * 1.5 + tr * 3 + nh
             scored.append((s, num))
-            
         scored.sort(key=lambda x: (-x[0], x[1]))
-        return scored[0][1] if scored else pool[0]
+        return scored[0][1]
 
-    def generate_prediction(self):
-        if len(self.history) < 50: return None
-        
-        seq = [x["size"] for x in self.history]
-        feat = self.extract_math_features(seq)
-        if not feat: return None
-        
-        p_big = self.calculate_prediction(feat)
-        
-        # Pure Mathematical Decision
-        pred_size = 1 if p_big >= 0.5 else 0
-        
-        conf_val = p_big if pred_size == 1 else (1 - p_big)
-        confidence = int(min(88, max(52, conf_val * 100)))
-        
-        logic_tags = []
-        if p_big > 0.55: logic_tags.append("Math_Big")
-        elif p_big < 0.45: logic_tags.append("Math_Small")
-        else: logic_tags.append("Math_Neutral")
-        
-        z = sum(w * f for w, f in zip(self.weights, feat))
-        max_w_idx = self.weights.index(max(self.weights))
-        if max_w_idx in [11, 12]: logic_tags.append("ZScore")
-        elif max_w_idx == 14: logic_tags.append("Streak")
-        elif 6 <= max_w_idx <= 10: logic_tags.append("Markov")
-        
-        mode = "RECOVERY" if self.loss_streak >= 1 else "PURE_MATH"
-        target_num = self.get_best_number(self.history, pred_size)
-
-        return {
-            "issue": str(int(self.history[-1]["issue"]) + 1),
-            "size": "BIG" if pred_size == 1 else "SMALL",
-            "num": target_num,
-            "confidence": confidence,
-            "logic": " + ".join(logic_tags),
-            "mode": mode,
-            "sigs": logic_tags
-        }
-
-PREDICTOR = PureMathEngine()
+PREDICTOR = HybridSyncEngine()
 
 # =========================
 # FORMATTING
@@ -311,7 +398,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V160 PURE MATH AI</i>
+⚡ <i>V161 HYBRID SYNC ENGINE</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -329,7 +416,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V160 Pure Math started...")
+    log.info("V161 Hybrid Sync started...")
     last_processed_issue = None
 
     while True:
@@ -350,10 +437,10 @@ async def worker_loop(app, session):
                 
                 if latest_issue != last_processed_issue:
                     if not STORE.prediction_exists(next_issue):
-                        # Train on immediate past result
                         if len(PREDICTOR.history) > 1:
                             past_seq = [x["size"] for x in PREDICTOR.history[:-1]]
-                            past_feat = PREDICTOR.extract_math_features(past_seq)
+                            past_nums = [x["num"] for x in PREDICTOR.history[:-1]]
+                            past_feat, _ = PREDICTOR.extract_features(past_seq, past_nums)
                             if past_feat:
                                 PREDICTOR.train_model(past_feat, PREDICTOR.history[-1]["size"])
 
@@ -376,7 +463,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V160 Pure Math is running!")
+    return web.Response(text="V161 Hybrid Sync is running!")
 
 async def main():
     CFG.validate()
