@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V150 TITAN BREAKER (FIXED)"
+    bot_name: str = "V150 TITAN BREAKER"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -60,7 +60,11 @@ def h(x: Any) -> str: return html.escape(str(x))
 class Storage:
     def __init__(self, path: str):
         self.path = path
+        self._init_db()
+
+    def _init_db(self):
         with self._conn() as c:
+            # Table create
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
                     issue TEXT PRIMARY KEY, size TEXT, num INTEGER,
@@ -68,11 +72,12 @@ class Storage:
                     mode TEXT, logic TEXT, sigs TEXT, created_at REAL
                 )
             """)
-            # 🔥 FIX: Add sigs column if it doesn't exist in old DB
+            # 🔥 FIX: Auto-Migration for old DBs missing 'sigs'
             try:
                 c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
+                log.info("Added 'sigs' column to existing database")
             except sqlite3.OperationalError:
-                pass
+                pass # Column already exists
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=20)
@@ -363,7 +368,8 @@ class TitanBreaker:
             "confidence": confidence,
             "logic": " + ".join(logic_tags[:3]),
             "mode": mode,
-            "regime": regime
+            "regime": regime,
+            "sigs": list(self.engine_stats.keys()) # Safe default
         }
 
 PREDICTOR = TitanBreaker()
@@ -420,7 +426,7 @@ async def worker_loop(app, session):
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
-                    # 🔥 FIX: Safe parsing for old DB records
+                    # 🔥 FIX: Safely parse 'sigs' and avoid KeyError
                     sigs_json = res.get('sigs')
                     if sigs_json:
                         try:
@@ -431,7 +437,7 @@ async def worker_loop(app, session):
                                     if res['win']: PREDICTOR.engine_stats[name]['w'] += 1
                                     else: PREDICTOR.engine_stats[name]['l'] += 1
                         except Exception:
-                            pass
+                            pass # Ignore if old DB has bad JSON
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -476,7 +482,7 @@ async def main():
     
     async with app:
         await app.start()
-        # 🔥 FIX: Clear webhook to avoid Conflict error
+        # 🔥 FIX: Ensure webhook is deleted to clear old conflicts
         await app.bot.delete_webhook(drop_pending_updates=True)
         await app.updater.start_polling(drop_pending_updates=True)
         
