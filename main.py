@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V147 HYPER-QUANTUM OMEGA"
+    bot_name: str = "V150 TITAN BREAKER"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v147")
+log = logging.getLogger("v150")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -111,20 +111,18 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V147 OMEGA ENGINE
+# V150 TITAN BREAKER
 # =========================
-class OmegaEngine:
+class TitanBreaker:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # Meta-Learner Weights
         self.engine_stats = {
             'Markov': {'w': 2.0, 'l': 0},
             'ZScore': {'w': 1.5, 'l': 0},
-            'Chop': {'w': 1.5, 'l': 0},
-            'EWMA': {'w': 1.0, 'l': 0},
-            'Run': {'w': 1.0, 'l': 0}
+            'CUSUM': {'w': 1.5, 'l': 0},
+            'Exhaustion': {'w': 2.0, 'l': 0}
         }
 
     async def fetch_data(self, session):
@@ -150,34 +148,140 @@ class OmegaEngine:
         except Exception:
             return False
 
-    # --- EXACT CSV LOGIC: hxDigitScores ---
     def get_best_number(self, data, side):
-        d = [x['num'] for x in reversed(data[-60:])]
+        d = [x['num'] for x in reversed(data[-80:])]
         if not d: return 0
         last_n = d[0]
-        freq = Counter(d[:30])
-        tm = Counter()
+        trans = Counter()
         for i in range(1, len(d)):
-            tm[f"{d[i]}>{d[i-1]}"] += 1
+            if d[i] == last_n: trans[d[i-1]] += 1
+        gaps = {i: 80 for i in range(10)}
+        for i in range(len(d)):
+            if gaps[d[i]] == 80: gaps[d[i]] = i
+        freq = Counter(d[:30])
         pool = [5, 6, 7, 8, 9] if side == 1 else [0, 1, 2, 3, 4]
-        scored = []
-        for num in pool:
-            gp = d.index(num) if num in pool else 60
-            gg = min(gp, 30)
-            tr = tm.get(f"{last_n}>{num}", 0)
-            nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
-            s = gg * 1.2 + freq.get(num, 0) * 1.5 + tr * 3 + nh
-            scored.append((s, num))
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return scored[0][1] if scored else pool[0]
-
-    # --- ENGINE 1: BAYESIAN MARKOV (Multi-Order) ---
-    def analyze_markov(self, seq):
-        # Check orders from 6 down to 2
-        best_order, best_conf = 0, 0.5
-        best_dir = None
         
-        for order in [6, 5, 4, 3, 2]:
+        best_num, best_score = pool[0], -999
+        for n in pool:
+            trans_score = trans.get(n, 0) * 4.0
+            gap_score = min(gaps[n], 30) * 1.5
+            freq_score = freq.get(n, 0) * 1.0
+            neigh_score = 3.0 if (n == (last_n + 1) % 10 or n == (last_n - 1 + 10) % 10) else 0
+            total = trans_score + gap_score + freq_score + neigh_score + (n * 0.01)
+            if total > best_score:
+                best_score = total
+                best_num = n
+        return best_num
+
+    def get_market_regime(self, seq):
+        if len(seq) < 15: return "NORMAL"
+        w = seq[-15:]
+        switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
+        rate = switches / 14.0
+        if rate >= 0.73: return "ZIGZAG"
+        if rate <= 0.40: return "TREND"
+        return "NORMAL"
+
+    # ==========================================
+    # 🔥 THE 5 SIGNALS OF TREND BREAK DETECTOR
+    # ==========================================
+    
+    # Signal 1: CUSUM (Statistical Shift Detector)
+    def signal_cusum(self, seq):
+        if len(seq) < 30: return 0
+        pos_sum, neg_sum = 0.0, 0.0
+        for s in seq[-30:]:
+            pos_sum = max(0, pos_sum + s - 0.6)
+            neg_sum = max(0, neg_sum - s + 0.4)
+        if pos_sum > 2.5: return 1  # Shift to SMALL (against BIG trend)
+        if neg_sum > 2.5: return 1  # Shift to BIG (against SMALL trend)
+        return 0
+    
+    # Signal 2: Run-Length Exhaustion (History Based)
+    def signal_exhaustion(self, seq):
+        streak = 1
+        for i in range(len(seq)-2, -1, -1):
+            if seq[i] == seq[-1]: streak += 1
+            else: break
+            
+        if streak < 4: return 0
+        
+        # Check history: when N-length streaks happened, did they break?
+        breaks, conts = 0, 0
+        for i in range(len(seq) - streak):
+            if all(seq[i+j] == seq[-1] for j in range(streak)):
+                if i + streak < len(seq):
+                    if seq[i+streak] == seq[-1]: conts += 1
+                    else: breaks += 1
+        
+        total = breaks + conts
+        if total >= 2 and breaks / total >= 0.60:  # 60%+ historically break
+            return 1
+        return 0
+    
+    # Signal 3: Volatility Spike (Inconsistency)
+    def signal_volatility(self, seq):
+        if len(seq) < 10: return 0
+        # If last 5 results had variance in NUMBER (not size), trend may be breaking
+        w = seq[-10:]
+        # Check if there's an "opposite" mixed in recently
+        last_side = seq[-1]
+        opposite_count = sum(1 for x in w[-5:] if x != last_side)
+        if opposite_count >= 1:  # At least 1 opposite in last 5
+            return 1
+        return 0
+
+    # Signal 4: EWMA Crossover
+    def signal_ewma(self, seq):
+        if len(seq) < 20: return 0
+        alpha_s = 0.4  # Fast
+        alpha_l = 0.1  # Slow
+        
+        ema_s = seq[-20]
+        ema_l = seq[-20]
+        for x in seq[-19:]:
+            ema_s = alpha_s * x + (1 - alpha_s) * ema_s
+            ema_l = alpha_l * x + (1 - alpha_l) * ema_l
+        
+        diff = ema_s - ema_l
+        last_side = seq[-1]
+        
+        # If fast EMA crosses slow EMA in opposite direction, break incoming
+        if last_side == 1 and diff < -0.1: return 1
+        if last_side == 0 and diff > 0.1: return 1
+        return 0
+
+    # Signal 5: Markov Anti-Pattern (Weak Signal, Low Weight)
+    def signal_antimarkov(self, seq):
+        order = 3
+        if len(seq) < order + 5: return 0
+        target = tuple(seq[-order:])
+        big, small = 0, 0
+        for i in range(len(seq) - order):
+            if tuple(seq[i:i+order]) == target:
+                if seq[i+order] == 1: big += 1
+                else: small += 1
+        total = big + small
+        if total >= 3:
+            # If history STRONGLY suggests flip (70%+)
+            if seq[-1] == 1 and small / total >= 0.70: return 1
+            if seq[-1] == 0 and big / total >= 0.70: return 1
+        return 0
+    
+    # Aggregate Break Score
+    def calculate_break_score(self, seq):
+        signals = {
+            'CUSUM': self.signal_cusum(seq),
+            'Exhaustion': self.signal_exhaustion(seq),
+            'Volatility': self.signal_volatility(seq),
+            'EWMA': self.signal_ewma(seq),
+            'AntiMarkov': self.signal_antimarkov(seq)
+        }
+        total = sum(signals.values())
+        return total, signals
+
+    def analyze_markov(self, seq):
+        for order in [5, 4, 3, 2]:
             if len(seq) < order + 5: continue
             target = tuple(seq[-order:])
             big, small = 0, 0
@@ -186,112 +290,104 @@ class OmegaEngine:
                     if seq[i+order] == 1: big += 1
                     else: small += 1
             total = big + small
-            
-            # Bayesian Smoothing
-            p = (big + 1) / (total + 2)
-            conf = max(p, 1-p)
-            
-            # Weigh confidence by sample size (Laplace)
-            weighted_conf = conf * (total / (total + 5))
-            
-            if weighted_conf > best_conf:
-                best_conf = weighted_conf
-                best_order = order
-                best_dir = 1 if p >= 0.5 else 0
-                
-        if best_order > 0:
-            return (best_dir, best_conf * 1.2), f"M{best_order}"
+            if total >= 3:
+                p = (big + 1) / (total + 2)
+                return (1 if p >= 0.5 else 0, max(p, 1-p)), f"M{order}"
         return None, ""
 
-    # --- ENGINE 2: Z-SCORE (Mean Reversion) ---
     def analyze_zscore(self, seq):
         if len(seq) < 30: return None, ""
         w = seq[-30:]
-        big_c = sum(w)
-        z = (big_c - 15) / math.sqrt(30 * 0.25)
+        z = (sum(w) - 15) / math.sqrt(30 * 0.25)
         if z > 1.6: return (0, 0.8), "ZScore(S)"
         if z < -1.6: return (1, 0.8), "ZScore(B)"
-        return None, ""
-
-    # --- ENGINE 3: CHOP SHIELD (Zigzag Detector) ---
-    def analyze_chop(self, seq):
-        if len(seq) < 15: return None, ""
-        w = seq[-15:]
-        switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
-        if switches >= 10:
-            return (1 - seq[-1], 0.75), "ChopFlip"
-        return None, ""
-
-    # --- ENGINE 4: EWMA (Trend Direction) ---
-    def analyze_ewma(self, seq):
-        if len(seq) < 20: return None, ""
-        alpha = 0.3
-        ema = seq[-20]
-        for x in seq[-19:]:
-            ema = alpha * x + (1 - alpha) * ema
-        sma = sum(seq[-20:]) / 20
-        diff = ema - sma
-        if diff > 0.15: return (1, 0.65), "EWMA(B)"
-        if diff < -0.15: return (0, 0.65), "EWMA(S)"
         return None, ""
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
         
         seq = [x["size"] for x in self.history]
-        signals = {}
+        last_size = seq[-1]
+        regime = self.get_market_regime(seq)
         
-        # 1. Always run ZScore and Chop (They are reliable)
-        zs, zs_tag = self.analyze_zscore(seq)
-        if zs: signals['ZScore'] = (zs, zs_tag)
-        
-        ch, ch_tag = self.analyze_chop(seq)
-        if ch: signals['Chop'] = (ch, ch_tag)
-
-        # 2. Mode Based Engines
-        if self.loss_streak == 0:
-            # NORMAL MODE
-            mk, mk_tag = self.analyze_markov(seq)
-            if mk: signals['Markov'] = (mk, mk_tag)
-            
-            ew, ew_tag = self.analyze_ewma(seq)
-            if ew: signals['EWMA'] = (ew, ew_tag)
-        else:
-            # ULTRA VENGEANCE MODE (No Run Pattern, Only Deep Math)
-            mk, mk_tag = self.analyze_markov(seq)
-            if mk: signals['Markov'] = (mk, mk_tag)
-            
-            ew, ew_tag = self.analyze_ewma(seq)
-            if ew: signals['EWMA'] = (ew, ew_tag)
-
-        # 3. Meta-Learner Mixer
-        log_odds = 0
+        pred_size = last_size
+        confidence = 60
         logic_tags = []
-        
-        for name, ((direction, conf), tag) in signals.items():
-            stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
-            acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
-            weight = max(0.2, acc * 2.5) # Engines with bad history get 0.2 weight
-            
-            # Apply weight to log odds
-            log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
-            logic_tags.append(tag)
 
-        # 4. Final Decision
-        if not signals:
-            # Absolute Fallback (Majority)
-            big_c = sum(seq[-20:])
-            pred_size = 1 if big_c >= 10 else 0
-            confidence = 55
-            logic_tags = ["MajorityFallback"]
+        # ==========================================
+        # 🛑 ZIGZAG MODE
+        # ==========================================
+        if regime == "ZIGZAG":
+            pred_size = 1 - last_size
+            confidence = 75
+            logic_tags = ["ZIGZAG_FLIP"]
+
+        # ==========================================
+        # 🚀 TREND MODE + STRONG BREAK DETECTOR
+        # ==========================================
+        elif regime == "TREND":
+            streak = 1
+            for i in range(len(seq)-2, -1, -1):
+                if seq[i] == last_size: streak += 1
+                else: break
+
+            # 🔥 CALCULATE BREAK SCORE (5 Signals)
+            break_score, break_signals = self.calculate_break_score(seq)
+            active_signals = [k for k, v in break_signals.items() if v == 1]
+
+            if break_score >= 3:
+                # STRONG BREAK: 3+ signals agree
+                pred_size = 1 - last_size
+                confidence = min(88, 70 + break_score * 3)
+                logic_tags = [f"BREAK({break_score}/5)"]
+                if break_score == 5:
+                    logic_tags = ["MEGA_BREAK(5/5)"]
+            elif break_score == 2:
+                # WEAK BREAK: Mixed signals. Follow trend but at low confidence.
+                pred_size = last_size
+                confidence = 60
+                logic_tags = [f"TREND_RIDE({streak}x)", f"Warn_Break({break_score}/5)"]
+            else:
+                # NO BREAK: Follow trend strongly
+                pred_size = last_size
+                confidence = min(88, 70 + streak * 2)
+                logic_tags = [f"TREND_RIDE({streak}x)"]
+
+        # ==========================================
+        # 🧠 NORMAL MODE
+        # ==========================================
         else:
-            pred_size = 1 if log_odds > 0 else 0
-            confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
+            signals = {}
+            zs, zs_tag = self.analyze_zscore(seq)
+            if zs: signals['ZScore'] = (zs, zs_tag)
+            mk, mk_tag = self.analyze_markov(seq)
+            if mk: signals['Markov'] = (mk, mk_tag)
+            
+            # Check for break even in normal mode
+            break_score, _ = self.calculate_break_score(seq)
+            if break_score >= 3:
+                pred_size = 1 - last_size
+                confidence = 75
+                logic_tags = ["NORMAL_BREAK"]
+            else:
+                log_odds = 0
+                for name, ((direction, conf), tag) in signals.items():
+                    stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
+                    acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
+                    weight = max(0.2, acc * 2.5)
+                    log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
+                    logic_tags.append(tag)
 
-        # 5. Target Number
+                if not signals:
+                    pred_size = 1 if sum(seq[-20:]) >= 10 else 0
+                    confidence = 55
+                    logic_tags = ["Fallback"]
+                else:
+                    pred_size = 1 if log_odds > 0 else 0
+                    confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
+
         target_num = self.get_best_number(self.history, pred_size)
-
-        mode = "OMEGA_VENGEANCE" if self.loss_streak >= 1 else "NORMAL"
+        mode = "VENGEANCE" if self.loss_streak >= 1 else "NORMAL"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -300,10 +396,10 @@ class OmegaEngine:
             "confidence": confidence,
             "logic": " + ".join(logic_tags[:3]),
             "mode": mode,
-            "sigs": list(signals.keys())
+            "regime": regime
         }
 
-PREDICTOR = OmegaEngine()
+PREDICTOR = TitanBreaker()
 
 # =========================
 # FORMATTING
@@ -320,12 +416,13 @@ def format_prediction(p, recent_rows):
 
 📈 <b>Confidence</b>: {p['confidence']}%
 🧠 <b>Logic</b>: {h(p['logic'])}
-⚖️ <b>Mode</b>: <b>{h(p['mode'])}</b>
+⚖️ <b>Regime</b>: <b>{h(p['regime'])}</b>
+🔮 <b>Mode</b>: <b>{h(p['mode'])}</b>
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V147 HYPER-QUANTUM OMEGA</i>
+⚡ <i>V150 TITAN BREAKER</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -343,7 +440,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V147 Omega started...")
+    log.info("V150 Titan Breaker started...")
     last_processed_issue = None
 
     while True:
@@ -392,7 +489,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V147 Omega is running!")
+    return web.Response(text="V150 Titan Breaker is running!")
 
 async def main():
     CFG.validate()
