@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V155 APEX PREDATOR"
+    bot_name: str = "V155 APEX PREDATOR (FIXED)"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -118,7 +118,7 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V155 APEX PREDATOR (META-LEARNER + ADVANCED RECOVERY)
+# V155 APEX PREDATOR
 # =========================
 class ApexPredator:
     def __init__(self):
@@ -126,7 +126,6 @@ class ApexPredator:
         self.loss_streak = 0
         self.last_pred_size = None
         
-        # Meta-Learner Memory
         self.engine_stats = {
             'Markov': {'w': 2.0, 'l': 0},
             'ZScore': {'w': 1.5, 'l': 0},
@@ -158,7 +157,6 @@ class ApexPredator:
         except Exception:
             return False
 
-    # --- EXACT CSV LOGIC (JACK MAKER) ---
     def get_best_number(self, data, side):
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
@@ -182,7 +180,6 @@ class ApexPredator:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
-    # --- ENGINES ---
     def analyze_markov(self, seq, order=4):
         if len(seq) < order + 5: return None, ""
         target = tuple(seq[-order:])
@@ -239,65 +236,55 @@ class ApexPredator:
         last_size = seq[-1]
         signals = {}
         
-        # Trend Streak Check
         streak = 1
         for i in range(len(seq)-2, -1, -1):
             if seq[i] == last_size: streak += 1
             else: break
 
-        # ==========================================
         # 🔥 1. ADVANCED RECOVERY MODE (1 Loss)
-        # ==========================================
         if self.loss_streak >= 1:
             logic_tags = ["RECOVERY_MODE"]
             mode = "ADVANCED_RECOVERY"
             
-            # Boost CUSUM & ZScore (because trend might have broken)
-            zs = self.analyze_zscore(seq)
-            if zs: signals['ZScore'] = (zs, zs[1] * 3.0) # 3x weight
+            # FIX: Extract actual data (direction, conf) from tuple, not string
+            zs, zs_tag = self.analyze_zscore(seq)
+            if zs: signals['ZScore'] = (zs, 3.0)
             
-            cu = self.analyze_cusum(seq)
-            if cu: signals['CUSUM'] = (cu, cu[1] * 3.0)
+            cu, cu_tag = self.analyze_cusum(seq)
+            if cu: signals['CUSUM'] = (cu, 3.0)
             
-            # Deep Markov (Order 5 down to 3)
             for o in [5, 4, 3]:
-                mk = self.analyze_markov(seq, o)
-                if mk[0]: 
-                    signals['Markov'] = (mk, mk[1] * 2.0)
+                mk, mk_tag = self.analyze_markov(seq, o)
+                if mk:
+                    signals['Markov'] = (mk, 2.0)
                     break
                     
-            # If loss was due to fighting trend, force trend ride
             if self.last_pred_size != last_size and streak >= 3:
                 signals['Trend'] = ((last_size, 0.8), 1.0)
                 logic_tags.append("TREND_RIDE_FORCED")
 
-        # ==========================================
-        # 🧠 2. NORMAL MODE (Super Advanced Engines)
-        # ==========================================
+        # 🧠 2. NORMAL MODE
         else:
             mode = "NORMAL"
             logic_tags = []
             
-            # Normal mode now uses all deep engines!
-            mk = self.analyze_markov(seq, 4)
-            if mk[0]: signals['Markov'] = mk
+            mk, mk_tag = self.analyze_markov(seq, 4)
+            if mk: signals['Markov'] = (mk, 1.0)
             
-            zs = self.analyze_zscore(seq)
-            if zs[0]: signals['ZScore'] = zs
+            zs, zs_tag = self.analyze_zscore(seq)
+            if zs: signals['ZScore'] = (zs, 1.0)
             
-            cu = self.analyze_cusum(seq)
-            if cu[0]: signals['CUSUM'] = cu
+            cu, cu_tag = self.analyze_cusum(seq)
+            if cu: signals['CUSUM'] = (cu, 1.0)
             
-            ew = self.analyze_ewma(seq)
-            if ew[0]: signals['EWMA'] = ew
+            ew, ew_tag = self.analyze_ewma(seq)
+            if ew: signals['EWMA'] = (ew, 1.0)
             
             if streak >= 4:
                 signals['Trend'] = ((last_size, 0.85), 1.0)
                 logic_tags.append(f"STRONG_TREND({streak}x)")
 
-        # ==========================================
         # 3. Meta-Learner Mixer
-        # ==========================================
         log_odds = 0
         for name, (data, weight_mult) in signals.items():
             direction, conf = data
@@ -314,7 +301,6 @@ class ApexPredator:
             pred_size = 1 if log_odds > 0 else 0
             confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
 
-        # 5. Target Number (Always CSV)
         target_num = self.get_best_number(self.history, pred_size)
         self.last_pred_size = pred_size
 
@@ -350,7 +336,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V155 APEX PREDATOR</i>
+⚡ <i>V155 APEX PREDATOR (FIXED)</i>
 """
 
 async def send_msg(app, text, retries=3):
