@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V151 OMEGA REBORN"
+    bot_name: str = "V152 HYPER-RECOVERY TITAN"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v151")
+log = logging.getLogger("v152")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -71,7 +71,7 @@ class Storage:
                     mode TEXT, logic TEXT, sigs TEXT, created_at REAL
                 )
             """)
-            # Fix for old database schema error
+            # Auto-fix for old databases missing 'sigs' column
             try:
                 c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
             except sqlite3.OperationalError:
@@ -119,19 +119,12 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V151 OMEGA ENGINE
+# V152 HYPER-RECOVERY TITAN
 # =========================
-class OmegaReborn:
+class HyperRecoveryTitan:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
-        
-        self.engine_stats = {
-            'Markov': {'w': 2.0, 'l': 0},
-            'ZScore': {'w': 1.5, 'l': 0},
-            'CUSUM': {'w': 1.5, 'l': 0},
-            'Chop': {'w': 1.5, 'l': 0}
-        }
 
     async def fetch_data(self, session):
         try:
@@ -173,104 +166,185 @@ class OmegaReborn:
             gg = min(gp, 30)
             tr = tm.get(f"{last_n}>{num}", 0)
             nh = 1.5 if (num == (last_n + 1) % 10 or num == (last_n + 9) % 10) else 0
+            
             s = gg * 1.2 + freq.get(num, 0) * 1.5 + tr * 3 + nh
             scored.append((s, num))
+            
         scored.sort(key=lambda x: (-x[0], x[1]))
         return scored[0][1] if scored else pool[0]
 
-    # --- MARKET REGIME ---
-    def get_market_regime(self, seq):
-        if len(seq) < 15: return "NORMAL"
-        w = seq[-15:]
-        switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
-        rate = switches / 14.0
-        if rate >= 0.73: return "ZIGZAG"
-        if rate <= 0.40: return "TREND"
-        return "NORMAL"
+    # --- HTML LOGIC: RUN PATTERNS ---
+    def extract_runs(self, seq):
+        runs = []
+        if not seq: return runs
+        curr, length = seq[0], 1
+        for x in seq[1:]:
+            if x == curr: length += 1
+            else:
+                runs.append({"side": curr, "len": length})
+                curr, length = x, 1
+        runs.append({"side": curr, "len": length})
+        return runs
 
-    # --- DEEP MARKOV ---
-    def analyze_markov(self, seq):
-        for order in [5, 4, 3, 2]:
-            if len(seq) < order + 5: continue
-            target = tuple(seq[-order:])
-            big, small = 0, 0
-            for i in range(len(seq) - order):
-                if tuple(seq[i:i+order]) == target:
-                    if seq[i+order] == 1: big += 1
-                    else: small += 1
-            total = big + small
+    def analyze_run_pattern(self, runs):
+        if len(runs) < 3: return None
+        ongoing = runs[-1]
+        best = None
+        
+        for k in range(min(13, len(runs)), 2, -1):
+            window = runs[-k:]
+            prefix = window[:-1]
+            cont, brk = 0, 0
+            
+            for j in range(k, len(runs) - 1):
+                cand = runs[j]
+                if cand['len'] < ongoing['len']: continue
+                ok = True
+                for t in range(k - 1):
+                    if runs[j - (k - 1) + t]['len'] != prefix[t]['len']:
+                        ok = False
+                        break
+                if ok:
+                    if cand['len'] > ongoing['len']: cont += 1
+                    else: brk += 1
+                    
+            total = cont + brk
             if total >= 3:
-                p = (big + 1) / (total + 2)
-                return (1 if p >= 0.5 else 0, max(p, 1-p)), f"M{order}"
-        return None, ""
+                p_cont = (cont + 1) / (total + 2)
+                dir = ongoing['side'] if p_cont >= 0.5 else 1 - ongoing['side']
+                best = (dir, max(p_cont, 1 - p_cont))
+                break
+        return best
 
-    # --- Z-SCORE ---
+    # --- DEEP ENGINES ---
+    def analyze_markov(self, seq, order):
+        if len(seq) < order + 5: return None
+        target = tuple(seq[-order:])
+        big, small = 0, 0
+        for i in range(len(seq) - order):
+            if tuple(seq[i:i+order]) == target:
+                if seq[i+order] == 1: big += 1
+                else: small += 1
+        total = big + small
+        if total >= 2:
+            p = (big + 1) / (total + 2)
+            return (1 if p >= 0.5 else 0, max(p, 1-p))
+        return None
+
     def analyze_zscore(self, seq):
-        if len(seq) < 30: return None, ""
+        if len(seq) < 30: return None
         w = seq[-30:]
-        z = (sum(w) - 15) / math.sqrt(30 * 0.25)
-        if z > 1.6: return (0, 0.8), "ZScore(S)"
-        if z < -1.6: return (1, 0.8), "ZScore(B)"
-        return None, ""
+        big_c = sum(w)
+        z = (big_c - 15) / math.sqrt(30 * 0.25)
+        if z > 1.8: return (0, 0.8)
+        if z < -1.8: return (1, 0.8)
+        return None
+
+    def analyze_exhaustion(self, seq):
+        streak = 1
+        for i in range(len(seq)-2, -1, -1):
+            if seq[i] == seq[-1]: streak += 1
+            else: break
+            
+        if streak >= 4:
+            breaks, conts = 0, 0
+            for i in range(len(seq)-streak):
+                if all(seq[i+j] == seq[-1] for j in range(streak)):
+                    if i+streak < len(seq):
+                        if seq[i+streak] == seq[-1]: conts += 1
+                        else: breaks += 1
+            if breaks + conts >= 2:
+                if breaks > conts: return (1-seq[-1], 0.75)
+                else: return (seq[-1], 0.75)
+        return None
 
     def generate_prediction(self):
         if len(self.history) < 50: return None
         
         seq = [x["size"] for x in self.history]
+        runs = self.extract_runs(seq)
         last_size = seq[-1]
-        regime = self.get_market_regime(seq)
         
-        pred_size = last_size
-        confidence = 60
-        logic_tags = []
-
-        # 🔥 FIX 1: MICRO-TREND LOCK (Sabse Important)
-        # Agar pichle 5 me 4 same side hain, toh trend ke against mat jao.
-        recent_5 = seq[-5:]
-        big_count = recent_5.count(1)
-        if big_count >= 4:
-            pred_size = 1
-            confidence = 80
-            logic_tags = ["MICRO_TREND_BIG"]
-        elif big_count <= 1:
-            pred_size = 0
-            confidence = 80
-            logic_tags = ["MICRO_TREND_SMALL"]
-
-        # Agar micro-trend nahi hai, toh purana Omega logic chalega
-        else:
-            if regime == "ZIGZAG":
-                pred_size = 1 - last_size
-                confidence = 75
-                logic_tags = ["ZIGZAG_FLIP"]
-
-            else:
-                signals = {}
-                zs, zs_tag = self.analyze_zscore(seq)
-                if zs: signals['ZScore'] = (zs, zs_tag)
+        # 🔥 SUPER RECOVERY MODE (Triggered on 1 Loss)
+        if self.loss_streak >= 1:
+            logic_tags = ["RECOVERY_MODE"]
+            
+            # 1. Deep Markov (Order 5 down to 3)
+            mk = None
+            for o in [5, 4, 3]:
+                mk = self.analyze_markov(seq, o)
+                if mk: 
+                    logic_tags.append(f"M{o}")
+                    break
+                    
+            # 2. Exhaustion
+            ex = self.analyze_exhaustion(seq)
+            if ex:
+                logic_tags.append("Exhaustion")
                 
-                mk, mk_tag = self.analyze_markov(seq)
-                if mk: signals['Markov'] = (mk, mk_tag)
+            # 3. Z-Score
+            zs = self.analyze_zscore(seq)
+            if zs:
+                logic_tags.append("ZScore")
+                
+            # Decision: If Markov and Exhaustion agree, go with them
+            if mk and ex and mk[0] == ex[0]:
+                pred_size, conf = mk[0], max(mk[1], ex[1]) + 0.1
+            elif mk:
+                pred_size, conf = mk
+            elif ex:
+                pred_size, conf = ex
+            elif zs:
+                pred_size, conf = zs
+            else:
+                # Absolute fallback: follow last 10 majority
+                pred_size = 1 if sum(seq[-10:]) >= 5 else 0
+                conf = 0.6
+                logic_tags = ["SafeMajority"]
+                
+            confidence = int(min(88, max(65, conf * 100)))
+            mode = "SUPER_RECOVERY"
 
-                # Meta-Learner Mixer
-                log_odds = 0
-                for name, ((direction, conf), tag) in signals.items():
-                    stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
-                    acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
-                    weight = max(0.2, acc * 2.5)
-                    log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
-                    logic_tags.append(tag)
+        # 🔥 NORMAL MODE
+        else:
+            logic_tags = []
+            
+            # 1. Run Pattern
+            rp = self.analyze_run_pattern(runs)
+            if rp:
+                logic_tags.append("RunPattern")
+                
+            # 2. Markov 4
+            mk = self.analyze_markov(seq, 4)
+            if mk:
+                logic_tags.append("Markov4")
+                
+            # 3. Z-Score
+            zs = self.analyze_zscore(seq)
+            if zs:
+                logic_tags.append("ZScore")
+                
+            # Combine (Voting)
+            votes = [rp, mk, zs]
+            big_v = sum(v[1] for v in votes if v and v[0] == 1)
+            small_v = sum(v[1] for v in votes if v and v[0] == 0)
+            
+            if big_v > small_v:
+                pred_size = 1
+                conf = big_v / (big_v + small_v)
+            elif small_v > big_v:
+                pred_size = 0
+                conf = small_v / (big_v + small_v)
+            else:
+                pred_size = last_size
+                conf = 0.6
+                logic_tags = ["Momentum"]
+                
+            confidence = int(min(85, max(60, conf * 100)))
+            mode = "NORMAL"
 
-                if not signals:
-                    pred_size = 1 if sum(seq[-20:]) >= 10 else 0
-                    confidence = 55
-                    logic_tags = ["Fallback"]
-                else:
-                    pred_size = 1 if log_odds > 0 else 0
-                    confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
-
+        # Target Number (Always CSV Logic)
         target_num = self.get_best_number(self.history, pred_size)
-        mode = "OMEGA_REBORN"
 
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
@@ -279,11 +353,10 @@ class OmegaReborn:
             "confidence": confidence,
             "logic": " + ".join(logic_tags[:3]),
             "mode": mode,
-            "regime": regime,
-            "sigs": list(self.engine_stats.keys())
+            "sigs": logic_tags
         }
 
-PREDICTOR = OmegaReborn()
+PREDICTOR = HyperRecoveryTitan()
 
 # =========================
 # FORMATTING
@@ -300,12 +373,12 @@ def format_prediction(p, recent_rows):
 
 📈 <b>Confidence</b>: {p['confidence']}%
 🧠 <b>Logic</b>: {h(p['logic'])}
-⚖️ <b>Regime</b>: <b>{h(p['regime'])}</b>
+⚖️ <b>Mode</b>: <b>{h(p['mode'])}</b>
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V151 OMEGA REBORN</i>
+⚡ <i>V152 HYPER-RECOVERY TITAN</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -323,7 +396,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V151 Omega Reborn started...")
+    log.info("V152 Titan started...")
     last_processed_issue = None
 
     while True:
@@ -335,19 +408,6 @@ async def worker_loop(app, session):
                 for res in resolved:
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
-                    
-                    # Safely parse sigs
-                    sigs_json = res.get('sigs')
-                    if sigs_json:
-                        try:
-                            sigs = json.loads(sigs_json)
-                            for s in sigs:
-                                name = s.split('_')[-1]
-                                if name in PREDICTOR.engine_stats:
-                                    if res['win']: PREDICTOR.engine_stats[name]['w'] += 1
-                                    else: PREDICTOR.engine_stats[name]['l'] += 1
-                        except Exception:
-                            pass
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -376,7 +436,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V151 Omega Reborn is running!")
+    return web.Response(text="V152 Titan is running!")
 
 async def main():
     CFG.validate()
