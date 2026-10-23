@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V168 OMNIPOTENT AI"
+    bot_name: str = "V169 QUANTUM TITAN"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v168")
+log = logging.getLogger("v169")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -75,14 +75,12 @@ class Storage:
                 c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
             except sqlite3.OperationalError:
                 pass
-            # Expert Weights for Meta-Learner
             c.execute("""
                 CREATE TABLE IF NOT EXISTS expert_stats (
                     name TEXT PRIMARY KEY, wins INTEGER, losses INTEGER
                 )
             """)
-            # Init experts
-            for eng in ['Trend', 'Chop', 'Pattern', 'Math']:
+            for eng in ['Trend', 'Chop', 'Pattern', 'Math', 'Markov']:
                 c.execute("INSERT OR IGNORE INTO expert_stats (name, wins, losses) VALUES (?, 0, 0)", (eng,))
 
     def _conn(self):
@@ -137,20 +135,19 @@ class Storage:
             rows = c.execute("SELECT name, wins, losses FROM expert_stats").fetchall()
             for name, w, l in rows:
                 total = w + l
-                if total < 5:
-                    weights[name] = 1.0 # Default weight
+                if total < 3:
+                    weights[name] = 1.0
                 else:
                     acc = w / total
-                    # Weight ranges from 0.2 to 2.0 based on accuracy
-                    weights[name] = max(0.2, min(2.0, acc * 2.0))
+                    weights[name] = max(0.2, min(2.5, acc * 2.5))
         return weights
 
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V168 OMNIPOTENT ENGINE
+# V169 QUANTUM TITAN
 # =========================
-class OmnipotentAI:
+class QuantumTitan:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
@@ -178,16 +175,21 @@ class OmnipotentAI:
         except Exception:
             return False
 
-    def get_regime(self, seq):
-        if len(seq) < 15: return "NORMAL"
-        w = seq[-15:]
-        switches = sum(1 for i in range(1, 15) if w[i] != w[i-1])
+    def get_market_regime(self, seq):
+        """Detect Strong Trend, Chop or Neutral"""
+        if len(seq) < 10: return "NEUTRAL"
+        ma10 = sum(seq[-10:]) / 10.0
+        
+        if ma10 >= 0.7: return "STRONG_BIG"
+        if ma10 <= 0.3: return "STRONG_SMALL"
+        
+        w15 = seq[-15:]
+        switches = sum(1 for i in range(1, 15) if w15[i] != w15[i-1])
         if switches >= 10: return "CHOP"
-        if switches <= 4: return "TREND"
-        return "NORMAL"
+        
+        return "NEUTRAL"
 
     def get_best_number(self, data, side):
-        # CSV logic
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
         last_n = d[0]
@@ -210,7 +212,10 @@ class OmnipotentAI:
         return scored[0][1] if scored else pool[0]
 
     # 🔥 EXPERTS
-    def expert_trend(self, seq):
+    def expert_trend(self, seq, regime):
+        if regime == "STRONG_BIG": return 1, 0.85, "Regime_Big"
+        if regime == "STRONG_SMALL": return 0, 0.85, "Regime_Small"
+        
         streak = 1
         for i in range(len(seq)-2, -1, -1):
             if seq[i] == seq[-1]: streak += 1
@@ -219,13 +224,12 @@ class OmnipotentAI:
             return seq[-1], min(0.9, 0.65 + streak * 0.05), f"Trend({streak}x)"
         return None
 
-    def expert_chop(self, seq):
-        if self.get_regime(seq) == "CHOP":
-            return 1 - seq[-1], 0.70, "ChopFlip"
+    def expert_chop(self, seq, regime):
+        if regime == "CHOP":
+            return 1 - seq[-1], 0.75, "ChopFlip"
         return None
 
     def expert_pattern(self, seq, nums):
-        # Check Size Pattern
         for L in range(12, 2, -1):
             if len(seq) < L + 5: continue
             target = tuple(seq[-L:])
@@ -238,16 +242,18 @@ class OmnipotentAI:
             total = big + small
             if total >= 3:
                 p = (big+1)/(total+2)
-                if p >= 0.6 or p <= 0.4:
+                if p >= 0.65 or p <= 0.35:
                     return (1 if p >= 0.5 else 0), max(p, 1-p), f"Pat{L}"
         return None
 
-    def expert_math(self, seq):
-        # Z-Score
+    def expert_math(self, seq, regime):
+        # 🔥 Z-Score is DISABLED in Strong Trend
+        if regime in ["STRONG_BIG", "STRONG_SMALL"]: return None
+        
         w30 = seq[-30:]
         z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
-        if z > 1.6: return 0, 0.70, "ZScore(S)"
-        if z < -1.6: return 1, 0.70, "ZScore(B)"
+        if z > 1.8: return 0, 0.75, "ZScore(S)"
+        if z < -1.8: return 1, 0.75, "ZScore(B)"
         return None
 
     def generate_prediction(self):
@@ -255,53 +261,46 @@ class OmnipotentAI:
         
         seq = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
-        regime = self.get_regime(seq)
+        regime = self.get_market_regime(seq)
         weights = STORE.get_weights()
         
         signals = []
         
-        # ==========================================
-        # 🔥 1. COLLECT SIGNALS FROM EXPERTS
-        # ==========================================
-        t_res = self.expert_trend(seq)
+        t_res = self.expert_trend(seq, regime)
         if t_res: signals.append(('Trend', t_res))
         
-        c_res = self.expert_chop(seq)
+        c_res = self.expert_chop(seq, regime)
         if c_res: signals.append(('Chop', c_res))
         
         p_res = self.expert_pattern(seq, nums)
         if p_res: signals.append(('Pattern', p_res))
         
-        m_res = self.expert_math(seq)
+        m_res = self.expert_math(seq, regime)
         if m_res: signals.append(('Math', m_res))
 
         # ==========================================
-        # 🔥 2. RECOVERY OVERRIDE
+        # 🔥 RECOVERY MODE (High Priority)
         # ==========================================
-        if self.loss_streak >= 2:
-            # Force pure math (Z-Score) or most confident signal
-            best_sig = None
-            if m_res:
-                best_sig = m_res
+        if self.loss_streak >= 1:
+            # In recovery, never use Z-score. Only trust Trend or Pattern.
+            valid_sigs = [s for s in signals if s[0] in ['Trend', 'Pattern']]
+            if valid_sigs:
+                best = max(valid_sigs, key=lambda x: x[1][1] * weights.get(x[0], 1.0))
+                tag = "REC_" + best[1][2]
+                return self._build_response(best[1][0], best[1][1], tag, "RECOVERY")
             else:
-                best_sig = (1 - seq[-1], 0.65, "RecoveryFlip")
-            
-            return self._build_response(best_sig[0], best_sig[1], best_sig[2], "ULTRA_RECOVERY")
-
-        if self.loss_streak == 1:
-            # Use Z-Score if available, else best signal
-            if m_res:
-                return self._build_response(m_res[0], m_res[1], m_res[2], "RECOVERY")
-            elif signals:
-                best = max(signals, key=lambda x: x[1][1])
-                return self._build_response(best[1][0], best[1][1], best[1][2], "RECOVERY")
+                # Fallback to highest confidence signal available
+                if signals:
+                    best = max(signals, key=lambda x: x[1][1] * weights.get(x[0], 1.0))
+                    return self._build_response(best[1][0], best[1][1], "REC_"+best[1][2], "RECOVERY")
+                else:
+                    return self._build_response(seq[-1], 0.55, "REC_NoSignal", "RECOVERY")
 
         # ==========================================
-        # 🔥 3. META-LEARNER MIXER (Normal Mode)
+        # 🔥 NORMAL MODE (Meta-Learner Mixer)
         # ==========================================
         if not signals:
-            pred = seq[-1] # Fallback
-            return self._build_response(pred, 0.55, "Fallback", "NORMAL")
+            return self._build_response(seq[-1], 0.55, "Fallback", "NORMAL")
 
         log_odds = 0
         logic_tags = []
@@ -313,17 +312,6 @@ class OmnipotentAI:
 
         pred_size = 1 if log_odds > 0 else 0
         confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
-        
-        # If confidence is too low, trust the trend/regime
-        if confidence < 60:
-            if regime == "TREND":
-                pred_size = seq[-1]
-                confidence = 65
-                logic_tags = ["RegimeTrend"]
-            else:
-                pred_size = seq[-1]
-                confidence = 55
-                logic_tags = ["RegimeFollow"]
 
         return self._build_response(pred_size, confidence/100, " + ".join(logic_tags[:2]), "NORMAL")
 
@@ -336,10 +324,10 @@ class OmnipotentAI:
             "confidence": int(min(88, max(52, conf * 100))),
             "logic": tag,
             "mode": mode,
-            "sigs": [tag] # Save for meta-learner update
+            "sigs": [tag]
         }
 
-PREDICTOR = OmnipotentAI()
+PREDICTOR = QuantumTitan()
 
 # =========================
 # FORMATTING
@@ -361,7 +349,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V168 OMNIPOTENT AI</i>
+⚡ <i>V169 QUANTUM TITAN</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -379,7 +367,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V168 Omnipotent AI started...")
+    log.info("V169 Quantum Titan started...")
     last_processed_issue = None
 
     while True:
@@ -392,12 +380,10 @@ async def worker_loop(app, session):
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
-                    # Update Meta-Learner
                     try:
                         sigs = json.loads(res.get('sigs') or '[]')
                         for s in sigs:
-                            # Extract expert name from tag (e.g., 'Trend' from 'Trend(3x)')
-                            for eng in ['Trend', 'Chop', 'Pattern', 'Math']:
+                            for eng in ['Trend', 'Chop', 'Pattern', 'Math', 'Markov']:
                                 if eng in s:
                                     STORE.update_expert(eng, res['win'])
                                     break
@@ -431,7 +417,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V168 Omnipotent is running!")
+    return web.Response(text="V169 Quantum Titan is running!")
 
 async def main():
     CFG.validate()
