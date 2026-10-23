@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V158 PURE MATHEMATICAL"
+    bot_name: str = "V159 PURE MATH AI (Fixed)"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v158")
+log = logging.getLogger("v159")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -118,17 +118,16 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V158 PURE MATH ENGINE
+# V159 PURE MATH ENGINE (BALANCED)
 # =========================
 class PureMathEngine:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # 16 Mathematical Weights for Logistic Regression
-        # We start with 0 and let the Gradient Descent calculate them
+        # 16 Weights
         self.weights = [0.0] * 16
-        self.lr = 0.05 # Learning Rate for Gradient Descent
+        self.lr = 0.08 # Learning Rate
 
     async def fetch_data(self, session):
         try:
@@ -153,16 +152,16 @@ class PureMathEngine:
         except Exception:
             return False
 
-    # --- 1. PURE MATHEMATICAL FEATURES (16 Variables) ---
+    # --- 🔥 FIX: CENTERED FEATURES (-1 to +1) ---
     def extract_math_features(self, seq):
         if len(seq) < 50: return None
-        feat = [1.0] # Bias (x0)
+        feat = [1.0] # Bias
         
-        # x1-x5: Last 5 sizes (1 for Big, 0 for Small)
+        # 1. Last 5 sizes (-1 for Small, +1 for Big)
         for i in range(1, 6):
-            feat.append(float(seq[-i]))
+            feat.append(1.0 if seq[-i] == 1 else -1.0)
             
-        # x6-x10: Markov Probabilities (Order 2, 3, 4, 5, 6)
+        # 2. Markov Probabilities centered (-1 to +1)
         for order in [2, 3, 4, 5, 6]:
             target = tuple(seq[-order:])
             big, small = 0, 0
@@ -171,46 +170,40 @@ class PureMathEngine:
                     if seq[i+order] == 1: big += 1
                     else: small += 1
             total = big + small
-            # Laplace smoothing for pure probability
             p = (big + 1) / (total + 2) if total > 0 else 0.5
-            feat.append(p)
+            feat.append((p - 0.5) * 2.0) # Centered to -1 to +1
             
-        # x11: Z-Score (Last 30)
+        # 3. Z-Score (Normalized)
         w30 = seq[-30:]
-        mean30 = sum(w30) / 30.0
-        variance = sum((x - mean30)**2 for x in w30) / 30.0
-        std_dev = math.sqrt(variance) if variance > 0 else 0.01
         z = (sum(w30) - 15.0) / math.sqrt(30 * 0.25)
-        feat.append(max(-3.0, min(3.0, z)) / 3.0) # Normalized Z-Score
+        feat.append(max(-2.0, min(2.0, z)) / 2.0)
         
-        # x12: Z-Score (Last 50)
-        w50 = seq[-50:]
-        z50 = (sum(w50) - 25.0) / math.sqrt(50 * 0.25)
-        feat.append(max(-3.0, min(3.0, z50)) / 3.0)
-        
-        # x13-x14: CUSUM (Cumulative Sum)
+        # 4. CUSUM (Combined & Centered)
         pos, neg = 0.0, 0.0
         for s in seq[-30:]:
             pos = max(0, pos + s - 0.6)
             neg = max(0, neg - s + 0.4)
-        feat.append(min(1.0, pos / 3.0))
-        feat.append(min(1.0, neg / 3.0))
+        feat.append(max(-1.0, min(1.0, (pos - neg) / 3.0)))
         
-        # x15: Shannon Entropy (Last 20)
+        # 5. Shannon Entropy (-1 to +1)
         w20 = seq[-20:]
         p_big = sum(w20) / 20.0
         p_small = 1.0 - p_big
         entropy = 0.0
         if p_big > 0: entropy -= p_big * math.log2(p_big)
         if p_small > 0: entropy -= p_small * math.log2(p_small)
-        feat.append(entropy) # 0 to 1
+        feat.append((entropy - 0.5) * 2.0) # 0..1 becomes -1..1
         
-        # x16: Trend Streak (Normalized)
+        # 6. Trend Streak (Directional)
         streak = 1
         for i in range(len(seq)-2, -1, -1):
             if seq[i] == seq[-1]: streak += 1
             else: break
-        feat.append(min(10, streak) / 10.0)
+        direction = 1.0 if seq[-1] == 1 else -1.0
+        feat.append((min(10, streak) / 10.0) * direction)
+
+        # 7. Recent Momentum (Last 10)
+        feat.append((sum(seq[-10:]) / 10.0 - 0.5) * 2.0)
         
         return feat
 
@@ -218,24 +211,22 @@ class PureMathEngine:
         try: return 1 / (1 + math.exp(-max(-20, min(20, x))))
         except OverflowError: return 0.0 if x < 0 else 1.0
 
-    # --- 2. GRADIENT DESCENT TRAINING ---
     def train_model(self, feat, actual_size):
-        if not feat or len(feat) != 16: return
+        if not feat or len(feat) != 15: return
         z = sum(w * f for w, f in zip(self.weights, feat))
         pred = self.sigmoid(z)
         
-        # Pure math: Gradient Descent Update
         error = actual_size - pred
-        for i in range(16):
-            self.weights[i] += self.lr * error * feat[i]
+        for i in range(15):
+            # L2 Regularization (0.001) to prevent overfitting
+            reg = 0.001 * self.weights[i]
+            self.weights[i] += self.lr * (error * feat[i] - reg)
 
-    # --- 3. PURE CALCULATION PREDICTION ---
     def calculate_prediction(self, feat):
         if not feat: return 0.5
         z = sum(w * f for w, f in zip(self.weights, feat))
         return self.sigmoid(z)
 
-    # --- 4. JACK NUMBER LOGIC (CSV EXACT) ---
     def get_best_number(self, data, side):
         d = [x['num'] for x in reversed(data[-60:])]
         if not d: return 0
@@ -262,37 +253,29 @@ class PureMathEngine:
         if len(self.history) < 50: return None
         
         seq = [x["size"] for x in self.history]
-        
-        # 1. Extract 16 Math Features
         feat = self.extract_math_features(seq)
         if not feat: return None
         
-        # 2. Calculate Probability (0.0 to 1.0)
         p_big = self.calculate_prediction(feat)
         
-        # 3. Decision based on pure probability
+        # Balanced Threshold
         pred_size = 1 if p_big >= 0.5 else 0
         
-        # Confidence is the pure mathematical probability
-        # We cap it between 52% and 88% to avoid fake 99% claims
         conf_val = p_big if pred_size == 1 else (1 - p_big)
         confidence = int(min(88, max(52, conf_val * 100)))
         
-        # 4. Logic Tags (For UI)
         logic_tags = []
         if p_big > 0.6: logic_tags.append("Math_Strong_Big")
         elif p_big < 0.4: logic_tags.append("Math_Strong_Small")
         else: logic_tags.append("Math_Neutral")
         
-        # Add dominant feature to logic
         z = sum(w * f for w, f in zip(self.weights, feat))
         max_w_idx = self.weights.index(max(self.weights))
-        if max_w_idx == 11 or max_w_idx == 12: logic_tags.append("ZScore_Dominant")
-        elif max_w_idx == 15: logic_tags.append("Streak_Dominant")
+        if max_w_idx in [11, 12]: logic_tags.append("ZScore_Dominant")
+        elif max_w_idx == 14: logic_tags.append("Streak_Dominant")
         elif 6 <= max_w_idx <= 10: logic_tags.append("Markov_Dominant")
         
         mode = "RECOVERY" if self.loss_streak >= 1 else "PURE_MATH"
-        
         target_num = self.get_best_number(self.history, pred_size)
 
         return {
@@ -327,7 +310,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V158 PURE MATHEMATICAL</i>
+⚡ <i>V159 PURE MATH AI</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -345,7 +328,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V158 Pure Math started...")
+    log.info("V159 Pure Math started...")
     last_processed_issue = None
 
     while True:
@@ -366,7 +349,6 @@ async def worker_loop(app, session):
                 
                 if latest_issue != last_processed_issue:
                     if not STORE.prediction_exists(next_issue):
-                        # 🧠 PURE MATH TRAINING: Learn from the immediate past result
                         if len(PREDICTOR.history) > 1:
                             past_seq = [x["size"] for x in PREDICTOR.history[:-1]]
                             past_feat = PREDICTOR.extract_math_features(past_seq)
@@ -392,7 +374,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V158 Pure Math is running!")
+    return web.Response(text="V159 Pure Math is running!")
 
 async def main():
     CFG.validate()
