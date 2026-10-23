@@ -32,7 +32,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V150 TITAN BREAKER"
+    bot_name: str = "V150 TITAN BREAKER (FIXED)"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -68,6 +68,11 @@ class Storage:
                     mode TEXT, logic TEXT, sigs TEXT, created_at REAL
                 )
             """)
+            # 🔥 FIX: Add sigs column if it doesn't exist in old DB
+            try:
+                c.execute("ALTER TABLE predictions ADD COLUMN sigs TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=20)
@@ -182,76 +187,55 @@ class TitanBreaker:
         if rate <= 0.40: return "TREND"
         return "NORMAL"
 
-    # ==========================================
-    # 🔥 THE 5 SIGNALS OF TREND BREAK DETECTOR
-    # ==========================================
-    
-    # Signal 1: CUSUM (Statistical Shift Detector)
     def signal_cusum(self, seq):
         if len(seq) < 30: return 0
         pos_sum, neg_sum = 0.0, 0.0
         for s in seq[-30:]:
             pos_sum = max(0, pos_sum + s - 0.6)
             neg_sum = max(0, neg_sum - s + 0.4)
-        if pos_sum > 2.5: return 1  # Shift to SMALL (against BIG trend)
-        if neg_sum > 2.5: return 1  # Shift to BIG (against SMALL trend)
+        if pos_sum > 2.5: return 1
+        if neg_sum > 2.5: return 1
         return 0
     
-    # Signal 2: Run-Length Exhaustion (History Based)
     def signal_exhaustion(self, seq):
         streak = 1
         for i in range(len(seq)-2, -1, -1):
             if seq[i] == seq[-1]: streak += 1
             else: break
-            
         if streak < 4: return 0
-        
-        # Check history: when N-length streaks happened, did they break?
         breaks, conts = 0, 0
         for i in range(len(seq) - streak):
             if all(seq[i+j] == seq[-1] for j in range(streak)):
                 if i + streak < len(seq):
                     if seq[i+streak] == seq[-1]: conts += 1
                     else: breaks += 1
-        
         total = breaks + conts
-        if total >= 2 and breaks / total >= 0.60:  # 60%+ historically break
-            return 1
+        if total >= 2 and breaks / total >= 0.60: return 1
         return 0
     
-    # Signal 3: Volatility Spike (Inconsistency)
     def signal_volatility(self, seq):
         if len(seq) < 10: return 0
-        # If last 5 results had variance in NUMBER (not size), trend may be breaking
         w = seq[-10:]
-        # Check if there's an "opposite" mixed in recently
         last_side = seq[-1]
         opposite_count = sum(1 for x in w[-5:] if x != last_side)
-        if opposite_count >= 1:  # At least 1 opposite in last 5
-            return 1
+        if opposite_count >= 1: return 1
         return 0
 
-    # Signal 4: EWMA Crossover
     def signal_ewma(self, seq):
         if len(seq) < 20: return 0
-        alpha_s = 0.4  # Fast
-        alpha_l = 0.1  # Slow
-        
+        alpha_s = 0.4
+        alpha_l = 0.1
         ema_s = seq[-20]
         ema_l = seq[-20]
         for x in seq[-19:]:
             ema_s = alpha_s * x + (1 - alpha_s) * ema_s
             ema_l = alpha_l * x + (1 - alpha_l) * ema_l
-        
         diff = ema_s - ema_l
         last_side = seq[-1]
-        
-        # If fast EMA crosses slow EMA in opposite direction, break incoming
         if last_side == 1 and diff < -0.1: return 1
         if last_side == 0 and diff > 0.1: return 1
         return 0
 
-    # Signal 5: Markov Anti-Pattern (Weak Signal, Low Weight)
     def signal_antimarkov(self, seq):
         order = 3
         if len(seq) < order + 5: return 0
@@ -263,12 +247,10 @@ class TitanBreaker:
                 else: small += 1
         total = big + small
         if total >= 3:
-            # If history STRONGLY suggests flip (70%+)
             if seq[-1] == 1 and small / total >= 0.70: return 1
             if seq[-1] == 0 and big / total >= 0.70: return 1
         return 0
     
-    # Aggregate Break Score
     def calculate_break_score(self, seq):
         signals = {
             'CUSUM': self.signal_cusum(seq),
@@ -314,48 +296,34 @@ class TitanBreaker:
         confidence = 60
         logic_tags = []
 
-        # ==========================================
-        # 🛑 ZIGZAG MODE
-        # ==========================================
         if regime == "ZIGZAG":
             pred_size = 1 - last_size
             confidence = 75
             logic_tags = ["ZIGZAG_FLIP"]
 
-        # ==========================================
-        # 🚀 TREND MODE + STRONG BREAK DETECTOR
-        # ==========================================
         elif regime == "TREND":
             streak = 1
             for i in range(len(seq)-2, -1, -1):
                 if seq[i] == last_size: streak += 1
                 else: break
 
-            # 🔥 CALCULATE BREAK SCORE (5 Signals)
-            break_score, break_signals = self.calculate_break_score(seq)
-            active_signals = [k for k, v in break_signals.items() if v == 1]
+            break_score, _ = self.calculate_break_score(seq)
 
             if break_score >= 3:
-                # STRONG BREAK: 3+ signals agree
                 pred_size = 1 - last_size
                 confidence = min(88, 70 + break_score * 3)
                 logic_tags = [f"BREAK({break_score}/5)"]
                 if break_score == 5:
                     logic_tags = ["MEGA_BREAK(5/5)"]
             elif break_score == 2:
-                # WEAK BREAK: Mixed signals. Follow trend but at low confidence.
                 pred_size = last_size
                 confidence = 60
                 logic_tags = [f"TREND_RIDE({streak}x)", f"Warn_Break({break_score}/5)"]
             else:
-                # NO BREAK: Follow trend strongly
                 pred_size = last_size
                 confidence = min(88, 70 + streak * 2)
                 logic_tags = [f"TREND_RIDE({streak}x)"]
 
-        # ==========================================
-        # 🧠 NORMAL MODE
-        # ==========================================
         else:
             signals = {}
             zs, zs_tag = self.analyze_zscore(seq)
@@ -363,7 +331,6 @@ class TitanBreaker:
             mk, mk_tag = self.analyze_markov(seq)
             if mk: signals['Markov'] = (mk, mk_tag)
             
-            # Check for break even in normal mode
             break_score, _ = self.calculate_break_score(seq)
             if break_score >= 3:
                 pred_size = 1 - last_size
@@ -453,14 +420,18 @@ async def worker_loop(app, session):
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
-                    try:
-                        sigs = json.loads(res['sigs'])
-                        for s in sigs:
-                            name = s.split('_')[-1]
-                            if name in PREDICTOR.engine_stats:
-                                if res['win']: PREDICTOR.engine_stats[name]['w'] += 1
-                                else: PREDICTOR.engine_stats[name]['l'] += 1
-                    except: pass
+                    # 🔥 FIX: Safe parsing for old DB records
+                    sigs_json = res.get('sigs')
+                    if sigs_json:
+                        try:
+                            sigs = json.loads(sigs_json)
+                            for s in sigs:
+                                name = s.split('_')[-1]
+                                if name in PREDICTOR.engine_stats:
+                                    if res['win']: PREDICTOR.engine_stats[name]['w'] += 1
+                                    else: PREDICTOR.engine_stats[name]['l'] += 1
+                        except Exception:
+                            pass
                     
                     text = f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
                     await send_msg(app, text)
@@ -505,6 +476,7 @@ async def main():
     
     async with app:
         await app.start()
+        # 🔥 FIX: Clear webhook to avoid Conflict error
         await app.bot.delete_webhook(drop_pending_updates=True)
         await app.updater.start_polling(drop_pending_updates=True)
         
