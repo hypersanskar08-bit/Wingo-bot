@@ -31,8 +31,8 @@ class Config:
     db_path: str = "predictor.db"
     log_dir: str = "logs"
     fetch_every: float = 2.0
-    request_timeout: float = 10.0
-    bot_name: str = "V162 PATTERN-AI SYNC"
+    request_timeout: float = 15.0
+    bot_name: str = "V164 DEEP-TRACKER"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +54,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v162")
+log = logging.getLogger("v164")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -137,7 +137,7 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# MATH HELPERS (Skew, Kurt, Autocorr)
+# MATH HELPERS
 # =========================
 def skewness(seq):
     n = len(seq)
@@ -146,14 +146,6 @@ def skewness(seq):
     if var == 0: return 0
     m3 = sum((x-mean)**3 for x in seq) / n
     return m3 / (var**1.5)
-
-def kurtosis(seq):
-    n = len(seq)
-    mean = sum(seq)/n
-    var = sum((x-mean)**2 for x in seq) / n
-    if var == 0: return 0
-    m4 = sum((x-mean)**4 for x in seq) / n
-    return m4 / (var**2) - 3
 
 def autocorr(seq, lag):
     n = len(seq)
@@ -165,20 +157,20 @@ def autocorr(seq, lag):
     return num / var
 
 # =========================
-# V162 ADVANCED NEURAL ENGINE
+# V164 DEEP-TRACKER ENGINE
 # =========================
-class AdvancedPatternAI:
+class DeepTracker:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         self.lr = 0.05
         
         saved_weights = STORE.load_weights()
-        if saved_weights and len(saved_weights) == 28:
+        if saved_weights and len(saved_weights) == 23:
             self.weights = saved_weights
             self.warmed_up = True
         else:
-            self.weights = [0.0] * 28
+            self.weights = [0.0] * 23
             self.warmed_up = False
             
         self.save_counter = 0
@@ -206,12 +198,75 @@ class AdvancedPatternAI:
         except Exception:
             return False
 
+    # --- 🔥 SPLIT PATTERN SCANNER ---
+    def scan_patterns(self, seq, nums):
+        sig_num_short = 0.0
+        sig_size_long = 0.0
+        sig_single = 0.0
+        
+        # 1. Short Combined Pattern (Length 3 to 5) - Numbers & Size
+        for L in range(5, 2, -1):
+            if len(seq) < L + 5: continue
+            target_seq = tuple(seq[-L:])
+            target_num = tuple(nums[-L:])
+            
+            big, small = 0, 0
+            for i in range(len(seq) - L):
+                if tuple(seq[i:i+L]) == target_seq and tuple(nums[i:i+L]) == target_num:
+                    if seq[i+L] == 1: big += 1
+                    else: small += 1
+            total = big + small
+            if total >= 2:
+                p = (big + 1) / (total + 2)
+                sig_num_short = (p - 0.5) * 2.0
+                break
+
+        # 2. Long Size Pattern (Length 6 to 12) - Only Size
+        for L in range(12, 5, -1):
+            if len(seq) < L + 5: continue
+            target_seq = tuple(seq[-L:])
+            
+            big, small = 0, 0
+            for i in range(len(seq) - L):
+                if tuple(seq[i:i+L]) == target_seq:
+                    if seq[i+L] == 1: big += 1
+                    else: small += 1
+            total = big + small
+            if total >= 3:
+                p = (big + 1) / (total + 2)
+                sig_size_long = (p - 0.5) * 2.0
+                break
+
+        # 3. Single Number Repetition (Length 7 to 12)
+        if len(nums) >= 12:
+            for L in range(12, 6, -1):
+                if len(nums) < L + 5: continue
+                window = nums[-L:]
+                freq = Counter(window)
+                dominant, count = freq.most_common(1)[0]
+                
+                if count >= 4:
+                    follow_big, follow_small = 0, 0
+                    for i in range(len(nums) - L):
+                        hist_window = nums[i:i+L]
+                        if hist_window.count(dominant) >= count:
+                            if i+L < len(nums):
+                                if nums[i+L] >= 5: follow_big += 1
+                                else: follow_small += 1
+                    total = follow_big + follow_small
+                    if total >= 3:
+                        p = (follow_big + 1) / (total + 2)
+                        sig_single = (p - 0.5) * 2.0
+                        break
+                        
+        return sig_num_short, sig_size_long, sig_single
+
     def extract_features(self, seq, nums):
         if len(seq) < 50: return None
         feat = [1.0] # 0. Bias
         
-        # 1-5: Last 5 sizes
-        for i in range(1, 6): feat.append(1.0 if seq[-i] == 1 else -1.0)
+        # 1-5: Recent 5 sizes
+        for i in range(1, 6): feat.append(1.0 if seq[-1-i] == 1 else -1.0)
             
         # 6-10: Markov 2 to 6
         for order in [2, 3, 4, 5, 6]:
@@ -257,61 +312,13 @@ class AdvancedPatternAI:
         # 15: Momentum
         feat.append((sum(seq[-10:]) / 10.0 - 0.5) * 2.0)
         
-        # 16: Size Pattern (3-12)
-        sig_size_pattern = 0.0
-        for L in range(12, 2, -1):
-            if len(seq) < L + 5: continue
-            target = tuple(seq[-L:])
-            big, small = 0, 0
-            for i in range(len(seq) - L):
-                if tuple(seq[i:i+L]) == target:
-                    if seq[i+L] == 1: big += 1
-                    else: small += 1
-            total = big + small
-            if total >= 2:
-                p = (big + 1) / (total + 2)
-                sig_size_pattern = (p - 0.5) * 2.0
-                break
-        feat.append(sig_size_pattern)
-        
-        # 17: Number Pattern (3-6)
-        sig_num_pattern = 0.0
-        for L in range(6, 2, -1):
-            if len(nums) < L + 5: continue
-            target = tuple(nums[-L:])
-            big, small = 0, 0
-            for i in range(len(nums) - L):
-                if tuple(nums[i:i+L]) == target:
-                    if nums[i+L] >= 5: big += 1
-                    else: small += 1
-            total = big + small
-            if total >= 1:
-                p = (big + 1) / (total + 2)
-                sig_num_pattern = (p - 0.5) * 2.0
-                break
-        feat.append(sig_num_pattern)
-        
-        # 18: Single Number Repetition (7-12)
-        sig_single = 0.0
-        if len(nums) >= 12:
-            recent_10 = nums[-10:]
-            freq = Counter(recent_10)
-            dominant, count = freq.most_common(1)[0]
-            if count >= 4:
-                follow_big, follow_small = 0, 0
-                for i in range(len(nums) - 10):
-                    w = nums[i:i+10]
-                    if w.count(dominant) >= count:
-                        if i+10 < len(nums):
-                            if nums[i+10] >= 5: follow_big += 1
-                            else: follow_small += 1
-                total = follow_big + follow_small
-                if total >= 2:
-                    p = (follow_big + 1) / (total + 2)
-                    sig_single = (p - 0.5) * 2.0
+        # 🔥 16-18: Split Pattern Results
+        sig_num_short, sig_size_long, sig_single = self.scan_patterns(seq, nums)
+        feat.append(sig_num_short)
+        feat.append(sig_size_long)
         feat.append(sig_single)
         
-        # 19: Trend Shift (After 6-Pattern)
+        # 19: Trend Shift (After Size Pattern Break)
         sig_trend = 0.0
         if len(seq) >= 15:
             target = tuple(seq[-6:])
@@ -322,54 +329,34 @@ class AdvancedPatternAI:
                     if seq[i+6] == last_side: follow_same += 1
                     else: follow_opp += 1
             total = follow_same + follow_opp
-            if total >= 2:
+            if total >= 3:
                 p_same = (follow_same + 1) / (total + 2)
                 p_big = p_same if last_side == 1 else (1 - p_same)
                 sig_trend = (p_big - 0.5) * 2.0
         feat.append(sig_trend)
         
         # 20-22: Autocorrelation
-        ac1 = max(-1, min(1, autocorr(seq[-30:], 1)))
-        ac2 = max(-1, min(1, autocorr(seq[-30:], 2)))
-        ac3 = max(-1, min(1, autocorr(seq[-30:], 3)))
-        feat.append(ac1)
-        feat.append(ac2)
-        feat.append(ac3)
+        feat.append(max(-1, min(1, autocorr(seq[-30:], 1))))
+        feat.append(max(-1, min(1, autocorr(seq[-30:], 2))))
+        feat.append(max(-1, min(1, autocorr(seq[-30:], 3))))
         
         # 23: Skewness
         sk = max(-2, min(2, skewness(seq[-30:])))
         feat.append(sk / 2.0)
         
-        # 24: Kurtosis
-        ku = max(-3, min(3, kurtosis(seq[-30:])))
-        feat.append(ku / 3.0)
-        
-        # 25: Variance
-        var_val = sum((x-0.5)**2 for x in seq[-30:]) / 30.0
-        std = math.sqrt(var_val)
-        feat.append(min(1.0, std * 2.0))
-        
-        # 26: Recent 5 Big count
-        feat.append((sum(seq[-5:]) / 5.0 - 0.5) * 2.0)
-        
-        # 27: Recent 5 Small count
-        feat.append((sum(1 for x in seq[-5:] if x==0) / 5.0 - 0.5) * 2.0)
-        
-        # Ensure 28 features
-        while len(feat) < 28: feat.append(0.0)
-        return feat[:28]
+        return feat[:23]
 
     def sigmoid(self, x):
         try: return 1 / (1 + math.exp(-max(-20, min(20, x))))
         except OverflowError: return 0.0 if x < 0 else 1.0
 
     def train_model(self, feat, actual_size):
-        if not feat or len(feat) != 28: return
+        if not feat or len(feat) != 23: return
         z = sum(w * f for w, f in zip(self.weights, feat))
         pred = self.sigmoid(z)
         
         error = actual_size - pred
-        for i in range(28):
+        for i in range(23):
             reg = 0.001 * self.weights[i]
             self.weights[i] += self.lr * (error * feat[i] - reg)
             
@@ -377,11 +364,28 @@ class AdvancedPatternAI:
         if self.save_counter % 10 == 0:
             STORE.save_weights(self.weights)
 
+    def warmup_training(self, seq, nums):
+        print("🔥 Warmup Training on 1000 results started (5 Epochs)...")
+        for epoch in range(5):
+            for i in range(50, len(seq)):
+                p_seq = seq[:i]
+                p_nums = nums[:i]
+                p_feat = self.extract_features(p_seq, p_nums)
+                if p_feat:
+                    z = sum(w * f for w, f in zip(self.weights, p_feat))
+                    pred = self.sigmoid(z)
+                    err = seq[i] - pred
+                    for j in range(23):
+                        reg = 0.001 * self.weights[j]
+                        self.weights[j] += self.lr * (err * p_feat[j] - reg)
+        STORE.save_weights(self.weights)
+        self.warmed_up = True
+        print("🔥 Warmup Training complete!")
+
     def get_best_number(self, data, side):
-        """Advance Pattern Number Prediction"""
         nums = [x['num'] for x in data]
         
-        # 1. Long Pattern (Single Number Repetition)
+        # 1. Long Pattern (Single Number)
         recent_10 = nums[-10:]
         freq = Counter(recent_10)
         dominant, count = freq.most_common(1)[0]
@@ -397,8 +401,8 @@ class AdvancedPatternAI:
                 if pool_next:
                     return Counter(pool_next).most_common(1)[0][0]
         
-        # 2. Short Pattern (Exact Match)
-        for L in [6, 5, 4, 3]:
+        # 2. Short Pattern
+        for L in [5, 4, 3]:
             if len(nums) < L + 5: continue
             target = tuple(nums[-L:])
             follows = []
@@ -411,7 +415,7 @@ class AdvancedPatternAI:
                 if pool_follows:
                     return Counter(pool_follows).most_common(1)[0][0]
                     
-        # 3. CSV Logic Fallback
+        # 3. CSV Fallback
         d = nums[::-1]
         last_n = d[0]
         freq30 = Counter(d[:30])
@@ -431,28 +435,13 @@ class AdvancedPatternAI:
         return scored[0][1]
 
     def generate_prediction(self):
-        if len(self.history) < 50: return None
+        if len(self.history) < 100: return None
         
         seq = [x["size"] for x in self.history]
         nums = [x["num"] for x in self.history]
         
-        if not self.warmed_up and len(self.history) >= 80:
-            print("Warmup training started...")
-            for _ in range(3):
-                for i in range(50, len(self.history)):
-                    p_seq = seq[:i]
-                    p_nums = nums[:i]
-                    p_feat = self.extract_features(p_seq, p_nums)
-                    if p_feat:
-                        z = sum(w * f for w, f in zip(self.weights, p_feat))
-                        pred = self.sigmoid(z)
-                        err = self.history[i]["size"] - pred
-                        for j in range(28):
-                            reg = 0.001 * self.weights[j]
-                            self.weights[j] += self.lr * (err * p_feat[j] - reg)
-            STORE.save_weights(self.weights)
-            self.warmed_up = True
-            print("Warmup done.")
+        if not self.warmed_up:
+            self.warmup_training(seq, nums)
         
         feat = self.extract_features(seq, nums)
         if not feat: return None
@@ -463,20 +452,20 @@ class AdvancedPatternAI:
         # Advanced Recovery Logic
         if self.loss_streak >= 1:
             pattern_signal = (feat[16] + feat[17] + feat[18] + feat[19]) / 4.0
-            p_big = p_big * 0.6 + (0.5 + pattern_signal / 2.0) * 0.4
+            p_big = p_big * 0.4 + (0.5 + pattern_signal / 2.0) * 0.6
             
         pred_size = 1 if p_big >= 0.5 else 0
         conf_val = p_big if pred_size == 1 else (1 - p_big)
         confidence = int(min(88, max(52, conf_val * 100)))
         
         logic_tags = []
-        if feat[16] != 0: logic_tags.append("SzPattern")
-        if feat[17] != 0: logic_tags.append("NumPattern")
-        if feat[18] != 0: logic_tags.append("SingleRep")
-        if feat[19] != 0: logic_tags.append("TrendShift")
+        if abs(feat[16]) > 0.2: logic_tags.append("NumShort(3-5)")
+        if abs(feat[17]) > 0.2: logic_tags.append("SizeLong(6-12)")
+        if abs(feat[18]) > 0.2: logic_tags.append("SingleRep(7-12)")
+        if abs(feat[19]) > 0.2: logic_tags.append("TrendShift")
         if not logic_tags: logic_tags.append("PureMath")
         
-        mode = "RECOVERY" if self.loss_streak >= 1 else "NEURAL_PATTERN"
+        mode = "RECOVERY" if self.loss_streak >= 1 else "NEURAL_DEEP"
         target_num = self.get_best_number(self.history, pred_size)
 
         return {
@@ -489,7 +478,7 @@ class AdvancedPatternAI:
             "sigs": logic_tags
         }
 
-PREDICTOR = AdvancedPatternAI()
+PREDICTOR = DeepTracker()
 
 # =========================
 # FORMATTING
@@ -511,7 +500,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V162 PATTERN-AI SYNC</i>
+⚡ <i>V164 DEEP-TRACKER</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -529,7 +518,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V162 Advanced Pattern AI started...")
+    log.info("V164 Deep Tracker started...")
     last_processed_issue = None
 
     while True:
@@ -576,7 +565,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V162 Advanced Pattern AI is running!")
+    return web.Response(text="V164 Deep Tracker is running!")
 
 async def main():
     CFG.validate()
