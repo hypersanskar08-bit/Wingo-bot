@@ -119,21 +119,20 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V156 NEURAL APEX ENGINE
+# V156 NEURAL APEX ENGINE (Fixed)
 # =========================
 class NeuralApex:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # Engine Stats for Meta-Learner
         self.engine_stats = {
             'NeuralNet': {'w': 1, 'l': 0},
             'DeepMarkov': {'w': 1, 'l': 0},
             'CUSUM': {'w': 1, 'l': 0}
         }
         
-        # 🧠 Neural Network Weights (12 features + 1 bias)
+        # 🧠 Neural Network Weights (13 features)
         self.weights = [0.0] * 13
         self.lr = 0.1 # Learning rate
 
@@ -160,12 +159,11 @@ class NeuralApex:
         except Exception:
             return False
 
-    # --- 1. NEURAL NETWORK (Features & Prediction) ---
     def extract_features(self, seq):
         if len(seq) < 30: return None
         feat = [1.0] # Bias
         
-        # 1. Last 5 sizes (1 for Big, -1 for Small)
+        # 1. Last 5 sizes
         for i in range(1, 6):
             feat.append(1.0 if seq[-i] == 1 else -1.0)
             
@@ -176,12 +174,12 @@ class NeuralApex:
             else: break
         feat.append(min(streak, 10) / 10.0)
         
-        # 3. Z-Score (Last 30)
+        # 3. Z-Score
         w = seq[-30:]
         z = (sum(w) - 15) / math.sqrt(30 * 0.25)
         feat.append(max(-2.0, min(2.0, z)) / 2.0)
         
-        # 4. CUSUM (Last 30)
+        # 4. CUSUM
         pos, neg = 0.0, 0.0
         for s in seq[-30:]:
             pos = max(0, pos + s - 0.6)
@@ -192,43 +190,45 @@ class NeuralApex:
         # 5. Last 10 Big Count
         feat.append(sum(seq[-10:]) / 10.0)
         
-        # 6. Last 5 sizes of same side (momentum)
+        # 6. Momentum
         feat.append(sum(1 for x in seq[-5:] if x == 1) / 5.0)
         
-        # 7. Volatility (Number of switches in last 10)
+        # 7. Volatility
         switches = sum(1 for i in range(1, 10) if seq[-i] != seq[-i-1])
         feat.append(switches / 9.0)
         
-        return feat
+        # Ensure we have exactly 13 features
+        while len(feat) < 13: feat.append(0.0)
+        return feat[:13]
 
     def sigmoid(self, x):
-        return 1 / (1 + math.exp(-max(-20, min(20, x))))
+        try:
+            return 1 / (1 + math.exp(-max(-20, min(20, x))))
+        except OverflowError:
+            return 0.0 if x < 0 else 1.0
 
     def neural_predict(self, seq):
         feat = self.extract_features(seq)
-        if not feat: return None
+        if not feat: return None, None
         
         z = sum(w * f for w, f in zip(self.weights, feat))
         p_big = self.sigmoid(z)
         
-        # If probability is too close to 0.5, return None (no clear signal)
-        if 0.45 <= p_big <= 0.55: return None
+        if 0.45 <= p_big <= 0.55: return None, None
         
         dir = 1 if p_big > 0.5 else 0
         conf = max(p_big, 1 - p_big)
-        return (dir, conf), feat, (1 if dir == 1 else 0)
+        return (dir, conf), feat
 
     def train_neural(self, feat, actual_size):
-        if not feat: return
+        if not feat or len(feat) != 13: return
         z = sum(w * f for w, f in zip(self.weights, feat))
         pred = self.sigmoid(z)
         
-        # Gradient Descent Update
         error = actual_size - pred
-        for i in range(len(self.weights)):
+        for i in range(13):
             self.weights[i] += self.lr * error * feat[i]
 
-    # --- 2. DEEP MARKOV ---
     def deep_markov(self, seq):
         for order in [4, 3, 2]:
             if len(seq) < order + 5: continue
@@ -244,7 +244,6 @@ class NeuralApex:
                 return (1 if p >= 0.5 else 0, max(p, 1-p)), f"Markov{order}"
         return None, ""
 
-    # --- 3. CUSUM SHIFT ---
     def cusum_shift(self, seq):
         if len(seq) < 30: return None, ""
         pos, neg = 0.0, 0.0
@@ -281,12 +280,11 @@ class NeuralApex:
         if len(self.history) < 50: return None
         
         seq = [x["size"] for x in self.history]
-        
         signals = {}
         
-        # --- 1. RUN ALL ENGINES ---
-        nn, feat, nn_pred = self.neural_predict(seq) or (None, None, None)
-        if nn: signals['NeuralNet'] = nn
+        # 1. Fetch Signals
+        nn_res, feat = self.neural_predict(seq)
+        if nn_res: signals['NeuralNet'] = (nn_res, "NeuralNet")
         
         mk, mk_tag = self.deep_markov(seq)
         if mk: signals['DeepMarkov'] = (mk, mk_tag)
@@ -294,26 +292,25 @@ class NeuralApex:
         cu, cu_tag = self.cusum_shift(seq)
         if cu: signals['CUSUM'] = (cu, cu_tag)
 
-        # --- 2. SMART META-LEARNER (DYNAMIC WEIGHTING) ---
+        # 2. Meta-Learner Mixer
         log_odds = 0
         logic_tags = []
         
-        for name, (direction, conf, *tag) in signals.items():
-            stats = self.engine_stats[name]
-            # If engine has failed recently, its weight drops.
+        for name, ((direction, conf), tag) in signals.items():
+            stats = self.engine_stats.get(name, {'w': 1, 'l': 0})
             acc = (stats['w'] + 1) / (stats['w'] + stats['l'] + 2)
-            dynamic_weight = max(0.2, acc * 2.5)
+            weight = max(0.2, acc * 2.5)
             
-            # Recovery Mode Boost (CUSUM and Markov get high weight if loss happened)
+            # Recovery mode boost
             if self.loss_streak >= 1 and name in ['CUSUM', 'DeepMarkov']:
-                dynamic_weight *= 2.0
+                weight *= 2.0
             if self.loss_streak == 0 and name == 'NeuralNet':
-                dynamic_weight *= 1.5 # Neural net is king in normal mode
+                weight *= 1.5
                 
-            log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * dynamic_weight
-            logic_tags.append(tag[0] if tag else name)
+            log_odds += (1 if direction == 1 else -1) * math.log(conf / (1 - conf)) * weight
+            logic_tags.append(tag)
 
-        # --- 3. FINAL DECISION ---
+        # 3. Final Decision
         if not signals:
             pred_size = 1 if sum(seq[-20:]) >= 10 else 0
             confidence = 55
@@ -324,15 +321,8 @@ class NeuralApex:
             confidence = int(min(88, max(60, 50 + abs(log_odds) * 10)))
             mode = "RECOVERY" if self.loss_streak >= 1 else "NEURAL_MODE"
 
-        # Target Number
         target_num = self.get_best_number(self.history, pred_size)
 
-        # Save features for learning
-        if feat:
-            self.train_neural(feat, pred_size) # We train assuming it will win, but actual result will be used in worker loop. Wait, no, we should train on ACTUAL result.
-            # I'll store the features in the DB to train later, or just recompute.
-            # Better approach: We train in the worker loop when result comes.
-            
         return {
             "issue": str(int(self.history[-1]["issue"]) + 1),
             "size": "BIG" if pred_size == 1 else "SMALL",
@@ -341,7 +331,7 @@ class NeuralApex:
             "logic": " + ".join(logic_tags[:3]),
             "mode": mode,
             "sigs": list(signals.keys()),
-            "feat": feat # Save to train later
+            "feat": feat
         }
 
 PREDICTOR = NeuralApex()
@@ -394,13 +384,6 @@ async def worker_loop(app, session):
                 
                 resolved = STORE.resolve_pending(hist_dict)
                 for res in resolved:
-                    # 🔥 NEURAL NETWORK TRAINING
-                    if res.get('sigs') and 'feat' in json.loads(res['sigs']):
-                        # Wait, we need to extract features again for the actual result.
-                        # Let's just re-extract features from the history up to that point.
-                        # This is too complex. Let's just do online SGD in the main loop.
-                        pass
-                        
                     if res['win']: PREDICTOR.loss_streak = 0
                     else: PREDICTOR.loss_streak += 1
                     
