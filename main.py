@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import sqlite3
 import time
 from collections import Counter
@@ -32,7 +33,7 @@ class Config:
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 10.0
-    bot_name: str = "V159 PURE MATH AI (Fixed)"
+    bot_name: str = "V160 PURE MATH AI"
 
     def parse_chat_id(self):
         return int(self.chat_id_raw) if self.chat_id_raw.isdigit() else self.chat_id_raw
@@ -54,7 +55,7 @@ def setup_logging():
     fh = RotatingFileHandler(Path(CFG.log_dir)/"bot.log", maxBytes=1_000_000, backupCount=1); fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v159")
+log = logging.getLogger("v160")
 def h(x: Any) -> str: return html.escape(str(x))
 
 class Storage:
@@ -118,16 +119,16 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# V159 PURE MATH ENGINE (BALANCED)
+# V160 PURE MATH ENGINE (FIXED)
 # =========================
 class PureMathEngine:
     def __init__(self):
         self.history = []
         self.loss_streak = 0
         
-        # 16 Weights
-        self.weights = [0.0] * 16
-        self.lr = 0.08 # Learning Rate
+        # 16 Weights, initialized with random small values to avoid starting bias
+        self.weights = [random.uniform(-0.1, 0.1) for _ in range(16)]
+        self.lr = 0.05 
 
     async def fetch_data(self, session):
         try:
@@ -152,7 +153,6 @@ class PureMathEngine:
         except Exception:
             return False
 
-    # --- 🔥 FIX: CENTERED FEATURES (-1 to +1) ---
     def extract_math_features(self, seq):
         if len(seq) < 50: return None
         feat = [1.0] # Bias
@@ -171,7 +171,7 @@ class PureMathEngine:
                     else: small += 1
             total = big + small
             p = (big + 1) / (total + 2) if total > 0 else 0.5
-            feat.append((p - 0.5) * 2.0) # Centered to -1 to +1
+            feat.append((p - 0.5) * 2.0) # Centered
             
         # 3. Z-Score (Normalized)
         w30 = seq[-30:]
@@ -192,7 +192,7 @@ class PureMathEngine:
         entropy = 0.0
         if p_big > 0: entropy -= p_big * math.log2(p_big)
         if p_small > 0: entropy -= p_small * math.log2(p_small)
-        feat.append((entropy - 0.5) * 2.0) # 0..1 becomes -1..1
+        feat.append((entropy - 0.5) * 2.0) 
         
         # 6. Trend Streak (Directional)
         streak = 1
@@ -205,20 +205,21 @@ class PureMathEngine:
         # 7. Recent Momentum (Last 10)
         feat.append((sum(seq[-10:]) / 10.0 - 0.5) * 2.0)
         
-        return feat
+        return feat # Length is 16
 
     def sigmoid(self, x):
         try: return 1 / (1 + math.exp(-max(-20, min(20, x))))
         except OverflowError: return 0.0 if x < 0 else 1.0
 
     def train_model(self, feat, actual_size):
-        if not feat or len(feat) != 15: return
+        # 🔥 FIX: Feature length is 16, not 15
+        if not feat or len(feat) != 16: return
+        
         z = sum(w * f for w, f in zip(self.weights, feat))
         pred = self.sigmoid(z)
         
         error = actual_size - pred
-        for i in range(15):
-            # L2 Regularization (0.001) to prevent overfitting
+        for i in range(16): # 🔥 FIX: Loop 16 times
             reg = 0.001 * self.weights[i]
             self.weights[i] += self.lr * (error * feat[i] - reg)
 
@@ -258,22 +259,22 @@ class PureMathEngine:
         
         p_big = self.calculate_prediction(feat)
         
-        # Balanced Threshold
+        # Pure Mathematical Decision
         pred_size = 1 if p_big >= 0.5 else 0
         
         conf_val = p_big if pred_size == 1 else (1 - p_big)
         confidence = int(min(88, max(52, conf_val * 100)))
         
         logic_tags = []
-        if p_big > 0.6: logic_tags.append("Math_Strong_Big")
-        elif p_big < 0.4: logic_tags.append("Math_Strong_Small")
+        if p_big > 0.55: logic_tags.append("Math_Big")
+        elif p_big < 0.45: logic_tags.append("Math_Small")
         else: logic_tags.append("Math_Neutral")
         
         z = sum(w * f for w, f in zip(self.weights, feat))
         max_w_idx = self.weights.index(max(self.weights))
-        if max_w_idx in [11, 12]: logic_tags.append("ZScore_Dominant")
-        elif max_w_idx == 14: logic_tags.append("Streak_Dominant")
-        elif 6 <= max_w_idx <= 10: logic_tags.append("Markov_Dominant")
+        if max_w_idx in [11, 12]: logic_tags.append("ZScore")
+        elif max_w_idx == 14: logic_tags.append("Streak")
+        elif 6 <= max_w_idx <= 10: logic_tags.append("Markov")
         
         mode = "RECOVERY" if self.loss_streak >= 1 else "PURE_MATH"
         target_num = self.get_best_number(self.history, pred_size)
@@ -310,7 +311,7 @@ def format_prediction(p, recent_rows):
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
 {recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>V159 PURE MATH AI</i>
+⚡ <i>V160 PURE MATH AI</i>
 """
 
 async def send_msg(app, text, retries=3):
@@ -328,7 +329,7 @@ async def send_msg(app, text, retries=3):
 # WORKER LOOP
 # =========================
 async def worker_loop(app, session):
-    log.info("V159 Pure Math started...")
+    log.info("V160 Pure Math started...")
     last_processed_issue = None
 
     while True:
@@ -349,6 +350,7 @@ async def worker_loop(app, session):
                 
                 if latest_issue != last_processed_issue:
                     if not STORE.prediction_exists(next_issue):
+                        # Train on immediate past result
                         if len(PREDICTOR.history) > 1:
                             past_seq = [x["size"] for x in PREDICTOR.history[:-1]]
                             past_feat = PREDICTOR.extract_math_features(past_seq)
@@ -374,7 +376,7 @@ async def worker_loop(app, session):
 # MAIN
 # =========================
 async def handle_ping(request):
-    return web.Response(text="V159 Pure Math is running!")
+    return web.Response(text="V160 Pure Math is running!")
 
 async def main():
     CFG.validate()
