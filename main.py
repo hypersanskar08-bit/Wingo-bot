@@ -1,8 +1,10 @@
 """
-V650 ULTRA-AI (BUG FIXED)
-=========================
-- FIXED: Double-negative log-odds bug (SMALL was turning into BIG).
-- FIXED: Trend Agent now correctly dictates the final direction.
+V700 HOUSE-TRAP TRACKER
+=======================
+- TrapAgent: Detects when the game maker is breaking a streak (Fake Breakout).
+- ZigzagAgent: Detects alternating patterns to counter confusion.
+- TrendAgent: Limited to streaks of 2 to avoid falling into traps.
+- Meta-Learner dynamically switches to the agent that is beating the house.
 """
 
 import asyncio
@@ -28,27 +30,34 @@ from telegram.ext import Application, CommandHandler
 from telegram.error import TimedOut, NetworkError
 
 # =========================
-# CONFIG
+# CONFIG (Hardcoded for immediate run)
 # =========================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAH_GCZP4vLI4M-rF8knnPAartqucT51X7U"
-    chat_id_raw: str = "1264164655"
+    # Tumhara Token
+    telegram_token: str = os.environ.get("TG_TOKEN", "8611789455:AAH_GCZP4vLI4M-rF8knnPAartqucT51X7U")
+    
+    # Tumhari Chat ID (Private Channel ya User ID)
+    chat_id_raw: str = os.environ.get("TG_CHAT", "1264164655")
+    
+    # Tumhara Render Webhook URL
+    webhook_url: str = os.environ.get("WEBHOOK_URL", "https://wingo-bot-mcs3.onrender.com")
+    
     source_api_url: str = os.environ.get(
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    webhook_url: str = "https://wingo-bot-mcs3.onrender.com"
-    db_path: str = os.environ.get("DB_PATH", "predictor_v650.db")
+    db_path: str = os.environ.get("DB_PATH", "predictor_v700.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V650 ULTRA-AI"
+    bot_name: str = "V700 HOUSE-TRAP TRACKER"
     min_history: int = 50
     warm_min: int = 20
 
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
+        # Return as int if it's a numeric ID (like -100... or 126...)
         return int(raw) if raw.lstrip("-").isdigit() else raw
 
     def validate(self):
@@ -65,17 +74,17 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v650.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v700.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v650")
+log = logging.getLogger("v700")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 # =========================
-# ADVANCED MATH & AI
+# AI & MATH CLASSES
 # =========================
 class HMMRegime:
     def __init__(self):
@@ -96,9 +105,15 @@ class HMMRegime:
 
 class MetaLearner:
     def __init__(self):
-        self.rewards = {"TrendAgent": deque(maxlen=50), "MeanRevAgent": deque(maxlen=50), "PatternAgent": deque(maxlen=50)}
+        self.rewards = {
+            "TrapAgent": deque(maxlen=50),
+            "ZigzagAgent": deque(maxlen=50),
+            "TrendAgent": deque(maxlen=50),
+            "PatternAgent": deque(maxlen=50)
+        }
     def record(self, agent, correct):
-        self.rewards[agent].append(1 if correct else 0)
+        if agent in self.rewards:
+            self.rewards[agent].append(1 if correct else 0)
     def get_weights(self):
         weights = {}
         for agent, history in self.rewards.items():
@@ -203,6 +218,46 @@ class BotState:
 
 STATE = BotState()
 
+def agent_trap(sizes):
+    n = len(sizes)
+    if n < 30: return None
+    last = sizes[-1]
+    streak = 1
+    for i in range(n-2, -1, -1):
+        if sizes[i] == last: streak += 1
+        else: break
+        
+    if streak < 3: return None
+    
+    continuations = 0
+    reversals = 0
+    for i in range(3, n):
+        temp_streak = 1
+        for j in range(i-2, -1, -1):
+            if sizes[j] == sizes[i-1]: temp_streak += 1
+            else: break
+        if temp_streak == streak:
+            if sizes[i] == last: continuations += 1
+            else: reversals += 1
+            
+    total = continuations + reversals
+    if total >= 5:
+        p_rev = reversals / total
+        if p_rev > 0.60: return {"dir": 1 - last, "conf": 60 + p_rev*20, "name": "TrapReversal"}
+        elif p_rev < 0.40: return {"dir": last, "conf": 60 + (1-p_rev)*20, "name": "TrapContinuation"}
+    return None
+
+def agent_zigzag(sizes):
+    if len(sizes) < 10: return None
+    alt = True
+    for i in range(len(sizes)-4, len(sizes)):
+        if sizes[i] == sizes[i-1]:
+            alt = False
+            break
+    if alt:
+        return {"dir": 1 - sizes[-1], "conf": 65, "name": "Zigzag"}
+    return None
+
 def agent_trend(sizes):
     if len(sizes) < 10: return None
     last = sizes[-1]
@@ -210,26 +265,9 @@ def agent_trend(sizes):
     for i in range(len(sizes)-2, -1, -1):
         if sizes[i] == last: run += 1
         else: break
-    if run >= 3: return {"dir": last, "conf": 60 + (run * 5), "name": "TrendFollow"}
-    ma5 = sum(sizes[-5:])/5
-    ma10 = sum(sizes[-10:])/10
-    if abs(ma5 - ma10) > 0.15:
-        return {"dir": 1 if ma5 > ma10 else 0, "conf": 65, "name": "MA-Cross"}
-    return None
-
-def agent_mean_rev(sizes):
-    if len(sizes) < 20: return None
-    last = sizes[-1]
-    run = 1
-    for i in range(len(sizes)-2, -1, -1):
-        if sizes[i] == last: run += 1
-        else: break
-    if run >= 5: return {"dir": 1 - last, "conf": 75, "name": "DragonReversal"}
-    ma20 = sum(sizes[-20:])/20
-    std = math.sqrt(sum((x-ma20)**2 for x in sizes[-20:])/20)
-    if std > 0.1:
-        if last > ma20 + 1.5*std: return {"dir": 0, "conf": 70, "name": "BollingerShort"}
-        if last < ma20 - 1.5*std: return {"dir": 1, "conf": 70, "name": "BollingerLong"}
+    
+    if run == 1 or run == 2: 
+        return {"dir": last, "conf": 58, "name": "SafeTrend"}
     return None
 
 def agent_pattern(sizes, nums):
@@ -247,7 +285,7 @@ def agent_pattern(sizes, nums):
     return None
 
 # =========================
-# PREDICTOR & RISK ENGINE
+# PREDICTOR
 # =========================
 def generate_prediction():
     if len(STATE.history) < CFG.min_history: return None
@@ -256,61 +294,51 @@ def generate_prediction():
     
     regime = STATE.hmm.update(sizes)
     
+    a_trap = agent_trap(sizes)
+    a_zigzag = agent_zigzag(sizes)
     a_trend = agent_trend(sizes)
-    a_meanrev = agent_mean_rev(sizes)
     a_pattern = agent_pattern(sizes, nums)
     
-    # Filter trend against mean reversion
-    if regime == "TRENDING_BIG" and a_meanrev and a_meanrev["dir"] == 0:
-        a_meanrev = None
-    elif regime == "TRENDING_SMALL" and a_meanrev and a_meanrev["dir"] == 1:
-        a_meanrev = None
-        
-    agents = [("TrendAgent", a_trend), ("MeanRevAgent", a_meanrev), ("PatternAgent", a_pattern)]
+    agents = [
+        ("TrapAgent", a_trap),
+        ("ZigzagAgent", a_zigzag),
+        ("TrendAgent", a_trend),
+        ("PatternAgent", a_pattern)
+    ]
     
-    if not any(p for _, p in agents):
-        fallback_dir = 1 - sizes[-1] if random.random() > 0.5 else sizes[-1]
-        agents.append(("FallbackAgent", {"dir": fallback_dir, "conf": 55, "name": "Fallback"}))
+    active_agents = [(name, pred) for name, pred in agents if pred is not None]
+    
+    if not active_agents:
+        fallback_dir = 1 - sizes[-1]
+        active_agents.append(("FallbackAgent", {"dir": fallback_dir, "conf": 55, "name": "Fallback"}))
 
     weights = STATE.meta.get_weights()
     total_log_odds = 0.0
     active_signals = []
     
-    for agent_name, pred in agents:
-        if not pred: continue
+    for agent_name, pred in active_agents:
         w = weights.get(agent_name, 1.0)
-        
-        # 🔥 CRITICAL BUG FIX: Correct Log-Odds Calculation
         p = pred["conf"] / 100.0
-        p = max(0.01, min(0.99, p)) # Prevent math domain errors
+        p = max(0.01, min(0.99, p))
         
-        # Calculate log-odds based on prediction direction
-        if pred["dir"] == 1:  # BIG
+        if pred["dir"] == 1:
             log_odds = math.log(p / (1 - p))
-        else:  # SMALL
-            log_odds = -math.log(p / (1 - p)) # Negative log-odds for SMALL
+        else:
+            log_odds = -math.log(p / (1 - p))
             
         total_log_odds += log_odds * w
         active_signals.append(f"{pred['name']} ({'BIG' if pred['dir']==1 else 'SMALL'})")
     
-    # If total log odds is 0, default to last result's opposite
     if total_log_odds == 0.0:
         total_log_odds = 0.1 if sizes[-1] == 0 else -0.1
 
-    # Calculate final P(BIG) correctly
     p_big = 1 / (1 + math.exp(-total_log_odds))
     pred_dir = 1 if p_big > 0.5 else 0
 
-    # Risk Engine
     stake = "1x"
-    if STATE.loss_streak >= 2:
-        stake = "0.5x"
-        active_signals.append("DefensiveMode")
-    elif STATE.win_streak >= 2:
-        stake = "2x"
-        active_signals.append("AggressiveMode")
+    if STATE.loss_streak >= 2: stake = "0.5x"
+    elif STATE.win_streak >= 2: stake = "2x"
 
-    # Smart Number Picker
     pool = list(range(5, 10)) if pred_dir == 1 else list(range(0, 5))
     freq = Counter(nums[-15:])
     max_freq = max([freq[x] for x in pool]) if freq else 0
@@ -324,15 +352,18 @@ def generate_prediction():
         "p_big": p_big, "confidence": int(50 + abs(p_big - 0.5)*100), "raw_conf": int(50 + abs(p_big - 0.5)*100),
         "consensus": max(p_big, 1-p_big), "mode": regime, "regime": regime,
         "logic": ", ".join(active_signals), "sigs": [{"name": s, "dir": pred_dir} for s in active_signals],
-        "stake": stake, "details": {"agents": {a: p for a, p in agents if p}}
+        "stake": stake, "details": {"agents": {a: p for a, p in active_agents}}
     }
 
 def learn_from_resolution(res: dict):
     actual_size = 1 if res["actual_size"] == "BIG" else 0
     details = res.get("details") or {}
     agents = details.get("agents", {})
+    
     for agent_name, pred in agents.items():
-        if pred: STATE.meta.record(agent_name, pred["dir"] == actual_size)
+        if pred:
+            STATE.meta.record(agent_name, pred["dir"] == actual_size)
+            
     if res["win"]:
         STATE.loss_streak = 0; STATE.win_streak += 1
     else:
@@ -365,8 +396,8 @@ async def fetch_data(session):
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
-    sig_text = "\n".join(f"  🔹 {h(s['name'])}" for s in p["sigs"])
-    stake_emoji = {"2.5x": "🚀 2.5x", "2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x"}.get(p['stake'], "1x")
+    sig_text = "\n".join(f"  🕵️ {h(s['name'])}" for s in p["sigs"])
+    stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x"}.get(p['stake'], "1x")
     
     return f"""
 📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
@@ -377,7 +408,7 @@ def format_prediction(p, recent_rows):
 🎲 <b>P(BIG)</b>: <b>{p['p_big']*100:.1f}%</b>
 💰 <b>Risk Stake</b>: <b>{stake_emoji}</b>
 
-🔎 <b>Active Agents</b>:
+🔎 <b>House Trackers</b>:
 {sig_text}
 
 ━━━━━━━━━━━━━━━━━━
@@ -424,16 +455,18 @@ async def worker_loop(app, session):
         except Exception as e:
             log.exception(f"Loop error: {e}"); await asyncio.sleep(2)
 
-async def handle_ping(request): return web.Response(text="V650 is running!")
+async def handle_ping(request): return web.Response(text="V700 is running!")
 
 async def main():
     CFG.validate()
-    if not CFG.telegram_token: raise RuntimeError("TG_TOKEN env variable is empty")
+    
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
     
     async with app:
         await app.start()
         port = int(os.environ.get("PORT", 8080))
+        
+        # Webhook mode if URL is provided
         if CFG.webhook_url:
             webhook_path = f"/webhook/{CFG.telegram_token}"
             await app.bot.set_webhook(url=f"{CFG.webhook_url}{webhook_path}", drop_pending_updates=True)
@@ -443,9 +476,11 @@ async def main():
             runner = web.AppRunner(web_app)
             await runner.setup()
             await web.TCPSite(runner, "0.0.0.0", port).start()
+            log.info(f"Webhook started on port {port}")
         else:
             await app.bot.delete_webhook(drop_pending_updates=True)
             await app.updater.start_polling(drop_pending_updates=True)
+            log.info("Polling started")
 
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(worker_loop(app, session))
