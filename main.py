@@ -1,14 +1,13 @@
 """
-V900 MULTI-LAYER INTELLIGENCE PIPELINE
-======================================
+V900 BEST MODEL - MULTI-LAYER INTELLIGENCE PREDICTOR
+====================================================
 - Reads last 1000 results
-- Extracts exact shape features
-- Tracks multi-window pattern memory
-- Runs independent models
-- Combines them with dynamic weights
-- Uses confidence gate + soft risk fallback
-- Always returns a prediction, but lower stake if weak
-- Telegram + SQLite persistence
+- Learns exact multi-window sequence patterns
+- Ensemble of independent models
+- Dynamic weighted scoring
+- Safe risk gating
+- Always predicts, but reduces stake when weak
+- Telegram bot + SQLite persistence
 """
 
 import asyncio
@@ -44,11 +43,11 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_multi_layer_intelligence.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_best_model.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V900 MULTI-LAYER AI"
+    bot_name: str = "V900 BEST MODEL"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -75,7 +74,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_multi_layer.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_best_model.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -227,7 +226,7 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
 
 
 # =========================
-# STORAGE
+# DATABASE
 # =========================
 class Storage:
     def __init__(self, path: str):
@@ -321,7 +320,7 @@ class Storage:
             with self._conn() as c:
                 c.execute(
                     "UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?",
-                    (status, act["num"], act_size, issue),
+                    (status, act["num"], act_size, issue)
                 )
 
             resolved.append({
@@ -432,8 +431,10 @@ class Storage:
         with self._conn() as c:
             row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (actual_num,)).fetchone()
             if row is None:
-                c.execute("INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
-                          (actual_num, 0, 0, 0))
+                c.execute(
+                    "INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
+                    (actual_num, 0, 0, 0),
+                )
                 row = (0, 0, 0)
 
             big_count, small_count, total_count = row
@@ -486,7 +487,6 @@ class Storage:
 
         total_count = sum(m["count"] for m in matches)
         weighted_p_big = sum(m["p_big"] * m["count"] for m in matches) / total_count
-
         return {
             "p_big": weighted_p_big,
             "matched": len(matches),
@@ -550,7 +550,7 @@ STATE = BotState()
 
 
 # =========================
-# MULTI-LAYER MODELS
+# MODELS
 # =========================
 def model_exact_pattern(history: List[Dict[str, Any]]) -> Tuple[float, str]:
     sizes = [x["size"] for x in history]
@@ -599,9 +599,6 @@ def model_bias(history: List[Dict[str, Any]]) -> Tuple[float, str]:
     return 0.5, "BiasNeutral"
 
 
-# =========================
-# MODEL WEIGHTING
-# =========================
 def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     model_scores = [
         model_exact_pattern(history),
@@ -612,7 +609,6 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         model_bias(history),
     ]
 
-    # dynamic weights
     weights = {
         "ExactPattern": 0.35,
         "Trend": 0.12,
@@ -622,7 +618,6 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "Bias": 0.18,
     }
 
-    # adjust for regime
     regime = detect_regime([x["size"] for x in history])
     if regime == "TRAP":
         weights["ExactPattern"] += 0.10
@@ -639,9 +634,8 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     active_models = []
 
     for (score, name) in model_scores:
-        if score is not None:
-            weighted += score * weights.get(name, 0.10)
-            active_models.append((name, score))
+        weighted += score * weights.get(name, 0.10)
+        active_models.append((name, score))
 
     final = weighted / total_w
     return {
@@ -674,7 +668,7 @@ def candidate_signals(history: List[Dict[str, Any]]) -> List[Tuple[str, int, flo
     if alt >= 0.6:
         sigs.append(("Alternating", 1 - sizes[-1], 1.8, "Alternation suggests reversal."))
     if bp:
-        sigs.append(("Block", 1 - sizes[-1], 1.6, "Block structure is active."))
+        sigs.append(("Block", 1 - sizes[-1], 1.6, "Block structure active."))
     if abs(ratio - 0.5) > 0.18:
         sigs.append(("Bias", 1 if ratio >= 0.5 else 0, 1.4, "Side imbalance."))
     if vol > 0.5:
@@ -696,6 +690,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 
     score = defaultdict(float)
     bias_map = STORE.get_num_bias(pred_dir, pool)
+
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
         score[n] += freq.get(n, 0) * 3.0
@@ -755,16 +750,14 @@ def generate_prediction() -> Dict[str, Any]:
     history = STATE.history[-1000:]
     sizes = [x["size"] for x in history]
 
-    # ensemble
+    # ensemble probability
     ensemble = ensemble_probability(history)
     p_big = ensemble["p_big"]
 
-    # exact pattern stale penalty
     stale = stale_pattern_penalty(history, 12)
     if stale > 0:
         p_big = p_big * (1.0 - stale)
 
-    # state overrides
     regime = detect_regime(sizes)
     if regime == "ALTERNATING":
         p_big = 1.0 - sizes[-1]
@@ -791,6 +784,7 @@ def generate_prediction() -> Dict[str, Any]:
     pred_dir = 1 if p_big >= 0.5 else 0
 
     strength = signal_strength(history)
+
     if strength < 0.45:
         mode = "LOW-EDGE"
         stake = "0.25x"
@@ -892,6 +886,7 @@ async def fetch_data(session):
 
             out = []
             seen = set()
+
             for item in items:
                 try:
                     issue = str(item.get("issueNumber", item.get("issue", "")))
@@ -1018,7 +1013,6 @@ async def handle_ping(request):
 # =========================
 async def main():
     CFG.validate()
-
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
 
     async with app:
