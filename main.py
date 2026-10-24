@@ -1,9 +1,9 @@
 """
-V800 TREND-ENFORCER
-===================
-- Smart Fallback: Follows the majority of the last 10 results (never contradicts trend).
-- Strict Override: If HMM Regime is TRENDING_SMALL, final prediction MUST be SMALL.
-- Streak Recovery: Mutes complex AI agents after losses to strictly follow the trend.
+V900 RHYTHM-MASTER
+==================
+- Rhythm Detector: Identifies Zig-Zag (B-S-B-S) and Block (B-B-S-S) patterns.
+- Double-Loss Contrarian: Flips logic if bot loses twice in a row to dodge traps.
+- Strict No-Trap: Disables trend following after 3+ streaks to avoid house traps.
 """
 
 import asyncio
@@ -40,11 +40,11 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "predictor_v800.db")
+    db_path: str = os.environ.get("DB_PATH", "predictor_v900.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V800 TREND-ENFORCER"
+    bot_name: str = "V900 RHYTHM-MASTER"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -65,57 +65,65 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v800.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v800")
+log = logging.getLogger("v900")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 # =========================
-# AI & MATH CLASSES
+# AI & RHYTHM DETECTORS
 # =========================
-class HMMRegime:
-    def __init__(self):
-        self.current_state = "CHOPPY"
-    def update(self, sizes):
-        n = len(sizes)
-        if n < 10: return self.current_state
-        last = sizes[-1]
-        run = 1
-        for i in range(n-2, -1, -1):
-            if sizes[i] == last: run += 1
-            else: break
-        
-        # Strict regime definition
-        if run >= 3:
-            self.current_state = "TRENDING_BIG" if last == 1 else "TRENDING_SMALL"
-        elif run <= 1:
-            self.current_state = "CHOPPY"
-        return self.current_state
+def detect_rhythm(sizes):
+    """Detects if the market is in ZigZag (BSBS) or Block (BBSS) rhythm."""
+    if len(sizes) < 10: return None
+    last_10 = sizes[-10:]
+    
+    # Check Zig-Zag (Alternating)
+    is_zigzag = True
+    for i in range(1, len(last_10)):
+        if last_10[i] == last_10[i-1]:
+            is_zigzag = False
+            break
+    if is_zigzag:
+        return {"dir": 1 - sizes[-1], "conf": 75, "name": "ZigZag-Rhythm"}
 
-class MetaLearner:
-    def __init__(self):
-        self.rewards = {
-            "TrapAgent": deque(maxlen=50),
-            "ZigzagAgent": deque(maxlen=50),
-            "TrendAgent": deque(maxlen=50),
-            "FallbackAgent": deque(maxlen=50)
-        }
-    def record(self, agent, correct):
-        if agent in self.rewards:
-            self.rewards[agent].append(1 if correct else 0)
-    def get_weights(self):
-        weights = {}
-        for agent, history in self.rewards.items():
-            if len(history) < 5:
-                weights[agent] = 1.0
-                continue
-            acc = sum(history) / len(history)
-            weights[agent] = max(0.1, min(3.0, (acc * 4) - 1))
-        return weights
+    # Check Block 2-2 (BBSS)
+    if last_10[-1] == last_10[-2] and last_10[-3] != last_10[-2]:
+        return {"dir": 1 - sizes[-1], "conf": 65, "name": "BlockBreak-2"}
+        
+    return None
+
+def agent_anti_trap(sizes):
+    """If 3+ streak, predict the break."""
+    if len(sizes) < 20: return None
+    last = sizes[-1]
+    run = 1
+    for i in range(len(sizes)-2, -1, -1):
+        if sizes[i] == last: run += 1
+        else: break
+        
+    if run == 3:
+        # 3 streak usually breaks (Trap)
+        return {"dir": 1 - last, "conf": 65, "name": "AntiTrap-3"}
+    elif run >= 5:
+        # 5 streak is a strong trend, continue
+        return {"dir": last, "conf": 70, "name": "Dragon-5"}
+    return None
+
+def agent_safe_trend(sizes):
+    if len(sizes) < 5: return None
+    last = sizes[-1]
+    run = 1
+    for i in range(len(sizes)-2, -1, -1):
+        if sizes[i] == last: run += 1
+        else: break
+    if run == 1 or run == 2: 
+        return {"dir": last, "conf": 58, "name": "SafeTrend"}
+    return None
 
 # =========================
 # STORAGE
@@ -190,69 +198,15 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# STATE & AGENTS
+# STATE
 # =========================
 class BotState:
     def __init__(self):
         self.history = []
-        self.hmm = HMMRegime()
-        self.meta = MetaLearner()
         self.loss_streak = 0
         self.win_streak = 0
 
 STATE = BotState()
-
-def agent_trap(sizes):
-    n = len(sizes)
-    if n < 30: return None
-    last = sizes[-1]
-    streak = 1
-    for i in range(n-2, -1, -1):
-        if sizes[i] == last: streak += 1
-        else: break
-        
-    if streak < 3: return None
-    
-    continuations = 0
-    reversals = 0
-    for i in range(3, n):
-        temp_streak = 1
-        for j in range(i-2, -1, -1):
-            if sizes[j] == sizes[i-1]: temp_streak += 1
-            else: break
-        if temp_streak == streak:
-            if sizes[i] == last: continuations += 1
-            else: reversals += 1
-            
-    total = continuations + reversals
-    if total >= 5:
-        p_rev = reversals / total
-        if p_rev > 0.60: return {"dir": 1 - last, "conf": 60 + p_rev*20, "name": "TrapReversal"}
-        elif p_rev < 0.40: return {"dir": last, "conf": 60 + (1-p_rev)*20, "name": "TrapContinuation"}
-    return None
-
-def agent_zigzag(sizes):
-    if len(sizes) < 10: return None
-    alt = True
-    for i in range(len(sizes)-4, len(sizes)):
-        if sizes[i] == sizes[i-1]:
-            alt = False
-            break
-    if alt:
-        return {"dir": 1 - sizes[-1], "conf": 65, "name": "Zigzag"}
-    return None
-
-def agent_trend(sizes):
-    if len(sizes) < 10: return None
-    last = sizes[-1]
-    run = 1
-    for i in range(len(sizes)-2, -1, -1):
-        if sizes[i] == last: run += 1
-        else: break
-    
-    if run == 1 or run == 2: 
-        return {"dir": last, "conf": 58, "name": "SafeTrend"}
-    return None
 
 # =========================
 # PREDICTOR
@@ -262,66 +216,44 @@ def generate_prediction():
     sizes = [x["size"] for x in STATE.history]
     nums = [x["num"] for x in STATE.history]
     
-    regime = STATE.hmm.update(sizes)
-    
-    a_trap = agent_trap(sizes)
-    a_zigzag = agent_zigzag(sizes)
-    a_trend = agent_trend(sizes)
+    # Get agents
+    a_rhythm = detect_rhythm(sizes)
+    a_anti_trap = agent_anti_trap(sizes)
+    a_safe_trend = agent_safe_trend(sizes)
     
     agents = [
-        ("TrapAgent", a_trap),
-        ("ZigzagAgent", a_zigzag),
-        ("TrendAgent", a_trend)
+        ("RhythmAgent", a_rhythm),
+        ("TrapAgent", a_anti_trap),
+        ("TrendAgent", a_safe_trend)
     ]
     
     active_agents = [(name, pred) for name, pred in agents if pred is not None]
     
-    # 🔥 SMART FALLBACK LOGIC
+    # 🔥 DOUBLE LOSS CONTRARIAN OVERRIDE
+    # If bot lost 2 times, it assumes the house is tricking it. Flip the signal.
+    if STATE.loss_streak >= 2 and active_agents:
+        # Reverse the first available signal
+        name, pred = active_agents[0]
+        active_agents = [("ContrarianAgent", {"dir": 1 - pred["dir"], "conf": 70, "name": "Contrarian-Flip"})]
+        mode_override = "CHOPPY"
+    else:
+        mode_override = "DYNAMIC"
+
     if not active_agents:
-        # Find majority in last 10
-        last_10 = sizes[-10:]
-        majority = 1 if sum(last_10) > 5 else 0
-        # If regime says trending, override majority
-        if regime == "TRENDING_SMALL": majority = 0
-        if regime == "TRENDING_BIG": majority = 1
-        
-        active_agents.append(("FallbackAgent", {"dir": majority, "conf": 60, "name": "SmartFallback"}))
+        # Smart fallback: Follow last 3 majority
+        last_3 = sizes[-3:]
+        fallback = 1 if sum(last_3) >= 2 else 0
+        active_agents.append(("FallbackAgent", {"dir": fallback, "conf": 55, "name": "Fallback"}))
 
-    # 🔥 LOSS STREAK OVERRIDE
-    if STATE.loss_streak >= 2:
-        if regime == "TRENDING_SMALL":
-            active_agents = [("StrictTrendAgent", {"dir": 0, "conf": 80, "name": "StrictTrend"})]
-        elif regime == "TRENDING_BIG":
-            active_agents = [("StrictTrendAgent", {"dir": 1, "conf": 80, "name": "StrictTrend"})]
-
-    weights = STATE.meta.get_weights()
-    total_log_odds = 0.0
-    active_signals = []
+    # Calculate combined direction (Majority Vote)
+    votes_big = sum(1 for _, p in active_agents if p["dir"] == 1)
+    votes_small = sum(1 for _, p in active_agents if p["dir"] == 0)
     
-    for agent_name, pred in active_agents:
-        w = weights.get(agent_name, 1.0)
-        p = pred["conf"] / 100.0
-        p = max(0.01, min(0.99, p))
-        
-        if pred["dir"] == 1:
-            log_odds = math.log(p / (1 - p))
-        else:
-            log_odds = -math.log(p / (1 - p))
-            
-        total_log_odds += log_odds * w
-        active_signals.append(f"{pred['name']} ({'BIG' if pred['dir']==1 else 'SMALL'})")
+    pred_dir = 1 if votes_big > votes_small else 0
     
-    if total_log_odds == 0.0:
-        total_log_odds = 0.1 if sizes[-1] == 0 else -0.1
-
-    p_big = 1 / (1 + math.exp(-total_log_odds))
-    pred_dir = 1 if p_big > 0.5 else 0
-
-    # 🔥 STRICT REGIME OVERRIDE
-    # If regime is trending but edge is weak, obey regime.
-    if abs(p_big - 0.5) < 0.10:
-        if regime == "TRENDING_SMALL": pred_dir = 0
-        elif regime == "TRENDING_BIG": pred_dir = 1
+    # Confidence calculation
+    total_votes = votes_big + votes_small
+    p_big = votes_big / total_votes if total_votes > 0 else 0.5
 
     stake = "1x"
     if STATE.loss_streak >= 2: stake = "0.5x"
@@ -334,24 +266,17 @@ def generate_prediction():
     num = random.choice(best_nums)
 
     issue = str(int(STATE.history[-1]["issue"]) + 1)
-    
+    active_signals = [f"{name} ({'BIG' if p['dir']==1 else 'SMALL'})" for name, p in active_agents]
+
     return {
         "issue": issue, "size": "BIG" if pred_dir == 1 else "SMALL", "num": num,
         "p_big": p_big, "confidence": int(50 + abs(p_big - 0.5)*100), "raw_conf": int(50 + abs(p_big - 0.5)*100),
-        "consensus": max(p_big, 1-p_big), "mode": regime, "regime": regime,
+        "consensus": max(p_big, 1-p_big), "mode": mode_override, "regime": mode_override,
         "logic": ", ".join(active_signals), "sigs": [{"name": s, "dir": pred_dir} for s in active_signals],
         "stake": stake, "details": {"agents": {a: p for a, p in active_agents}}
     }
 
 def learn_from_resolution(res: dict):
-    actual_size = 1 if res["actual_size"] == "BIG" else 0
-    details = res.get("details") or {}
-    agents = details.get("agents", {})
-    
-    for agent_name, pred in agents.items():
-        if pred:
-            STATE.meta.record(agent_name, pred["dir"] == actual_size)
-            
     if res["win"]:
         STATE.loss_streak = 0; STATE.win_streak += 1
     else:
@@ -392,11 +317,11 @@ def format_prediction(p, recent_rows):
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
-🧠 <b>AI Regime</b>: <b>{h(p['regime'])}</b>
+🧠 <b>Mode</b>: <b>{h(p['mode'])}</b>
 🎲 <b>P(BIG)</b>: <b>{p['p_big']*100:.1f}%</b>
 💰 <b>Risk Stake</b>: <b>{stake_emoji}</b>
 
-🔎 <b>House Trackers</b>:
+🔎 <b>Active Agents</b>:
 {sig_text}
 
 ━━━━━━━━━━━━━━━━━━
@@ -443,7 +368,7 @@ async def worker_loop(app, session):
         except Exception as e:
             log.exception(f"Loop error: {e}"); await asyncio.sleep(2)
 
-async def handle_ping(request): return web.Response(text="V800 is running!")
+async def handle_ping(request): return web.Response(text="V900 is running!")
 
 async def main():
     CFG.validate()
