@@ -1,12 +1,11 @@
 """
-V900 RECOVERY MODE ENGINE - FULL CODE
-====================================
-- Normal predictor when stable
-- Recovery engine after loss
-- Exact pattern memory
-- Anti-trap logic
-- Telegram + SQLite
-- Render ready
+V900 RECOVERY ENGINE - FULL FIXED CODE
+======================================
+- Robust API fetch
+- Fallback URL support
+- Telegram validation
+- Recovery after loss
+- Render-ready
 """
 
 import asyncio
@@ -38,9 +37,10 @@ class Config:
     telegram_token: str = os.environ.get("TG_TOKEN", "8611789455:AAH_GCZP4vLI4M-rF8knnPAartqucT51X7U")
     chat_id_raw: str = os.environ.get("TG_CHAT", "1264164655")
     webhook_url: str = os.environ.get("WEBHOOK_URL", "https://wingo-bot-mcs3.onrender.com")
-    source_api_url: str = os.environ.get(
-        "API_URL",
-        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
+    source_api_urls: str = os.environ.get(
+        "API_URLS",
+        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000,"
+        "https://www.google.com/"
     )
     db_path: str = os.environ.get("DB_PATH", "v900_recovery_engine.db")
     log_dir: str = "logs"
@@ -52,6 +52,12 @@ class Config:
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
         return int(raw) if raw.lstrip("-").isdigit() else raw
+
+    def api_urls(self) -> List[str]:
+        urls = [u.strip() for u in self.source_api_urls.split(",") if u.strip()]
+        return urls if urls else [
+            "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
+        ]
 
     def validate(self):
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
@@ -224,14 +230,11 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
 
 
 # =========================
-# PATTERN DB (memory)
+# STORAGE
 # =========================
 PATTERN_DB: Dict[str, Dict[str, int]] = {}
 
 
-# =========================
-# STORAGE
-# =========================
 class Storage:
     def __init__(self, path: str):
         self.path = path
@@ -345,7 +348,6 @@ class Storage:
                 "consensus": consensus or 0.5,
                 "stake": stake or "1x"
             })
-
         return resolved
 
     def recent_outcomes(self, limit: int = 12):
@@ -431,7 +433,6 @@ class Storage:
                     (big_count, small_count, total_count, time.time(), key),
                 )
 
-                # in-memory mirror
                 PATTERN_DB[key] = {
                     "big": big_count,
                     "total": total_count,
@@ -558,7 +559,7 @@ STATE = BotState()
 
 
 # =========================
-# NORMAL MODE PREDICTION
+# NORMAL MODE
 # =========================
 def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     sizes = [x["size"] for x in history]
@@ -566,7 +567,6 @@ def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     exact_p = exact["p_big"]
 
     signal = 0.5
-    # trend / trap / alternation / block
     regime = detect_regime(sizes)
     if regime == "TRAP":
         signal = 1.0 - sizes[-1]
@@ -589,13 +589,12 @@ def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     pred_dir = 1 if p_big >= 0.5 else 0
     return {
         "pred_dir": pred_dir,
-        "p_big": p_big,
-        "strength": strength
+        "p_big": p_big
     }
 
 
 # =========================
-# RECOVERY MODE PREDICTION
+# RECOVERY MODE
 # =========================
 def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
     sizes = [x["size"] for x in history]
@@ -606,13 +605,9 @@ def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[st
     last = sizes[-1]
     run = trailing_run(sizes)
 
-    # base
     score = 0.5
-
-    # exact pattern weighted
     score = (score * 0.40) + (exact_p * 0.60)
 
-    # regime flip logic
     if regime == "TRAP":
         score = 1.0 - last
     elif regime == "ALTERNATING":
@@ -626,11 +621,9 @@ def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[st
     else:
         score = ratio_big(sizes, 20)
 
-    # if recent run exists, reverse it
     if run >= 3:
         score = 1.0 - last
 
-    # if loss streak exists, force anti-repeat
     if loss_streak >= 1:
         score = 1.0 - last
     if loss_streak >= 2:
@@ -671,7 +664,6 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 
     score = defaultdict(float)
 
-    # num memory
     bias_map = STORE.get_num_bias(pred_dir, pool)
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
@@ -741,7 +733,7 @@ def generate_prediction() -> Dict[str, Any]:
 
     pred_dir = model["pred_dir"]
     p_big = model["p_big"]
-    strength = model["strength"]
+    strength = signal_strength(history)
 
     if STATE.loss_streak >= 1:
         pred_dir = model["pred_dir"]
@@ -769,7 +761,6 @@ def generate_prediction() -> Dict[str, Any]:
     num = choose_number(pred_dir, history, STATE.loss_streak)
     issue = str(int(STATE.history[-1]["issue"]) + 1)
 
-    # signal list
     sigs = []
     if regime == "TRAP":
         sigs.append({"name": "Trap", "dir": pred_dir})
@@ -824,57 +815,96 @@ def learn_from_resolution(res: dict):
 
 
 # =========================
+# API PARSE
+# =========================
+def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], dict):
+            data = payload["data"]
+            if "list" in data and isinstance(data["list"], list):
+                items = data["list"]
+            elif isinstance(data, list):
+                items = data
+            else:
+                items = []
+        elif "result" in payload and isinstance(payload["result"], list):
+            items = payload["result"]
+        elif "items" in payload and isinstance(payload["items"], list):
+            items = payload["items"]
+        elif "history" in payload and isinstance(payload["history"], list):
+            items = payload["history"]
+        else:
+            items = []
+    else:
+        items = []
+
+    out = []
+    seen = set()
+
+    for item in items:
+        try:
+            if not isinstance(item, dict):
+                continue
+
+            issue = str(item.get("issueNumber", item.get("issue", "")))
+            if not issue or issue in seen:
+                continue
+            seen.add(issue)
+
+            num = safe_int(item.get("number", item.get("value", 0)), 0)
+            if num < 0 or num > 9:
+                continue
+
+            out.append({
+                "issue": issue,
+                "num": num,
+                "size": 1 if num >= 5 else 0
+            })
+        except Exception:
+            continue
+
+    return out
+
+
+# =========================
 # API FETCH
 # =========================
 async def fetch_data(session):
-    try:
-        async with session.get(CFG.source_api_url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
-            if r.status != 200:
-                return False
+    urls = CFG.api_urls()
 
-            payload = await r.json()
-            if not isinstance(payload, dict):
-                return False
-
-            items = payload.get("data", {}).get("list", [])
-            if not items:
-                return False
-
-            items.sort(key=lambda x: int(x.get("issueNumber", x.get("issue", 0))))
-
-            out = []
-            seen = set()
-
-            for item in items:
-                try:
-                    issue = str(item.get("issueNumber", item.get("issue", "")))
-                    if not issue or issue in seen:
-                        continue
-                    seen.add(issue)
-
-                    num = safe_int(item.get("number", item.get("value", 0)), 0)
-                    if num < 0 or num > 9:
-                        continue
-
-                    out.append({
-                        "issue": issue,
-                        "num": num,
-                        "size": 1 if num >= 5 else 0
-                    })
-                except Exception:
+    for url in urls:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
+                if r.status != 200:
+                    log.warning("Fetch failed for %s: status=%s", url, r.status)
                     continue
 
-            if out:
-                STATE.history = out[-1000:]
-                return True
-            return False
-    except Exception as e:
-        log.warning(f"Fetch failed: {e}")
-        return False
+                payload = await r.json()
+                parsed = parse_history_payload(payload)
+
+                if parsed:
+                    STATE.history = parsed[-1000:]
+                    log.info("Fetched history from %s -> %d records", url, len(parsed))
+                    return True
+
+                log.warning("Empty history payload from %s", url)
+                continue
+
+        except Exception as e:
+            log.warning("Fetch failed for %s: %s", url, e)
+            continue
+
+    log.warning("All API endpoints failed.")
+    return False
 
 
 # =========================
-# FORMAT
+# FORMATTING
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(
@@ -922,7 +952,7 @@ async def verify_telegram(app):
         log.info("Telegram verified. Bot username: %s", me.username)
         return True
     except Exception:
-        log.exception("Telegram verification failed. Check TG_TOKEN / TG_CHAT.")
+        log.exception("Telegram verification failed")
         return False
 
 
