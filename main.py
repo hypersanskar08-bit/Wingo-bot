@@ -1,11 +1,12 @@
+python name=main.py
 """
-V900 ADVANCED + FIXED PERIOD MATCHING
-=====================================
+V900 ADVANCED + PERIOD FIXED + SYNTAX FIXED
+===========================================
 - Uses real API issue id
 - Sorts by actual issue number
 - Resolves result by exact issue key
-- Recovery engine after loss
-- Telegram + SQLite
+- Recovery logic after loss
+- Telegram integration
 - Render-ready
 """
 
@@ -22,7 +23,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
@@ -181,7 +182,7 @@ def volatility(values: List[int], window: int = 20) -> float:
     if len(values) < 2:
         return 0.0
     arr = values[-window:]
-    diffs = [abs(arr[i] - arr[i - 1)] for i in range(1, len(arr))]
+    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 
@@ -248,11 +249,12 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
         s += 0.15
     if alt >= 0.6:
         s += 0.15
+
     return min(1.0, s)
 
 
 # ============================================================
-# PATTERN MEMORY
+# MEMORY
 # ============================================================
 PATTERN_DB: Dict[str, Dict[str, int]] = {}
 
@@ -589,7 +591,7 @@ STATE = BotState()
 
 
 # ============================================================
-# MULTI-MODEL SIGNALS
+# EXACT SUFFIX MEMORY
 # ============================================================
 def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
     if len(history) < 8:
@@ -619,6 +621,9 @@ def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
     return sum(p * v for _, p, v in matches) / total_weight
 
 
+# ============================================================
+# MULTI-MODEL SIGNALS
+# ============================================================
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     run = trailing_run(sizes)
@@ -900,7 +905,6 @@ def generate_prediction() -> Dict[str, Any]:
         stake = "0.25x"
 
     if STATE.loss_streak >= 1:
-        pred_dir = model["pred_dir"]
         p_big = model["p_big"]
 
     if STATE.loss_streak >= 2:
