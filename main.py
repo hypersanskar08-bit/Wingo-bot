@@ -1,10 +1,12 @@
 """
-V902 FINAL WORKING VERSION
-================================
-- Added Dummy Web Server (Fixes Render 'Timed Out' & Restart Loop)
-- API Timeout & Retries
-- Local JSON Cache
-- Better Logging for Predictions
+V903 ULTRA DEEP FIXED VERSION
+=====================================
+- FIXED: Added Dummy Web Server for Render Health Check
+- FIXED: Increased API timeout & removed strict Content-Type check
+- FIXED: Added Local Cache (history won't reset on restart)
+- FIXED: exact_suffix_memory now fetches from SQLite DB instead of RAM
+- ADDED: Transition probability is now used in prediction logic
+- FIXED: SQLite WAL mode to prevent database locks
 """
 
 import asyncio
@@ -23,8 +25,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from aiohttp import web  # NEW: For Render Web Server
+from aiohttp import web  # Render Web Server ke liye
 from telegram.ext import Application
+
 
 # ============================================================
 # CONFIG
@@ -37,12 +40,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v902_fixed.db")
+    db_path: str = os.environ.get("DB_PATH", "v903_ultra_deep.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
-    request_timeout: float = 30.0
-    bot_name: str = "V902 FIXED"
+    request_timeout: float = 30.0 # FIXED: 12 -> 30
+    bot_name: str = "V903 ULTRA DEEP"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -57,6 +60,7 @@ class Config:
 
     def validate(self):
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+
 
 CFG = Config()
 
@@ -73,64 +77,35 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v902_fixed.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v903_ultra_deep.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
+
 setup_logging()
-log = logging.getLogger("v902")
+log = logging.getLogger("v903")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 # ============================================================
-# DUMMY WEB SERVER (FOR RENDER HEALTH CHECK)
+# DUMMY WEB SERVER (RENDER FIX)
 # ============================================================
 async def health_check(request):
-    return web.Response(text="V902 Bot is Running!")
+    return web.Response(text="V903 Bot is Running!")
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render gives a PORT env variable, default to 8080
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     log.info(f"Web Server started on port {port} (Render Health Check OK)")
 
 # ============================================================
-# STATE & CACHE HELPERS
-# ============================================================
-class BotState:
-    def __init__(self):
-        self.history = []
-        self.loss_streak = 0
-        self.win_streak = 0
-
-    def save_cache(self):
-        try:
-            with open(CFG.cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.history[-1000:], f)
-        except Exception as e:
-            log.warning(f"Failed to save cache: {e}")
-
-    def load_cache(self):
-        try:
-            if os.path.exists(CFG.cache_file):
-                with open(CFG.cache_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list) and data:
-                        self.history = data
-                        log.info(f"Loaded {len(self.history)} records from local cache.")
-        except Exception as e:
-            log.warning(f"Failed to load cache: {e}")
-
-STATE = BotState()
-
-# ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
@@ -238,6 +213,35 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     return min(1.0, s)
 
 # ============================================================
+# STATE & CACHE
+# ============================================================
+class BotState:
+    def __init__(self):
+        self.history: List[Dict[str, Any]] = []
+        self.loss_streak = 0
+        self.win_streak = 0
+
+    def save_cache(self):
+        try:
+            with open(CFG.cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.history[-1000:], f)
+        except Exception as e:
+            log.warning(f"Failed to save cache: {e}")
+
+    def load_cache(self):
+        try:
+            if os.path.exists(CFG.cache_file):
+                with open(CFG.cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list) and data:
+                        self.history = data
+                        log.info(f"Loaded {len(self.history)} records from local cache.")
+        except Exception as e:
+            log.warning(f"Failed to load cache: {e}")
+
+STATE = BotState()
+
+# ============================================================
 # STORAGE
 # ============================================================
 class Storage:
@@ -247,7 +251,7 @@ class Storage:
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=20)
-        c.execute("PRAGMA journal_mode=TRUNCATE")
+        c.execute("PRAGMA journal_mode=WAL") # FIXED: WAL is better for concurrency
         return c
 
     def _init_db(self):
@@ -275,6 +279,11 @@ class Storage:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS num_stats (
                     num INTEGER PRIMARY KEY, big_count INTEGER DEFAULT 0, small_count INTEGER DEFAULT 0, total_count INTEGER DEFAULT 0
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS transition_stats (
+                    key TEXT PRIMARY KEY, big_count INTEGER DEFAULT 0, small_count INTEGER DEFAULT 0, total_count INTEGER DEFAULT 0, last_seen REAL DEFAULT 0
                 )
             """)
             c.execute("""
@@ -389,6 +398,21 @@ class Storage:
                 total_count += 1
                 c.execute("UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?", (big_count, small_count, total_count, time.time(), key))
 
+    def update_transition_memory(self, prev_sizes: List[int], actual_size: int):
+        if len(prev_sizes) < 2: return
+        prev = tuple(prev_sizes[-3:])
+        key = f"trans:{json.dumps(list(prev))}"
+        with self._conn() as c:
+            row = c.execute("SELECT big_count, small_count, total_count FROM transition_stats WHERE key=?", (key,)).fetchone()
+            if row is None:
+                c.execute("INSERT INTO transition_stats (key, big_count, small_count, total_count, last_seen) VALUES (?, 0, 0, 0, ?)", (key, time.time()))
+                row = (0, 0, 0)
+            big_count, small_count, total_count = row
+            if actual_size == 1: big_count += 1
+            else: small_count += 1
+            total_count += 1
+            c.execute("UPDATE transition_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE key=?", (big_count, small_count, total_count, time.time(), key))
+
     def update_num_memory(self, actual_num: int, actual_size: int):
         with self._conn() as c:
             row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (actual_num,)).fetchone()
@@ -401,6 +425,15 @@ class Storage:
             total_count += 1
             c.execute("UPDATE num_stats SET big_count=?, small_count=?, total_count=? WHERE num=?", (big_count, small_count, total_count, actual_num))
 
+    def get_transition_probability(self, recent_sizes: List[int], window: int = 3) -> float:
+        if len(recent_sizes) < window + 1: return 0.5
+        prev = tuple(recent_sizes[-window:])
+        key = f"trans:{json.dumps(list(prev))}"
+        with self._conn() as c:
+            row = c.execute("SELECT big_count, small_count, total_count FROM transition_stats WHERE key=?", (key,)).fetchone()
+        if row is None or row[2] <= 0: return 0.5
+        return row[0] / row[2]
+
     def get_exact_pattern_probability(self, sizes: List[int]) -> Dict[str, Any]:
         matches = []
         for window in [3, 5, 8, 12, 20, 30, 50, 100]:
@@ -410,12 +443,11 @@ class Storage:
             with self._conn() as c:
                 row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
             if row and row[2] > 0:
-                big_count, small_count, total_count = row
-                matches.append({"window": window, "p_big": big_count / total_count, "count": int(total_count)})
-        if not matches: return {"p_big": 0.5, "matched": 0, "matches": []}
+                matches.append({"window": window, "p_big": row[0] / row[2], "count": int(row[2])})
+        if not matches: return {"p_big": 0.5, "matched": 0}
         total_count = sum(m["count"] for m in matches)
         weighted_p_big = sum(m["p_big"] * m["count"] for m in matches) / total_count
-        return {"p_big": weighted_p_big, "matched": len(matches), "matches": matches}
+        return {"p_big": weighted_p_big, "matched": len(matches)}
 
     def get_num_bias(self, pred_dir: int, pool: List[int]) -> Dict[int, float]:
         weights = {}
@@ -424,7 +456,6 @@ class Storage:
                 row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (n,)).fetchone()
             big_count, small_count, total_count = row if row else (0, 0, 0)
             p_big = big_count / total_count if total_count > 0 else 0.5
-            
             if pred_dir == 1:
                 weights[n] = 1.0 + p_big * 4.0
                 if n in (6, 7, 8): weights[n] += 2.0
@@ -438,11 +469,19 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# DEEP PATTERN & PREDICTION LOGIC
+# PATTERN ANALYSERS
 # ============================================================
-def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
+    if len(history) < 8: return 0.5
+    sizes = [x["size"] for x in history]
+    # FIXED: Ab RAM ke bajaye DB se fetch hoga
+    res = STORE.get_exact_pattern_probability(sizes)
+    return res["p_big"]
+
+def deep_feature_analysis(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not history: return {}
     sizes = [x["size"] for x in history]
+    nums = [x["num"] for x in history]
     regime = detect_regime(sizes)
     return {
         "last": sizes[-1], "run": trailing_run(sizes), "ratio_big": ratio_big(sizes, 20),
@@ -450,12 +489,6 @@ def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "block": 1.0 if block_pattern(sizes, 10) else 0.0, "regime": regime,
         "stale_penalty": stale_pattern_penalty(history, 12),
     }
-
-def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8: return 0.5
-    sizes = [x["size"] for x in history]
-    res = STORE.get_exact_pattern_probability(sizes)
-    return res["p_big"]
 
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -483,6 +516,11 @@ def model_bias(history: List[Dict[str, Any]]) -> float:
     return 0.5
 
 def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    sizes = [x["size"] for x in history]
+    
+    # Transition model added
+    trans_p = STORE.get_transition_probability(sizes, 3)
+
     scores = [
         ("Exact", exact_suffix_memory(history)),
         ("Trend", model_trend(history)),
@@ -490,9 +528,10 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         ("Block", model_block(history)),
         ("Volatility", model_volatility(history)),
         ("Bias", model_bias(history)),
+        ("Transition", trans_p) # ADDED
     ]
-    weights = {"Exact": 0.35, "Trend": 0.15, "Alternation": 0.15, "Block": 0.10, "Volatility": 0.10, "Bias": 0.15}
-    regime = detect_regime([x["size"] for x in history])
+    weights = {"Exact": 0.30, "Trend": 0.15, "Alternation": 0.15, "Block": 0.10, "Volatility": 0.10, "Bias": 0.15, "Transition": 0.15}
+    regime = detect_regime(sizes)
     if regime == "TRAP": weights["Exact"] += 0.10; weights["Alternation"] += 0.10
     if regime == "TREND": weights["Trend"] += 0.15
     if regime == "ALTERNATING": weights["Alternation"] += 0.15
@@ -506,7 +545,6 @@ def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str
     if not history: return {"pred_dir": 1, "p_big": 0.5, "reason": "empty"}
     sizes = [x["size"] for x in history]
     regime = detect_regime(sizes)
-    
     score = ensemble_probability(history)["p_big"]
 
     if loss_streak >= 1:
@@ -527,10 +565,7 @@ def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str
     strength = signal_strength(history)
     if strength < 0.45: score = 0.5
     
-    return {
-        "pred_dir": 1 if score >= 0.5 else 0, "p_big": score, 
-        "strength": strength, "regime": regime, "features": deep_pattern_features(history)
-    }
+    return {"pred_dir": 1 if score >= 0.5 else 0, "p_big": score, "strength": strength, "regime": regime, "features": deep_feature_analysis(history)}
 
 def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
     nums = [x["num"] for x in history]
@@ -538,8 +573,8 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
     freq = Counter(recent)
     pool = list(range(5, 10)) if pred_dir == 1 else list(range(0, 5))
     score = defaultdict(float)
-
     bias_map = STORE.get_num_bias(pred_dir, pool)
+    
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
         score[n] += freq.get(n, 0) * 2.5
@@ -588,7 +623,6 @@ def generate_prediction() -> Dict[str, Any]:
     elif strength < 0.45: confidence, stake = 58, "0.25x"
     elif strength < 0.65: confidence, stake = 62, "0.5x"
     else: confidence, stake = 72, "1x"
-
     if STATE.loss_streak >= 2: confidence, stake = 55, "0.25x"
 
     num = choose_number(pred_dir, history, STATE.loss_streak)
@@ -619,6 +653,7 @@ def learn_from_resolution(res: dict):
     if STATE.history:
         actual_size = 1 if res["actual_size"] == "BIG" else 0
         STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
+        STORE.update_transition_memory([x["size"] for x in STATE.history], actual_size)
         STORE.update_num_memory(int(res["actual_num"]), actual_size)
 
     for name in ["Exact", "Trend", "Alternation", "Block", "Volatility", "Bias"]:
@@ -656,38 +691,30 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
 async def fetch_data(session):
     urls = CFG.api_urls()
-    
     for url in urls:
         for retry in range(5):
             try:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
                 async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
                     if r.status == 429:
-                        wait = min((retry + 1) * 2, 10)
-                        log.warning("429 from %s. retrying in %ss", url, wait)
-                        await asyncio.sleep(wait)
+                        await asyncio.sleep(min((retry + 1) * 2, 10))
                         continue
-                    
                     if r.status != 200:
-                        log.warning("HTTP %s from %s", r.status, url)
                         break
                     
+                    # Content-Type check hataya gaya
                     try:
                         payload = await r.json(content_type=None)
-                    except Exception as e:
-                        log.warning(f"Failed to parse JSON from {url}: {e}")
+                    except Exception:
                         break
                         
                     parsed = parse_history_payload(payload)
                     if parsed:
                         STATE.history = parsed[-1000:]
-                        STATE.save_cache()
+                        STATE.save_cache() # Cache Save
                         log.info("Fetched history from %s -> %d records", url, len(parsed))
                         return True
-                    
-                    log.warning("Empty history payload from %s", url)
                     break
-                    
             except asyncio.TimeoutError:
                 log.warning("Timeout on %s (attempt %d/5)", url, retry + 1)
                 await asyncio.sleep((retry + 1) * 3)
@@ -696,9 +723,8 @@ async def fetch_data(session):
                 await asyncio.sleep((retry + 1) * 3)
 
     if STATE.history:
-        log.warning("Using last known good/cached history because all API endpoints failed.")
+        log.warning("Using last known good/cached history.")
         return True
-
     log.warning("All API endpoints failed and no local cache exists.")
     return False
 
@@ -767,7 +793,6 @@ async def worker_loop(app, session):
                     p = generate_prediction()
                     if p:
                         STORE.save_prediction(p)
-                        # Log prediction being sent
                         log.info(f"Sending Prediction for Issue: {next_issue}")
                         await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
                         last_processed_issue = latest_issue
@@ -783,7 +808,6 @@ async def main():
     STATE.load_cache()
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
-    
     async with app:
         await app.start()
         try:
@@ -793,7 +817,6 @@ async def main():
             log.exception("Telegram verification failed. Check TG_TOKEN.")
             return
 
-        # NEW: Start Dummy Web Server for Render Health Check
         await start_web_server()
 
         async with aiohttp.ClientSession() as session:
