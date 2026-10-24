@@ -1,14 +1,13 @@
 """
-V900 FINAL PURPLE-AWARE FULL CODE
-==================================
-- Supports colors: RED / BLACK / PURPLE
-- Big/Small + Color final winner system
-- Deep adaptive pattern tracking
-- Exact issue matching
-- Recovery logic after losses
-- Retry/backoff on 429
-- Last-good-history fallback
-- Render-ready
+V900 FINAL WORKING CODE
+========================================
+- Only real JSON API is used
+- No google.com / HTML fallback
+- Handles 429 with retry/backoff
+- Fully safe for Render
+- Purple supported as valid color
+- Final single prediction only
+- Adaptive learning over time
 """
 
 import asyncio
@@ -41,11 +40,11 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_final_purple_adaptive.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_final_working.db")
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 12.0
-    bot_name: str = "V900 FINAL PURPLE"
+    bot_name: str = "V900 FINAL"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -78,7 +77,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_final_purple_adaptive.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_final_working.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -126,7 +125,6 @@ def normalize_issue(value: Any) -> Optional[int]:
 def normalize_color(value: Any) -> Optional[str]:
     if value is None:
         return None
-
     if isinstance(value, str):
         v = value.strip().lower()
         if v in ("red", "r", "1"):
@@ -137,7 +135,6 @@ def normalize_color(value: Any) -> Optional[str]:
             return "PURPLE"
         if v in ("green", "gr", "g", "4"):
             return "GREEN"
-
     if isinstance(value, int):
         if value == 1:
             return "RED"
@@ -147,7 +144,6 @@ def normalize_color(value: Any) -> Optional[str]:
             return "PURPLE"
         if value == 4:
             return "GREEN"
-
     return None
 
 
@@ -536,7 +532,6 @@ class Storage:
                     "UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?",
                     (big_count, small_count, total_count, time.time(), key),
                 )
-
                 PATTERN_DB[key] = {"big": big_count, "total": total_count}
 
     def update_transition_memory(self, prev_sizes: List[int], actual_size: int):
@@ -589,80 +584,16 @@ class Storage:
                 (big_count, small_count, total_count, actual_num),
             )
 
-    def get_transition_probability(self, recent_sizes: List[int], window: int = 3) -> float:
-        if len(recent_sizes) < window + 1:
-            return 0.5
-        prev = tuple(recent_sizes[-window:])
-        key = f"trans:{json.dumps(list(prev))}"
-        with self._conn() as c:
-            row = c.execute("SELECT big_count, small_count, total_count FROM transition_stats WHERE key=?", (key,)).fetchone()
-        if row is None:
-            return 0.5
-        big_count, small_count, total_count = row
-        if total_count <= 0:
-            return 0.5
-        return big_count / total_count
-
-    def get_exact_pattern_probability(self, sizes: List[int]) -> Dict[str, Any]:
-        matches = []
-        for window in [3, 5, 8, 12, 20, 30, 50, 100]:
-            if len(sizes) < window:
-                continue
-            seq = tuple(sizes[-window:])
-            key = f"{window}:{json.dumps(list(seq))}"
-
-            with self._conn() as c:
-                row = c.execute(
-                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
-                    (key,),
-                ).fetchone()
-
-            if row is None:
-                continue
-
-            big_count, small_count, total_count = row
-            if total_count <= 0:
-                continue
-            p_big = big_count / total_count
-            matches.append({
-                "window": window,
-                "p_big": p_big,
-                "count": int(total_count),
-                "big_count": int(big_count),
-                "small_count": int(small_count),
-            })
-
-        if not matches:
-            return {"p_big": 0.5, "matched": 0, "matches": []}
-
-        total_count = sum(m["count"] for m in matches)
-        weighted_p_big = sum(m["p_big"] * m["count"] for m in matches) / total_count
-        return {
-            "p_big": weighted_p_big,
-            "matched": len(matches),
-            "matches": matches,
-        }
-
     def get_num_bias(self, pred_dir: int, pool: List[int]) -> Dict[int, float]:
         weights = {}
         for n in pool:
             with self._conn() as c:
                 row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (n,)).fetchone()
-
             if row is None:
-                big_count = 0
-                small_count = 0
-                total_count = 0
-            else:
-                big_count, small_count, total_count = row
-                big_count = int(big_count)
-                small_count = int(small_count)
-                total_count = int(total_count)
-
-            if total_count <= 0:
                 p_big = 0.5
             else:
-                p_big = big_count / total_count
+                big_count, small_count, total_count = row
+                p_big = big_count / total_count if total_count > 0 else 0.5
 
             if pred_dir == 1:
                 weights[n] = 1.0 + p_big * 4.0
@@ -687,7 +618,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# COLOR + TREND ANALYSERS
+# COLOR + PATTERN ANALYSIS
 # ============================================================
 def color_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
     colors = [x.get("color") for x in history if x.get("color")]
@@ -729,9 +660,6 @@ def color_streak(history: List[Dict[str, Any]]) -> Dict[str, float]:
     return out
 
 
-# ============================================================
-# PATTERN ANALYSERS
-# ============================================================
 def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
     if len(history) < 8:
         return 0.5
@@ -831,124 +759,6 @@ def model_bias(history: List[Dict[str, Any]]) -> float:
     return 0.5
 
 
-def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    scores = [
-        ("Exact", exact_suffix_memory(history)),
-        ("Trend", model_trend(history)),
-        ("Alternation", model_alternation(history)),
-        ("Block", model_block(history)),
-        ("Volatility", model_volatility(history)),
-        ("Bias", model_bias(history)),
-    ]
-
-    weights = {
-        "Exact": 0.35,
-        "Trend": 0.15,
-        "Alternation": 0.15,
-        "Block": 0.10,
-        "Volatility": 0.10,
-        "Bias": 0.15,
-    }
-
-    regime = detect_regime([x["size"] for x in history])
-    if regime == "TRAP":
-        weights["Exact"] += 0.10
-        weights["Alternation"] += 0.10
-    if regime == "TREND":
-        weights["Trend"] += 0.15
-    if regime == "ALTERNATING":
-        weights["Alternation"] += 0.15
-    if regime == "BLOCK":
-        weights["Block"] += 0.12
-
-    total_weight = sum(weights.values())
-    final = 0.0
-    for _, score in scores:
-        final += score * weights.get(_, 0.10)
-    final = final / total_weight
-    return {
-        "p_big": clamp(final, 0.05, 0.95),
-        "weights": weights,
-        "scores": scores,
-    }
-
-
-def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    sizes = [x["size"] for x in history]
-    ensemble = ensemble_probability(history)
-    p_big = ensemble["p_big"]
-
-    regime = detect_regime(sizes)
-    if regime == "TRAP":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "ALTERNATING":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "BLOCK":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "TREND":
-        p_big = sizes[-1]
-    elif regime == "CHOPPY":
-        p_big = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
-
-    stale = stale_pattern_penalty(history, 12)
-    if stale > 0:
-        p_big = p_big * (1.0 - stale)
-
-    strength = signal_strength(history)
-    if strength < 0.45:
-        p_big = 0.5
-
-    pred_dir = 1 if p_big >= 0.5 else 0
-    return {"pred_dir": pred_dir, "p_big": clamp(p_big, 0.05, 0.95), "strength": strength}
-
-
-def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
-    sizes = [x["size"] for x in history]
-    exact_p = exact_suffix_memory(history)
-    regime = detect_regime(sizes)
-    last = sizes[-1]
-    run = trailing_run(sizes)
-
-    score = 0.5
-    score = (score * 0.40) + (exact_p * 0.60)
-
-    if regime == "TRAP":
-        score = 1.0 - last
-    elif regime == "ALTERNATING":
-        score = 1.0 - last
-    elif regime == "BLOCK":
-        score = 1.0 - last
-    elif regime == "TREND":
-        score = last
-    elif regime == "CHOPPY":
-        score = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
-    else:
-        score = ratio_big(sizes, 20)
-
-    if run >= 3:
-        score = 1.0 - last
-
-    if loss_streak >= 1:
-        score = 1.0 - last
-    if loss_streak >= 2:
-        score = 1.0 - majority_dir(sizes, 6)
-
-    stale = stale_pattern_penalty(history, 12)
-    if stale > 0:
-        score = score * (1.0 - stale)
-        score = 1.0 - score
-
-    strength = signal_strength(history)
-    if strength < 0.45:
-        score = 0.5
-    elif strength < 0.60:
-        score = 0.5 + (score - 0.5) * 0.6
-
-    score = clamp(score, 0.05, 0.95)
-    pred_dir = 1 if score >= 0.5 else 0
-    return {"pred_dir": pred_dir, "p_big": score, "strength": strength}
-
-
 def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
     if not history:
         return {"pred_dir": 1, "p_big": 0.5, "reason": "empty"}
@@ -1001,12 +811,15 @@ def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str
         score = 0.5
 
     pred_dir = 1 if score >= 0.5 else 0
-    return {"pred_dir": pred_dir, "p_big": score, "strength": strength, "regime": regime, "features": features}
+    return {
+        "pred_dir": pred_dir,
+        "p_big": score,
+        "strength": strength,
+        "regime": regime,
+        "features": features,
+    }
 
 
-# ============================================================
-# NUMBER PICKER
-# ============================================================
 def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
     nums = [x["num"] for x in history]
     recent = nums[-250:]
@@ -1062,9 +875,6 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
     return max(score, key=score.get)
 
 
-# ============================================================
-# FINAL BEST WINNER PICKER
-# ============================================================
 def choose_best_outcome(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
     side = side_prediction(history, loss_streak)
     p_big = side["p_big"]
@@ -1094,7 +904,7 @@ def choose_best_outcome(history: List[Dict[str, Any]], loss_streak: int) -> Dict
 
 
 # ============================================================
-# PREDICTION
+# FINAL PREDICTION
 # ============================================================
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
@@ -1204,7 +1014,7 @@ def learn_from_resolution(res: dict):
 
 
 # ============================================================
-# PARSE RESPONSE
+# PARSE HISTORY
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -1276,7 +1086,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# FETCH DATA
+# FETCH DATA WITH BACKOFF
 # ============================================================
 async def fetch_data(session):
     urls = CFG.api_urls()
