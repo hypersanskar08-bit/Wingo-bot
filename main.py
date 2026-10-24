@@ -1,13 +1,11 @@
 """
 V900 STRONGEST PRACTICAL PATTERN ENGINE
 =======================================
-- exact sequence memory by windows: 3,5,8,12,20,30,50,100
-- compares current ending sequence to historical exact patterns
-- learns from each actual outcome
-- calibrates signal weights over time
-- dynamic risk based on weak / strong evidence
-- no skip behavior: always predicts, but uses low-risk mode when weak
-- Telegram integration
+- tracks exact multi-window sequence patterns
+- learns from historical same-pattern outcomes
+- dynamic signal calibration
+- no-skip logic with low-risk fallback
+- Telegram bot + SQLite persistence
 """
 
 import asyncio
@@ -27,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
-from telegram.error import TimedOut, NetworkError
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application
 
 
@@ -43,7 +41,7 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_strongest_pattern_engine.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_strongest_engine.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
@@ -69,9 +67,14 @@ def setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
     fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_strongest.log", maxBytes=1_000_000, backupCount=2)
-    fh.setFormatter(fmt); root.addHandler(fh)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
 
 
 setup_logging()
@@ -139,7 +142,7 @@ def block_pattern(values: List[int], window: int = 10) -> bool:
         return False
     arr = values[-window:]
     for i in range(len(arr) - 3):
-        a, b, c, d = arr[i:i+4]
+        a, b, c, d = arr[i:i + 4]
         if a == b and c == d and a != c:
             return True
     return False
@@ -149,7 +152,7 @@ def volatility(values: List[int], window: int = 20) -> float:
     if len(values) < 2:
         return 0.0
     arr = values[-window:]
-    diffs = [abs(arr[i] - arr[i - 1)] for i in range(1, len(arr))]
+    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 
@@ -176,7 +179,7 @@ def detect_regime(sizes: List[int]) -> str:
 
 
 # =========================
-# DATABASE
+# STORAGE
 # =========================
 class Storage:
     def __init__(self, path: str):
@@ -250,9 +253,22 @@ class Storage:
                 SELECT issue, size, num, mode, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake
                 FROM predictions WHERE status='PENDING'
             """).fetchall()
-
         for row in rows:
-            (issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake) = row
+            (
+                issue,
+                p_size,
+                p_num,
+                mode,
+                sigs_json,
+                raw_conf,
+                regime,
+                details_json,
+                p_big,
+                cal_conf,
+                consensus,
+                stake,
+            ) = row
+
             if issue not in history_dict:
                 continue
 
@@ -270,7 +286,7 @@ class Storage:
             with self._conn() as c:
                 c.execute(
                     "UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?",
-                    (status, act["num"], act_size, issue)
+                    (status, act["num"], act_size, issue),
                 )
 
             resolved.append({
@@ -289,7 +305,7 @@ class Storage:
                 "p_big": p_big if p_big is not None else 0.5,
                 "calibrated_conf": cal_conf or 50,
                 "consensus": consensus or 0.5,
-                "stake": stake or "1x"
+                "stake": stake or "1x",
             })
 
         return resolved
@@ -298,7 +314,7 @@ class Storage:
         with self._conn() as c:
             rows = c.execute(
                 "SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
-                (limit,)
+                (limit,),
             ).fetchall()
         return rows[::-1]
 
@@ -308,7 +324,7 @@ class Storage:
             if row is None:
                 c.execute(
                     "INSERT INTO signal_weights (name, weight, hits, misses, updated_at) VALUES (?, ?, 0, 0, ?)",
-                    (name, 1.0, time.time())
+                    (name, 1.0, time.time()),
                 )
 
     def get_signal_weight(self, name: str) -> float:
@@ -333,12 +349,12 @@ class Storage:
                 new_weight = clamp(current * 1.12, 0.35, 6.0)
                 hits += 1
             else:
-                new_weight = clamp(current * 0.8, 0.2, 6.0)
+                new_weight = clamp(current * 0.80, 0.2, 6.0)
                 misses += 1
 
             c.execute(
                 "UPDATE signal_weights SET weight=?, hits=?, misses=?, updated_at=? WHERE name=?",
-                (new_weight, hits, misses, time.time(), name)
+                (new_weight, hits, misses, time.time(), name),
             )
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
@@ -348,11 +364,14 @@ class Storage:
             seq = tuple(sizes[-window:])
             key = f"{window}:{json.dumps(list(seq))}"
             with self._conn() as c:
-                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+                row = c.execute(
+                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
+                    (key,),
+                ).fetchone()
                 if row is None:
                     c.execute(
                         "INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-                        (key, window, 0, 0, 0, time.time())
+                        (key, window, 0, 0, 0, time.time()),
                     )
                     row = (0, 0, 0)
 
@@ -369,7 +388,7 @@ class Storage:
 
                 c.execute(
                     "UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?",
-                    (big_count, small_count, total_count, time.time(), key)
+                    (big_count, small_count, total_count, time.time(), key),
                 )
 
     def update_num_memory(self, actual_num: int, actual_size: int):
@@ -378,7 +397,7 @@ class Storage:
             if row is None:
                 c.execute(
                     "INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
-                    (actual_num, 0, 0, 0)
+                    (actual_num, 0, 0, 0),
                 )
                 row = (0, 0, 0)
 
@@ -395,14 +414,10 @@ class Storage:
 
             c.execute(
                 "UPDATE num_stats SET big_count=?, small_count=?, total_count=? WHERE num=?",
-                (big_count, small_count, total_count, actual_num)
+                (big_count, small_count, total_count, actual_num),
             )
 
     def get_pattern_match_probability(self, sizes: List[int]) -> Dict[str, Any]:
-        """
-        Compare exact same ending patterns from history.
-        Returns weighted p_big if same exact window patterns are found.
-        """
         matches = []
         for window in [3, 5, 8, 12, 20, 30, 50, 100]:
             if len(sizes) < window:
@@ -410,7 +425,10 @@ class Storage:
             seq = tuple(sizes[-window:])
             key = f"{window}:{json.dumps(list(seq))}"
             with self._conn() as c:
-                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+                row = c.execute(
+                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
+                    (key,),
+                ).fetchone()
             if row is None:
                 continue
             big_count, small_count, total_count = row
@@ -422,18 +440,18 @@ class Storage:
                 "p_big": p_big,
                 "count": int(total_count),
                 "big_count": int(big_count),
-                "small_count": int(small_count)
+                "small_count": int(small_count),
             })
 
         if not matches:
             return {"p_big": 0.5, "matched": 0, "matches": []}
 
         total_count = sum(m["count"] for m in matches)
-        weighted = sum(m["p_big"] * m["count"] for m in matches) / total_count
+        weighted_p_big = sum(m["p_big"] * m["count"] for m in matches) / total_count
         return {
-            "p_big": weighted,
+            "p_big": weighted_p_big,
             "matched": len(matches),
-            "matches": matches
+            "matches": matches,
         }
 
     def get_num_bias(self, pred_dir: int, pool: List[int]) -> Dict[int, float]:
@@ -442,7 +460,9 @@ class Storage:
             with self._conn() as c:
                 row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (n,)).fetchone()
             if row is None:
-                big_count = 0; small_count = 0; total_count = 0
+                big_count = 0
+                small_count = 0
+                total_count = 0
             else:
                 big_count, small_count, total_count = row
                 big_count = int(big_count)
@@ -457,7 +477,7 @@ class Storage:
             if pred_dir == 1:
                 weights[n] = 1.0 + p_big * 4.0
             else:
-                weights[n] = 1.0 + (1 - p_big) * 4.0
+                weights[n] = 1.0 + (1.0 - p_big) * 4.0
 
             if pred_dir == 1:
                 if n in (6, 7, 8):
@@ -490,7 +510,7 @@ STATE = BotState()
 
 
 # =========================
-# STRONG PATTERN DETECTORS
+# PATTERN BASIC CHECKS
 # =========================
 def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
     if len(history) < window + 4:
@@ -499,7 +519,7 @@ def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> fl
     current = tuple(x["size"] for x in history[-window:])
     repeats = 0
     for i in range(len(history) - window - 1, 0, -1):
-        prev = tuple(x["size"] for x in history[i:i+window])
+        prev = tuple(x["size"] for x in history[i:i + window])
         if prev == current:
             repeats += 1
             if repeats >= 2:
@@ -536,6 +556,9 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     return min(1.0, s)
 
 
+# =========================
+# SIGNALS
+# =========================
 def candidate_signals(history: List[Dict[str, Any]]) -> List[Tuple[str, int, float, str]]:
     if not history:
         return []
@@ -564,11 +587,12 @@ def candidate_signals(history: List[Dict[str, Any]]) -> List[Tuple[str, int, flo
         sigs.append(("Volatile", 1 - sizes[-1], 1.05, "High volatility gives reversal edge."))
     if regime in ("TRAP", "BLOCK", "ALTERNATING"):
         sigs.append(("Regime-Flip", 1 - sizes[-1], 1.35, "Regime-sensitive break."))
+
     return sigs
 
 
 # =========================
-# NUMBER SELECTION
+# NUMBER CHOICE
 # =========================
 def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
     nums = [x["num"] for x in history]
@@ -581,7 +605,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 
     score = defaultdict(float)
 
-    # history-based number bias
+    # exact historical number bias
     bias_map = STORE.get_num_bias(pred_dir, pool)
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
@@ -624,7 +648,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 # =========================
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
-        # no skip behavior: fallback with low risk
+        # no skip: fallback with low risk
         issue = str(int(STATE.history[-1]["issue"]) + 1) if STATE.history else "1"
         fallback_dir = 1 if random.random() >= 0.5 else 0
         return {
@@ -640,13 +664,13 @@ def generate_prediction() -> Dict[str, Any]:
             "logic": "Fallback",
             "sigs": [{"name": "Fallback", "dir": fallback_dir}],
             "stake": "0.25x",
-            "details": {"fallback": True}
+            "details": {"fallback": True},
         }
 
     history = STATE.history[-1000:]
     sizes = [x["size"] for x in history]
 
-    # exact before signal
+    # exact same sequence outcome memory
     pattern_match = STORE.get_pattern_match_probability(sizes)
     exact_p_big = pattern_match["p_big"]
 
@@ -656,10 +680,10 @@ def generate_prediction() -> Dict[str, Any]:
     small_w = 0.0
     total_w = 0.0
 
-    for name, d, weight, reason in signals:
-        calibrated = STORE.get_signal_weight(name) * weight
+    for name, dir_val, raw_weight, reason in signals:
+        calibrated = STORE.get_signal_weight(name) * raw_weight
         total_w += calibrated
-        if d == 1:
+        if dir_val == 1:
             big_w += calibrated
         else:
             small_w += calibrated
@@ -669,15 +693,13 @@ def generate_prediction() -> Dict[str, Any]:
     else:
         signal_p_big = ratio_big(sizes, 20)
 
-    # total p_big blend
+    # combine exact pattern memory + signal + base ratio
     p_big = (signal_p_big * 0.55) + (exact_p_big * 0.35) + (ratio_big(sizes, 20) * 0.10)
 
-    # stale pattern penalty
     stale = stale_pattern_penalty(history, 12)
     if stale > 0:
         p_big = p_big * (1.0 - stale)
 
-    # regime overrides
     regime = detect_regime(sizes)
     if regime == "ALTERNATING":
         p_big = 1.0 - sizes[-1]
@@ -690,7 +712,6 @@ def generate_prediction() -> Dict[str, Any]:
     elif regime == "CHOPPY":
         p_big = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
 
-    # state override
     if STATE.loss_streak >= 1:
         p_big = 1.0 - sizes[-1]
     if STATE.loss_streak >= 2:
@@ -704,9 +725,9 @@ def generate_prediction() -> Dict[str, Any]:
     p_big = clamp(p_big, 0.05, 0.95)
     pred_dir = 1 if p_big >= 0.5 else 0
 
+    # no-skip logic: weak evidence stays alive, but low risk
     strength = signal_strength(history)
 
-    # NO-SKIP logic: weak evidence stays alive, but with low risk
     if strength < 0.45:
         mode = "LOW-EDGE"
         stake = "0.25x"
@@ -740,7 +761,7 @@ def generate_prediction() -> Dict[str, Any]:
             "name": name,
             "dir": "BIG" if dir_val == 1 else "SMALL",
             "weight": round(STORE.get_signal_weight(name) * raw_weight, 3),
-            "reason": reason
+            "reason": reason,
         })
 
     if not signal_entries:
@@ -748,7 +769,7 @@ def generate_prediction() -> Dict[str, Any]:
             "name": "Baseline",
             "dir": "BIG" if pred_dir == 1 else "SMALL",
             "weight": 1.0,
-            "reason": "Fallback"
+            "reason": "Fallback",
         })
 
     return {
@@ -768,7 +789,7 @@ def generate_prediction() -> Dict[str, Any]:
             "pattern_match": pattern_match,
             "stale_penalty": stale,
             "signal_strength": strength,
-            "regime": regime
+            "regime": regime,
         }
     }
 
@@ -781,13 +802,11 @@ def learn_from_resolution(res: dict):
         STATE.loss_streak += 1
         STATE.win_streak = 0
 
-    # update signal weights
     for sig in res.get("sigs", []):
         name = sig.get("name")
         if name:
             STORE.update_signal_weight(name, bool(res["win"]))
 
-    # exact pattern learning
     if STATE.history:
         actual_size = 1 if res["actual_size"] == "BIG" else 0
         STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
@@ -795,7 +814,7 @@ def learn_from_resolution(res: dict):
 
 
 # =========================
-# API FETCH
+# DATA FETCH
 # =========================
 async def fetch_data(session):
     try:
@@ -845,7 +864,7 @@ async def fetch_data(session):
 
 
 # =========================
-# FORMAT
+# FORMATTING
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(
@@ -853,7 +872,7 @@ def format_prediction(p, recent_rows):
         for r in recent_rows[-12:]
     )
     sig_text = "\n".join(f"  🕵️ {h(s['name'])}" for s in p["sigs"])
-    stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p['stake'], "1x")
+    stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
 
     return f"""
 📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
@@ -872,6 +891,7 @@ def format_prediction(p, recent_rows):
 {recent_text}━━━━━━━━━━━━━━━━━━
 ⚡ <i>{h(CFG.bot_name)}</i>
 """
+
 
 def format_result(res):
     return (
@@ -904,7 +924,6 @@ async def send_msg(app, text, retries=3):
 # =========================
 async def worker_loop(app, session):
     last_processed_issue = None
-
     while True:
         try:
             if await fetch_data(session):
@@ -942,6 +961,7 @@ async def handle_ping(request):
 # =========================
 async def main():
     CFG.validate()
+
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
 
     async with app:
