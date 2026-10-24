@@ -1,13 +1,12 @@
 """
-V900 BEST MODEL - FAST REAL-TIME INTELLIGENCE
-===========================================
-- reads last 1000 results
-- exact pattern memory by window
-- multi-model ensemble
-- anti-trap after losses
-- fast processing for on-time round predictions
-- no skip: low-risk fallback on weak evidence
-- Telegram bot + SQLite storage
+V900 BEST FAST MODEL - FULL FIXED CODE
+======================================
+- Reads last 1000 results from API
+- Exact multi-window pattern memory
+- Ensemble of pattern models
+- Risk-aware fallback
+- Telegram bot + SQLite
+- Render-ready fixed version
 """
 
 import asyncio
@@ -178,6 +177,51 @@ def detect_regime(sizes: List[int]) -> str:
     if abs(ratio - 0.5) <= 0.12:
         return "CHOPPY"
     return "CYCLE"
+
+
+def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
+    if len(history) < window + 4:
+        return 0.0
+
+    current = tuple(x["size"] for x in history[-window:])
+    repeats = 0
+    for i in range(len(history) - window - 1, 0, -1):
+        prev = tuple(x["size"] for x in history[i:i + window])
+        if prev == current:
+            repeats += 1
+            if repeats >= 2:
+                break
+    return min(0.35, repeats * 0.12)
+
+
+def signal_strength(history: List[Dict[str, Any]]) -> float:
+    if len(history) < 8:
+        return 0.2
+
+    sizes = [x["size"] for x in history]
+    regime = detect_regime(sizes)
+    run = trailing_run(sizes)
+    alt = alternating_score(sizes, 12)
+    bp = block_pattern(sizes, 10)
+    ratio = ratio_big(sizes, 20)
+
+    s = 0.0
+    if regime == "TRAP":
+        s += 0.35
+    if regime == "TREND":
+        s += 0.25
+    if regime == "ALTERNATING":
+        s += 0.30
+    if bp:
+        s += 0.20
+    if run >= 3:
+        s += 0.25
+    if abs(ratio - 0.5) > 0.18:
+        s += 0.15
+    if alt >= 0.6:
+        s += 0.15
+
+    return min(1.0, s)
 
 
 # =========================
@@ -440,7 +484,6 @@ class Storage:
 
         total_count = sum(m["count"] for m in matches)
         weighted_p_big = sum(m["p_big"] * m["count"] for m in matches) / total_count
-
         return {
             "p_big": weighted_p_big,
             "matched": len(matches),
@@ -738,7 +781,6 @@ def generate_prediction() -> Dict[str, Any]:
 
     strength = signal_strength(history)
 
-    # anti-loss recovery
     if STATE.loss_streak >= 1:
         mode = "ANTI-TRAP"
         stake = "0.25x"
