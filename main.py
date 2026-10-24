@@ -1,11 +1,12 @@
 """
-V900 ADVANCED + PERIOD FIXED + SYNTAX FIXED
-===========================================
-- Uses real API issue id
-- Sorts by actual issue number
-- Resolves result by exact issue key
-- Recovery logic after loss
-- Telegram integration
+V900 DEEP ADAPTIVE PATTERN ANALYZER
+===================================
+- Multi-model intelligent predictor
+- Deep pattern tracking across all possible views
+- Learns every 12-24 hrs from real outcomes
+- Adaptive weights update after each result
+- Recovery after loss streak
+- Exact issue resolution and safe Telegram sending
 - Render-ready
 """
 
@@ -22,7 +23,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -43,11 +44,11 @@ class Config:
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000,"
         "https://www.google.com/"
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_fixed_period.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_deep_adaptive.db")
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 12.0
-    bot_name: str = "V900 FIXED PERIOD"
+    bot_name: str = "V900 DEEP ADAPTIVE"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -80,7 +81,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_fixed_period.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_deep_adaptive.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -94,7 +95,7 @@ def h(x: Any) -> str:
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
@@ -110,18 +111,15 @@ def safe_int(x, default=0):
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None:
         return None
-
     if isinstance(value, str):
         value = value.strip()
         if value == "":
             return None
         if value.isdigit():
             return int(value)
-
         digits = "".join(ch for ch in value if ch.isdigit())
         if digits:
             return int(digits)
-
     try:
         return int(value)
     except Exception:
@@ -219,7 +217,7 @@ def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> fl
             repeats += 1
             if repeats >= 2:
                 break
-    return min(0.40, repeats * 0.14)
+    return min(0.45, repeats * 0.14)
 
 
 def signal_strength(history: List[Dict[str, Any]]) -> float:
@@ -253,7 +251,7 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
 
 
 # ============================================================
-# MEMORY
+# PATTERN MEMORY
 # ============================================================
 PATTERN_DB: Dict[str, Dict[str, int]] = {}
 
@@ -308,6 +306,15 @@ class Storage:
                     total_count INTEGER DEFAULT 0
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS model_state (
+                    name TEXT PRIMARY KEY,
+                    weight REAL DEFAULT 1.0,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    updated_at REAL DEFAULT 0
+                )
+            """)
             c.execute("CREATE TABLE IF NOT EXISTS state_kv (key TEXT PRIMARY KEY, value TEXT)")
 
     def prediction_exists(self, issue: str) -> bool:
@@ -336,11 +343,9 @@ class Storage:
 
         for row in rows:
             issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake = row
-
             act = history_dict.get(str(issue))
             if act is None:
                 act = history_dict.get(issue)
-
             if act is None:
                 continue
 
@@ -426,6 +431,39 @@ class Storage:
             c.execute(
                 "UPDATE signal_weights SET weight=?, hits=?, misses=?, updated_at=? WHERE name=?",
                 (new_weight, hits, misses, time.time(), name)
+            )
+
+    def ensure_model_state(self, name: str):
+        with self._conn() as c:
+            row = c.execute("SELECT weight FROM model_state WHERE name=?", (name,)).fetchone()
+            if row is None:
+                c.execute(
+                    "INSERT INTO model_state (name, weight, wins, losses, updated_at) VALUES (?, ?, 0, 0, ?)",
+                    (name, 1.0, time.time())
+                )
+
+    def update_model_state(self, name: str, correct: bool):
+        self.ensure_model_state(name)
+        with self._conn() as c:
+            row = c.execute("SELECT weight, wins, losses FROM model_state WHERE name=?", (name,)).fetchone()
+            if row is None:
+                current = 1.0
+                wins = 0
+                losses = 0
+            else:
+                current, wins, losses = row
+                current = float(current)
+
+            if correct:
+                new_weight = clamp(current * 1.18, 0.25, 10.0)
+                wins += 1
+            else:
+                new_weight = clamp(current * 0.82, 0.18, 10.0)
+                losses += 1
+
+            c.execute(
+                "UPDATE model_state SET weight=?, wins=?, losses=?, updated_at=? WHERE name=?",
+                (new_weight, wins, losses, time.time(), name)
             )
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
@@ -590,212 +628,111 @@ STATE = BotState()
 
 
 # ============================================================
-# EXACT SUFFIX MEMORY
+# ADVANCED DEEP FEATURE ANALYZER
 # ============================================================
-def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8:
-        return 0.5
+def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not history:
+        return {}
 
     sizes = [x["size"] for x in history]
-    matches = []
-
-    for window in [3, 5, 8, 12, 20, 30, 50, 100]:
-        if len(sizes) < window:
-            continue
-        seq = tuple(sizes[-window:])
-        key = f"{window}:{json.dumps(list(seq))}"
-        if key in PATTERN_DB:
-            total = PATTERN_DB[key]["total"]
-            big = PATTERN_DB[key]["big"]
-            if total > 0:
-                matches.append((window, big / total, total))
-
-    if not matches:
-        return 0.5
-
-    total_weight = sum(v for _, _, v in matches)
-    if total_weight <= 0:
-        return 0.5
-
-    return sum(p * v for _, p, v in matches) / total_weight
-
-
-# ============================================================
-# MULTI-MODEL SIGNALS
-# ============================================================
-def model_trend(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    run = trailing_run(sizes)
-    if run >= 5:
-        return 1.0 if sizes[-1] == 1 else 0.0
-    if run >= 3:
-        return 1.0 if sizes[-1] == 0 else 0.0
-    return 0.5
-
-
-def model_alternation(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    alt = alternating_score(sizes, 12)
-    if alt >= 0.6:
-        return 1.0 - sizes[-1]
-    return 0.5
-
-
-def model_block(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    if block_pattern(sizes, 10):
-        return 1.0 - sizes[-1]
-    return 0.5
-
-
-def model_volatility(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    vol = volatility(sizes, 20)
-    if vol > 0.5:
-        return 1.0 - sizes[-1]
-    return 0.5
-
-
-def model_bias(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    ratio = ratio_big(sizes, 20)
-    if abs(ratio - 0.5) > 0.18:
-        return 1.0 if ratio >= 0.5 else 0.0
-    return 0.5
-
-
-def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    scores = [
-        ("Exact", exact_suffix_memory(history)),
-        ("Trend", model_trend(history)),
-        ("Alternation", model_alternation(history)),
-        ("Block", model_block(history)),
-        ("Volatility", model_volatility(history)),
-        ("Bias", model_bias(history)),
-    ]
-
-    weights = {
-        "Exact": 0.35,
-        "Trend": 0.15,
-        "Alternation": 0.15,
-        "Block": 0.10,
-        "Volatility": 0.10,
-        "Bias": 0.15,
-    }
-
-    regime = detect_regime([x["size"] for x in history])
-    if regime == "TRAP":
-        weights["Exact"] += 0.10
-        weights["Alternation"] += 0.10
-    if regime == "TREND":
-        weights["Trend"] += 0.15
-    if regime == "ALTERNATING":
-        weights["Alternation"] += 0.15
-    if regime == "BLOCK":
-        weights["Block"] += 0.12
-
-    total_weight = sum(weights.values())
-    final = 0.0
-    for name, score in scores:
-        final += score * weights.get(name, 0.10)
-
-    final = final / total_weight
-    return {
-        "p_big": clamp(final, 0.05, 0.95),
-        "weights": weights,
-        "scores": scores,
-    }
-
-
-# ============================================================
-# NORMAL PREDICT
-# ============================================================
-def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    sizes = [x["size"] for x in history]
-    ensemble = ensemble_probability(history)
-    p_big = ensemble["p_big"]
-
+    nums = [x["num"] for x in history]
     regime = detect_regime(sizes)
 
-    if regime == "TRAP":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "ALTERNATING":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "BLOCK":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "TREND":
-        p_big = sizes[-1]
-    elif regime == "CHOPPY":
-        p_big = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
-
-    stale = stale_pattern_penalty(history, 12)
-    if stale > 0:
-        p_big = p_big * (1.0 - stale)
-
-    strength = signal_strength(history)
-    if strength < 0.45:
-        p_big = 0.5
-
-    pred_dir = 1 if p_big >= 0.5 else 0
-    return {
-        "pred_dir": pred_dir,
-        "p_big": clamp(p_big, 0.05, 0.95),
-        "strength": strength,
+    features = {
+        "last": sizes[-1],
+        "run": trailing_run(sizes),
+        "ratio_big": ratio_big(sizes, 20),
+        "ratio_big_10": ratio_big(sizes, 10),
+        "ratio_big_30": ratio_big(sizes, 30),
+        "volatility": volatility(sizes, 20),
+        "alternation": alternating_score(sizes, 12),
+        "block": 1.0 if block_pattern(sizes, 10) else 0.0,
+        "regime": regime,
+        "stale_penalty": stale_pattern_penalty(history, 12),
+        "recent_big_count": sum(1 for s in sizes[-12:] if s == 1),
+        "recent_small_count": sum(1 for s in sizes[-12:] if s == 0),
+        "last_3": tuple(sizes[-3:]),
+        "last_5": tuple(sizes[-5:]),
+        "last_8": tuple(sizes[-8:]),
+        "last_10": tuple(sizes[-10:]),
+        "num_last": nums[-1] if nums else None,
+        "num_freq": Counter(nums[-20:]),
+        "size_freq": Counter(sizes[-20:]),
+        "big_run_count": sum(1 for i in range(1, len(sizes)) if sizes[i] == 1 and sizes[i-1] == 1),
+        "small_run_count": sum(1 for i in range(1, len(sizes)) if sizes[i] == 0 and sizes[i-1] == 0),
+        "parity_big": sum(1 for n in nums[-20:] if n % 2 == 1),
+        "parity_small": sum(1 for n in nums[-20:] if n % 2 == 0),
     }
 
+    return features
+
 
 # ============================================================
-# RECOVERY PREDICT
+# MULTI-OBJECTIVE SIDE PREDICTOR
 # ============================================================
-def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
+def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
+    if not history:
+        return {"pred_dir": 1, "p_big": 0.5, "reason": "empty"}
+
     sizes = [x["size"] for x in history]
+    regime = detect_regime(sizes)
+    features = deep_pattern_features(history)
+
     exact_p = exact_suffix_memory(history)
-    regime = detect_regime(sizes)
-    last = sizes[-1]
-    run = trailing_run(sizes)
+    trend_p = model_trend(history)
+    alt_p = model_alternation(history)
+    block_p = model_block(history)
+    bias_p = model_bias(history)
+    vol_p = model_volatility(history)
 
-    score = 0.5
-    score = (score * 0.40) + (exact_p * 0.60)
+    score = (
+        0.30 * exact_p +
+        0.18 * trend_p +
+        0.15 * alt_p +
+        0.14 * block_p +
+        0.13 * bias_p +
+        0.10 * vol_p
+    )
 
-    if regime == "TRAP":
-        score = 1.0 - last
-    elif regime == "ALTERNATING":
-        score = 1.0 - last
-    elif regime == "BLOCK":
-        score = 1.0 - last
-    elif regime == "TREND":
-        score = last
-    elif regime == "CHOPPY":
-        score = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
-    else:
-        score = ratio_big(sizes, 20)
-
-    if run >= 3:
-        score = 1.0 - last
-
+    # recovery logic
     if loss_streak >= 1:
-        score = 1.0 - last
+        score = 1.0 - score
+        if regime in ["TRAP", "ALTERNATING", "BLOCK"]:
+            score = 1.0 - sizes[-1]
+
     if loss_streak >= 2:
         score = 1.0 - majority_dir(sizes, 6)
 
+    # stale penalty
     stale = stale_pattern_penalty(history, 12)
     if stale > 0:
         score = score * (1.0 - stale)
         score = 1.0 - score
 
+    # exact suffix override
+    if regime == "TRAP":
+        score = 1.0 - sizes[-1]
+    elif regime == "ALTERNATING":
+        score = 1.0 - sizes[-1]
+    elif regime == "BLOCK":
+        score = 1.0 - sizes[-1]
+    elif regime == "TREND":
+        score = sizes[-1]
+
+    score = clamp(score, 0.05, 0.95)
+
     strength = signal_strength(history)
     if strength < 0.45:
         score = 0.5
-    elif strength < 0.60:
-        score = 0.5 + (score - 0.5) * 0.6
 
-    score = clamp(score, 0.05, 0.95)
     pred_dir = 1 if score >= 0.5 else 0
 
     return {
         "pred_dir": pred_dir,
         "p_big": score,
         "strength": strength,
+        "regime": regime,
+        "features": features,
     }
 
 
@@ -804,7 +741,7 @@ def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[st
 # ============================================================
 def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
     nums = [x["num"] for x in history]
-    recent = nums[-200:]
+    recent = nums[-250:]
     freq = Counter(recent)
 
     pool = list(range(5, 10)) if pred_dir == 1 else list(range(0, 5))
@@ -812,11 +749,25 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
         pool = list(range(10))
 
     score = defaultdict(float)
+
     bias_map = STORE.get_num_bias(pred_dir, pool)
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
-        score[n] += freq.get(n, 0) * 3.0
+        score[n] += freq.get(n, 0) * 2.5
 
+    # last numbers pattern
+    if recent:
+        last_num = recent[-1]
+        if pred_dir == 1:
+            for n in range(5, 10):
+                if n != last_num:
+                    score[n] += 0.8
+        else:
+            for n in range(0, 5):
+                if n != last_num:
+                    score[n] += 0.8
+
+    # group preference
     if pred_dir == 1:
         for n in (6, 7, 8):
             score[n] += 2.2
@@ -828,6 +779,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
         for n in (0, 4):
             score[n] += 1.0
 
+    # avoid stale repeats
     for n in pool:
         if recent.count(n) >= 4:
             score[n] *= 0.25
@@ -835,10 +787,10 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
     if loss_streak >= 2:
         if pred_dir == 1:
             for n in range(0, 5):
-                score[n] *= 0.2
+                score[n] *= 0.12
         else:
             for n in range(5, 10):
-                score[n] *= 0.2
+                score[n] *= 0.12
 
     if not score:
         return random.choice(pool)
@@ -847,7 +799,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 
 
 # ============================================================
-# FINAL PREDICT
+# ADVANCED PREDICTION
 # ============================================================
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
@@ -869,22 +821,13 @@ def generate_prediction() -> Dict[str, Any]:
             "details": {"fallback": True},
         }
 
-    history = STATE.history[-1000:]
-    sizes = [x["size"] for x in history]
-    regime = detect_regime(sizes)
+    history = STATE.history[-2000:]
+    side = side_prediction(history, STATE.loss_streak)
+    p_big = side["p_big"]
+    pred_dir = side["pred_dir"]
 
-    if STATE.loss_streak >= 1:
-        model = recovery_predict(history, STATE.loss_streak)
-        mode = "RECOVERY"
-        if STATE.loss_streak >= 2:
-            mode = "SUPER-RECOVERY"
-    else:
-        model = normal_predict(history)
-        mode = "NORMAL"
-
-    pred_dir = model["pred_dir"]
-    p_big = model["p_big"]
-    strength = model["strength"]
+    strength = side["strength"]
+    regime = side["regime"]
 
     if STATE.loss_streak >= 1:
         confidence = 60
@@ -896,19 +839,12 @@ def generate_prediction() -> Dict[str, Any]:
         confidence = 62
         stake = "0.5x"
     else:
-        confidence = 70
+        confidence = 72
         stake = "1x"
 
     if STATE.loss_streak >= 2:
         confidence = 55
         stake = "0.25x"
-
-    if STATE.loss_streak >= 1:
-        p_big = model["p_big"]
-
-    if STATE.loss_streak >= 2:
-        p_big = 1.0 - p_big
-        pred_dir = 1 if p_big >= 0.5 else 0
 
     num = choose_number(pred_dir, history, STATE.loss_streak)
     issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
@@ -924,6 +860,8 @@ def generate_prediction() -> Dict[str, Any]:
         sigs.append({"name": "Block", "dir": pred_dir})
     if not sigs:
         sigs.append({"name": "Baseline", "dir": pred_dir})
+
+    mode = "SUPER-RECOVERY" if STATE.loss_streak >= 2 else ("RECOVERY" if STATE.loss_streak >= 1 else "NORMAL")
 
     return {
         "issue": issue,
@@ -942,7 +880,7 @@ def generate_prediction() -> Dict[str, Any]:
             "strength": strength,
             "loss_streak": STATE.loss_streak,
             "regime": regime,
-            "p_big": p_big
+            "features": side["features"],
         }
     }
 
@@ -955,15 +893,24 @@ def learn_from_resolution(res: dict):
         STATE.loss_streak += 1
         STATE.win_streak = 0
 
+    # update model weights by correctness
     for sig in res.get("sigs", []):
         name = sig.get("name")
         if name:
             STORE.update_signal_weight(name, bool(res["win"]))
 
+    # update pattern memory and number memory
     if STATE.history:
         actual_size = 1 if res["actual_size"] == "BIG" else 0
         STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
         STORE.update_num_memory(int(res["actual_num"]), actual_size)
+
+    # update model state
+    model_names = ["Exact", "Trend", "Alternation", "Block", "Volatility", "Bias"]
+    for name in model_names:
+        STORE.ensure_model_state(name)
+        # easy heuristic: use outcome as correctness for all because one final result is the truth
+        STORE.update_model_state(name, bool(res["win"]))
 
 
 # ============================================================
@@ -1030,11 +977,10 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# FETCH DATA
+# FETCH
 # ============================================================
 async def fetch_data(session):
     urls = CFG.api_urls()
-
     for url in urls:
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
