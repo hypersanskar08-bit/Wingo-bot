@@ -1,13 +1,13 @@
 """
-V900 FINAL WORKING CODE
-========================================
-- Only real JSON API is used
-- No google.com / HTML fallback
-- Handles 429 with retry/backoff
-- Fully safe for Render
+V900 FULL FIXED WORKING CODE
+================================
+- No invalid HTML fallback
+- Safe JSON-only fetching
+- Handles 429 / bad status / non-JSON / empty response
 - Purple supported as valid color
-- Final single prediction only
-- Adaptive learning over time
+- Final single best prediction only
+- Telegram bot ready
+- Render-safe
 """
 
 import asyncio
@@ -40,7 +40,7 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_final_working.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_fixed_full.db")
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 12.0
@@ -53,12 +53,7 @@ class Config:
 
     def api_urls(self) -> List[str]:
         urls = [u.strip() for u in self.source_api_urls.split(",") if u.strip()]
-        return urls if urls else [
-            "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
-        ]
-
-    def validate(self):
-        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+        return urls if urls else []
 
 
 CFG = Config()
@@ -73,11 +68,15 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_final_working.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(
+        Path(CFG.log_dir) / "v900_fixed_full.log",
+        maxBytes=1_000_000,
+        backupCount=2,
+    )
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -427,7 +426,7 @@ class Storage:
         with self._conn() as c:
             rows = c.execute(
                 "SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
-                (limit,)
+                (limit,),
             ).fetchall()
         return rows[::-1]
 
@@ -437,7 +436,7 @@ class Storage:
             if row is None:
                 c.execute(
                     "INSERT INTO signal_weights (name, weight, hits, misses, updated_at) VALUES (?, ?, 0, 0, ?)",
-                    (name, 1.0, time.time())
+                    (name, 1.0, time.time()),
                 )
 
     def update_signal_weight(self, name: str, outcome_correct: bool):
@@ -461,7 +460,7 @@ class Storage:
 
             c.execute(
                 "UPDATE signal_weights SET weight=?, hits=?, misses=?, updated_at=? WHERE name=?",
-                (new_weight, hits, misses, time.time(), name)
+                (new_weight, hits, misses, time.time(), name),
             )
 
     def ensure_model_state(self, name: str):
@@ -470,7 +469,7 @@ class Storage:
             if row is None:
                 c.execute(
                     "INSERT INTO model_state (name, weight, wins, losses, updated_at) VALUES (?, ?, 0, 0, ?)",
-                    (name, 1.0, time.time())
+                    (name, 1.0, time.time()),
                 )
 
     def update_model_state(self, name: str, correct: bool):
@@ -494,7 +493,7 @@ class Storage:
 
             c.execute(
                 "UPDATE model_state SET weight=?, wins=?, losses=?, updated_at=? WHERE name=?",
-                (new_weight, wins, losses, time.time(), name)
+                (new_weight, wins, losses, time.time(), name),
             )
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
@@ -544,7 +543,7 @@ class Storage:
             if row is None:
                 c.execute(
                     "INSERT INTO transition_stats (key, big_count, small_count, total_count, last_seen) VALUES (?, ?, ?, ?, ?)",
-                    (key, 0, 0, 0, time.time())
+                    (key, 0, 0, 0, time.time()),
                 )
                 row = (0, 0, 0)
 
@@ -564,8 +563,10 @@ class Storage:
         with self._conn() as c:
             row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (actual_num,)).fetchone()
             if row is None:
-                c.execute("INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
-                          (actual_num, 0, 0, 0))
+                c.execute(
+                    "INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
+                    (actual_num, 0, 0, 0),
+                )
                 row = (0, 0, 0)
 
             big_count, small_count, total_count = row
@@ -589,6 +590,7 @@ class Storage:
         for n in pool:
             with self._conn() as c:
                 row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (n,)).fetchone()
+
             if row is None:
                 p_big = 0.5
             else:
@@ -618,7 +620,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# COLOR + PATTERN ANALYSIS
+# PATTERN / COLOR ANALYSIS
 # ============================================================
 def color_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
     colors = [x.get("color") for x in history if x.get("color")]
@@ -879,7 +881,6 @@ def choose_best_outcome(history: List[Dict[str, Any]], loss_streak: int) -> Dict
     side = side_prediction(history, loss_streak)
     p_big = side["p_big"]
     p_small = 1.0 - p_big
-
     color_probs = color_streak(history)
     red = color_probs.get("RED", 0.33)
     black = color_probs.get("BLACK", 0.33)
@@ -890,7 +891,7 @@ def choose_best_outcome(history: List[Dict[str, Any]], loss_streak: int) -> Dict
         "SMALL": p_small * 0.85 + black * 0.15,
         "RED": red * 0.85 + p_big * 0.15,
         "BLACK": black * 0.85 + p_small * 0.15,
-        "PURPLE": purple * 0.90 + (0.10 * (1.0 - max(red, black, purple)))
+        "PURPLE": purple * 0.90 + (0.10 * (1.0 - max(red, black, purple))),
     }
 
     winner = max(candidates, key=candidates.get)
@@ -899,7 +900,7 @@ def choose_best_outcome(history: List[Dict[str, Any]], loss_streak: int) -> Dict
         "score": candidates[winner],
         "p_big": p_big,
         "p_small": p_small,
-        "color_probs": color_probs
+        "color_probs": color_probs,
     }
 
 
@@ -929,7 +930,6 @@ def generate_prediction() -> Dict[str, Any]:
     history = STATE.history[-2000:]
     side = side_prediction(history, STATE.loss_streak)
     p_big = side["p_big"]
-    pred_dir = side["pred_dir"]
 
     best = choose_best_outcome(history, STATE.loss_streak)
     final_winner = best["winner"]
@@ -983,8 +983,8 @@ def generate_prediction() -> Dict[str, Any]:
             "loss_streak": STATE.loss_streak,
             "regime": regime,
             "color_probs": best["color_probs"],
-            "best_outcome": final_winner
-        }
+            "best_outcome": final_winner,
+        },
     }
 
 
@@ -1014,7 +1014,7 @@ def learn_from_resolution(res: dict):
 
 
 # ============================================================
-# PARSE HISTORY
+# PARSE PAYLOAD
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -1076,7 +1076,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
                 "issue": str(issue),
                 "num": num,
                 "size": 1 if num >= 5 else 0,
-                "color": color
+                "color": color,
             })
         except Exception:
             continue
@@ -1086,20 +1086,29 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# FETCH DATA WITH BACKOFF
+# FETCH DATA
 # ============================================================
 async def fetch_data(session):
     urls = CFG.api_urls()
+    if not urls:
+        log.warning("No API_URLS configured. Waiting without fetch.")
+        return False
+
     last_good = [x for x in STATE.history]
 
     for url in urls:
         try:
             for retry in range(3):
                 try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=CFG.request_timeout),
+                    ) as r:
+                        body = await r.text()
+
                         if r.status == 429:
                             wait = (retry + 1) * 2
-                            log.warning("429 from %s. retrying in %ss", url, wait)
+                            log.warning("429 from %s. Retrying in %ss", url, wait)
                             await asyncio.sleep(wait)
                             continue
 
@@ -1107,20 +1116,24 @@ async def fetch_data(session):
                             log.warning("HTTP %s from %s", r.status, url)
                             break
 
-                        content_type = r.headers.get("Content-Type", "").lower()
-                        if "application/json" not in content_type and "text/json" not in content_type:
-                            log.warning("Non-JSON response from %s -> %s", url, content_type)
+                        ctype = (r.headers.get("Content-Type") or "").lower()
+                        if "json" not in ctype:
+                            log.warning("Non-JSON response from %s -> %s | body=%r", url, ctype, body[:200])
                             break
 
-                        payload = await r.json()
-                        parsed = parse_history_payload(payload)
+                        try:
+                            payload = json.loads(body)
+                        except Exception as e:
+                            log.warning("JSON parse failed for %s: %s | body=%r", url, e, body[:200])
+                            break
 
+                        parsed = parse_history_payload(payload)
                         if parsed:
                             STATE.history = parsed[-1000:]
-                            log.info("Fetched history from %s -> %d records", url, len(parsed))
+                            log.info("Fetched %d records from %s", len(parsed), url)
                             return True
 
-                        log.warning("Empty history payload from %s", url)
+                        log.warning("Empty payload from %s", url)
                         break
 
                 except Exception as e:
@@ -1133,10 +1146,10 @@ async def fetch_data(session):
 
     if last_good:
         STATE.history = last_good
-        log.warning("Using last known good history because all API endpoints failed.")
+        log.warning("Using last-known-good history because all endpoints failed.")
         return True
 
-    log.warning("All API endpoints failed and no last-good history exists.")
+    log.warning("No endpoint succeeded and no last-good history exists.")
     return False
 
 
@@ -1199,7 +1212,7 @@ async def send_msg(app, text, retries=3):
             await app.bot.send_message(
                 chat_id=CFG.parse_chat_id(),
                 text=text,
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return True
         except Exception as e:
@@ -1209,18 +1222,22 @@ async def send_msg(app, text, retries=3):
 
 
 # ============================================================
-# WORKER
+# WORKER LOOP
 # ============================================================
 async def worker_loop(app, session):
     last_processed_issue = None
 
     while True:
         try:
+            if not CFG.api_urls():
+                log.warning("No API URLs configured. Worker sleeping.")
+                await asyncio.sleep(CFG.fetch_every)
+                continue
+
             if await fetch_data(session):
                 hist_dict: Dict[str, Dict[str, Any]] = {}
                 for x in STATE.history:
-                    issue_key = str(x["issue"])
-                    hist_dict[issue_key] = x
+                    hist_dict[str(x["issue"])] = x
 
                 resolved = STORE.resolve_pending(hist_dict)
 
@@ -1245,8 +1262,9 @@ async def worker_loop(app, session):
 
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
+
         except Exception as e:
-            log.exception(f"Loop error: {e}")
+            log.exception("Worker loop error: %s", e)
             await asyncio.sleep(1)
 
 
@@ -1254,16 +1272,16 @@ async def worker_loop(app, session):
 # MAIN
 # ============================================================
 async def main():
+    CFG.source_api_urls = CFG.source_api_urls.strip()
     CFG.validate()
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
 
     async with app:
         await app.start()
-
         ok = await verify_telegram(app)
         if not ok:
-            log.error("Bot not valid. Check TG_TOKEN and TG_CHAT.")
+            log.error("Bot validation failed. Check TG_TOKEN and TG_CHAT.")
             return
 
         async with aiohttp.ClientSession() as session:
