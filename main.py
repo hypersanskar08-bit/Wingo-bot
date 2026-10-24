@@ -1,12 +1,10 @@
 """
-V900 ADVANCED + UPDATED PREDICTOR
-=================================
-- Exact suffix memory across windows
-- Multi-model ensemble
+V900 ADVANCED + FIXED PERIOD MATCHING
+=====================================
+- Uses real API issue id
+- Sorts by actual issue number
+- Resolves result by exact issue key
 - Recovery engine after loss
-- Trap reversal logic
-- Confidence gate
-- Number selection after side is chosen
 - Telegram + SQLite
 - Render-ready
 """
@@ -45,11 +43,11 @@ class Config:
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000,"
         "https://www.google.com/"
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_advanced.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_fixed_period.db")
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 12.0
-    bot_name: str = "V900 ADVANCED"
+    bot_name: str = "V900 FIXED PERIOD"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -82,7 +80,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_advanced.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_fixed_period.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -107,6 +105,27 @@ def safe_int(x, default=0):
         return int(x)
     except Exception:
         return default
+
+
+def normalize_issue(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return None
+        if value.isdigit():
+            return int(value)
+
+        digits = "".join(ch for ch in value if ch.isdigit())
+        if digits:
+            return int(digits)
+
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 def trailing_run(values: List[int], target: Optional[int] = None) -> int:
@@ -162,7 +181,7 @@ def volatility(values: List[int], window: int = 20) -> float:
     if len(values) < 2:
         return 0.0
     arr = values[-window:]
-    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
+    diffs = [abs(arr[i] - arr[i - 1)] for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 
@@ -229,7 +248,6 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
         s += 0.15
     if alt >= 0.6:
         s += 0.15
-
     return min(1.0, s)
 
 
@@ -307,7 +325,7 @@ class Storage:
                 p.get("p_big", 0.5), p.get("confidence", 50), p.get("consensus", 0.5), p.get("stake", "1x"), time.time()
             ))
 
-    def resolve_pending(self, history_dict):
+    def resolve_pending(self, history_dict: Dict[str, Dict[str, Any]]):
         resolved = []
         with self._conn() as c:
             rows = c.execute("""
@@ -316,11 +334,15 @@ class Storage:
             """).fetchall()
 
         for row in rows:
-            (issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake) = row
-            if issue not in history_dict:
+            issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake = row
+
+            act = history_dict.get(str(issue))
+            if act is None:
+                act = history_dict.get(issue)
+
+            if act is None:
                 continue
 
-            act = history_dict[issue]
             act_size = "BIG" if act["size"] == 1 else "SMALL"
             win = (p_size == act_size)
 
@@ -355,6 +377,7 @@ class Storage:
                 "consensus": consensus or 0.5,
                 "stake": stake or "1x"
             })
+
         return resolved
 
     def recent_outcomes(self, limit: int = 12):
@@ -566,7 +589,7 @@ STATE = BotState()
 
 
 # ============================================================
-# PART 1: EXACT SUFFIX MEMORY
+# MULTI-MODEL SIGNALS
 # ============================================================
 def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
     if len(history) < 8:
@@ -596,9 +619,6 @@ def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
     return sum(p * v for _, p, v in matches) / total_weight
 
 
-# ============================================================
-# PART 2: MODEL SIGNALS
-# ============================================================
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     run = trailing_run(sizes)
@@ -640,9 +660,6 @@ def model_bias(history: List[Dict[str, Any]]) -> float:
     return 0.5
 
 
-# ============================================================
-# PART 3: ADVANCED MULTI-MODEL ENSEMBLE
-# ============================================================
 def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     scores = [
         ("Exact", exact_suffix_memory(history)),
@@ -687,7 +704,7 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================
-# PART 4: NORMAL MODE
+# NORMAL PREDICT
 # ============================================================
 def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     sizes = [x["size"] for x in history]
@@ -724,7 +741,7 @@ def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================
-# PART 5: ADVANCED RECOVERY MODE
+# RECOVERY PREDICT
 # ============================================================
 def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
     sizes = [x["size"] for x in history]
@@ -779,7 +796,7 @@ def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[st
 
 
 # ============================================================
-# PART 6: NUMBER SELECTION
+# NUMBER PICKER
 # ============================================================
 def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
     nums = [x["num"] for x in history]
@@ -791,7 +808,6 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
         pool = list(range(10))
 
     score = defaultdict(float)
-
     bias_map = STORE.get_num_bias(pred_dir, pool)
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
@@ -827,7 +843,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 
 
 # ============================================================
-# PART 7: FINAL PREDICTION
+# FINAL PREDICT
 # ============================================================
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
@@ -866,7 +882,6 @@ def generate_prediction() -> Dict[str, Any]:
     p_big = model["p_big"]
     strength = model["strength"]
 
-    # dynamic confidence gate
     if STATE.loss_streak >= 1:
         confidence = 60
         stake = "0.25x"
@@ -893,7 +908,7 @@ def generate_prediction() -> Dict[str, Any]:
         pred_dir = 1 if p_big >= 0.5 else 0
 
     num = choose_number(pred_dir, history, STATE.loss_streak)
-    issue = str(int(STATE.history[-1]["issue"]) + 1)
+    issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
     sigs = []
     if regime == "TRAP":
@@ -985,23 +1000,29 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
             if not isinstance(item, dict):
                 continue
 
-            issue = str(item.get("issueNumber", item.get("issue", "")))
-            if not issue or issue in seen:
+            issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
+            if issue is None:
+                issue = normalize_issue(item.get("issue"))
+            if issue is None:
                 continue
-            seen.add(issue)
+
+            if str(issue) in seen:
+                continue
+            seen.add(str(issue))
 
             num = safe_int(item.get("number", item.get("value", 0)), 0)
             if num < 0 or num > 9:
                 continue
 
             out.append({
-                "issue": issue,
+                "issue": str(issue),
                 "num": num,
                 "size": 1 if num >= 5 else 0
             })
         except Exception:
             continue
 
+    out.sort(key=lambda x: int(x["issue"]))
     return out
 
 
@@ -1114,7 +1135,11 @@ async def worker_loop(app, session):
     while True:
         try:
             if await fetch_data(session):
-                hist_dict = {x["issue"]: x for x in STATE.history}
+                hist_dict: Dict[str, Dict[str, Any]] = {}
+                for x in STATE.history:
+                    issue_key = str(x["issue"])
+                    hist_dict[issue_key] = x
+
                 resolved = STORE.resolve_pending(hist_dict)
 
                 for res in resolved:
@@ -1122,7 +1147,7 @@ async def worker_loop(app, session):
                     await send_msg(app, format_result(res))
 
                 latest_issue = STATE.history[-1]["issue"]
-                next_issue = str(int(latest_issue) + 1)
+                next_issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
                 if latest_issue != last_processed_issue:
                     if not STORE.prediction_exists(next_issue):
