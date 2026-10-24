@@ -1,13 +1,13 @@
 """
-V900 DEEP PATTERN MASTER
-=======================
-- Uses last 1000 results from API
-- Deep pattern memory + historical signal bank
-- Alternation / block / streak / trap / reversal / trend detection
-- Volatility and frequency scoring
-- Rebound logic after losses
-- Smart stake sizing
-- Number selection based on real pattern frequency
+V900 DEEP MASTER
+================
+- Last 1000 result memory
+- Multi-window pattern tracking
+- Similar-pattern memory scoring
+- Sequence-based trend and trap detection
+- Adaptive probability calibration
+- Better number selection
+- Dynamic risk sizing
 """
 
 import asyncio
@@ -23,13 +23,12 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
-from telegram import Update
-from telegram.ext import Application, CommandHandler
 from telegram.error import TimedOut, NetworkError
+from telegram.ext import Application
 
 # =========================
 # CONFIG
@@ -43,11 +42,11 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "predictor_v900_deep.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_deep_master.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V900 DEEP PATTERN MASTER"
+    bot_name: str = "V900 DEEP MASTER"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -60,7 +59,6 @@ class Config:
 
 CFG = Config()
 
-
 # =========================
 # LOGGING
 # =========================
@@ -72,7 +70,7 @@ def setup_logging():
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_deep.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_deep_master.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -94,9 +92,9 @@ class Storage:
         self._init_db()
 
     def _conn(self):
-        c = sqlite3.connect(self.path, timeout=20)
-        c.execute("PRAGMA journal_mode=TRUNCATE")
-        return c
+        conn = sqlite3.connect(self.path, timeout=20)
+        conn.execute("PRAGMA journal_mode=TRUNCATE")
+        return conn
 
     def _init_db(self):
         with self._conn() as c:
@@ -133,14 +131,15 @@ class Storage:
                 SELECT issue, size, num, mode, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake
                 FROM predictions WHERE status='PENDING'
             """).fetchall()
+
         for row in rows:
             (issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake) = row
             if issue not in history_dict:
                 continue
 
             act = history_dict[issue]
-            act_size_str = "BIG" if act["size"] == 1 else "SMALL"
-            win = (p_size == act_size_str)
+            act_size = "BIG" if act["size"] == 1 else "SMALL"
+            win = (p_size == act_size)
 
             if win and p_num == act["num"]:
                 status = "JACK 🏆"
@@ -152,7 +151,7 @@ class Storage:
             with self._conn() as c:
                 c.execute(
                     "UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?",
-                    (status, act["num"], act_size_str, issue)
+                    (status, act["num"], act_size, issue)
                 )
 
             resolved.append({
@@ -160,7 +159,7 @@ class Storage:
                 "size": p_size,
                 "num": p_num,
                 "actual_num": act["num"],
-                "actual_size": act_size_str,
+                "actual_size": act_size,
                 "status": status,
                 "mode": mode,
                 "win": win,
@@ -173,6 +172,7 @@ class Storage:
                 "consensus": consensus or 0.5,
                 "stake": stake or "1x"
             })
+
         return resolved
 
     def recent_outcomes(self, limit: int = 12):
@@ -201,15 +201,15 @@ STATE = BotState()
 
 
 # =========================
-# HELPER FUNCTIONS
+# HELPERS
 # =========================
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+def clamp(v: float, low: float, high: float) -> float:
+    return max(low, min(high, v))
 
 
-def safe_int(v, default=0):
+def safe_int(x, default=0):
     try:
-        return int(v)
+        return int(x)
     except Exception:
         return default
 
@@ -227,18 +227,24 @@ def trailing_run(values: List[int], target: Optional[int] = None) -> int:
     return run
 
 
+def ratio_big(values: List[int], n: int = 20) -> float:
+    if not values:
+        return 0.5
+    arr = values[-n:]
+    return sum(arr) / len(arr)
+
+
 def majority_dir(values: List[int], window: int = 6) -> int:
     if not values:
         return 1
     chunk = values[-window:]
-    big_count = sum(chunk)
-    return 1 if big_count >= (len(chunk) / 2) else 0
+    return 1 if sum(chunk) >= (len(chunk) / 2) else 0
 
 
-def alternating_score(sizes: List[int], window: int = 12) -> float:
-    if len(sizes) < 2:
+def alternating_score(values: List[int], window: int = 12) -> float:
+    if len(values) < 2:
         return 0.0
-    arr = sizes[-window:]
+    arr = values[-window:]
     changes = 0
     for i in range(1, len(arr)):
         if arr[i] != arr[i - 1]:
@@ -246,10 +252,10 @@ def alternating_score(sizes: List[int], window: int = 12) -> float:
     return changes / max(1, len(arr) - 1)
 
 
-def block_score(sizes: List[int], window: int = 10) -> bool:
-    if len(sizes) < 4:
+def block_pattern(values: List[int], window: int = 10) -> bool:
+    if len(values) < 4:
         return False
-    arr = sizes[-window:]
+    arr = values[-window:]
     for i in range(len(arr) - 3):
         a, b, c, d = arr[i:i+4]
         if a == b and c == d and a != c:
@@ -257,174 +263,99 @@ def block_score(sizes: List[int], window: int = 10) -> bool:
     return False
 
 
-def recent_big_ratio(sizes: List[int], window: int = 20) -> float:
-    if len(sizes) < 1:
-        return 0.5
-    arr = sizes[-window:]
-    return sum(arr) / len(arr)
-
-
-def volatility_score(sizes: List[int], window: int = 20) -> float:
-    if len(sizes) < 2:
+def volatility(values: List[int], window: int = 20) -> float:
+    if len(values) < 2:
         return 0.0
-    arr = sizes[-window:]
+    arr = values[-window:]
     diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 
 # =========================
-# DEEP MARKET ANALYSIS
+# DEEP PATTERN ANALYSIS
 # =========================
-def analyze_history(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not history:
-        return {
-            "side_bias": 0.5,
-            "regime": "EMPTY",
-            "patterns": [],
-            "signal_strength": 0.0,
-            "volatility": 0.0,
-            "trend_run": 0,
-            "last_size": 1,
-        }
+def detect_regime(sizes: List[int]) -> str:
+    if len(sizes) < 8:
+        return "COLD"
 
-    sizes = [x["size"] for x in history]
-    nums = [x["num"] for x in history]
+    last_run = trailing_run(sizes)
+    alt = alternating_score(sizes, 10)
+    block = block_pattern(sizes, 10)
+    big_ratio = ratio_big(sizes, 10)
 
-    runs = {
-        "last_run": trailing_run(sizes),
-        "last_big_run": trailing_run([1 if s == 1 else 0 for s in sizes]),
-        "last_small_run": trailing_run([1 if s == 0 else 0 for s in sizes]),
-    }
-
-    recent_ratio = recent_big_ratio(sizes, 20)
-    alt = alternating_score(sizes, 12)
-    block = block_score(sizes, 10)
-    last = sizes[-1]
-    last_dir = 1 if last == 1 else 0
-
-    # find dominant recent number group
-    freq = Counter(nums[-200:])
-    most_common = freq.most_common(5)
-    number_bias = {
-        "most_common": most_common[:3],
-        "big_group_score": sum(freq[n] for n in range(5, 10)),
-        "small_group_score": sum(freq[n] for n in range(0, 5)),
-    }
-
-    # side bias / confidence
-    side_bias = 0.5
-    if len(sizes) >= 10:
-        side_bias = recent_big_ratio(sizes, 10)
-
-    # regime detection
-    regime = "DYNAMIC"
     if alt >= 0.65:
-        regime = "ALTERNATING"
-    elif block:
-        regime = "BLOCK"
-    elif runs["last_run"] >= 3:
-        regime = "TRAP"
-    elif runs["last_run"] >= 5:
-        regime = "TREND"
-    elif abs(recent_ratio - 0.5) <= 0.15:
-        regime = "CHOPPY"
-    else:
-        regime = "CYCLE"
-
-    # signal strength
-    signal_strength = 0.0
-    if alt >= 0.5:
-        signal_strength += 0.25
+        return "ALTERNATING"
     if block:
-        signal_strength += 0.20
-    if runs["last_run"] >= 3:
-        signal_strength += 0.30
-    if abs(recent_ratio - 0.5) > 0.25:
-        signal_strength += 0.15
-    signal_strength = clamp(signal_strength, 0.0, 1.0)
-
-    # direct pattern features
-    pattern_info = {
-        "alternating": alt,
-        "block_pattern": block,
-        "streak": runs["last_run"],
-        "recent_big_ratio": recent_ratio,
-        "last_side": last_dir,
-        "volatility": volatility_score(sizes, 20),
-        "number_bias": number_bias,
-    }
-
-    return {
-        "side_bias": side_bias,
-        "regime": regime,
-        "patterns": pattern_info,
-        "signal_strength": signal_strength,
-        "volatility": volatility_score(sizes, 20),
-        "trend_run": runs["last_run"],
-        "last_size": last,
-    }
+        return "BLOCK"
+    if last_run >= 3:
+        return "TRAP"
+    if last_run >= 5:
+        return "TREND"
+    if abs(big_ratio - 0.5) <= 0.12:
+        return "CHOPPY"
+    return "CYCLE"
 
 
-# =========================
-# DEEP HISTORICAL MEMORY SCORING
-# =========================
-def build_pattern_memory(history: List[Dict[str, Any]], window: int = 12):
+def build_pattern_memory(history: List[Dict[str, Any]], window: int = 12) -> Dict[str, float]:
     """
-    Builds a memory bank of pattern occurrences from the recent 1000 results.
-    Score is based on how often a similar pattern ended as BIG or SMALL.
+    Compare current recent pattern against earlier similar patterns.
+
+    The idea:
+      - If similar pattern structure appeared before and it led to BIG majority,
+        increase BIG probability.
+      - Same for SMALL.
     """
-    if len(history) < window + 5:
-        return {
-            "big_score": 0.5,
-            "small_score": 0.5,
-            "pattern_count": 0
-        }
+    if len(history) < window + 4:
+        return {"big_like": 0.5, "small_like": 0.5, "strength": 0.0}
 
     sizes = [x["size"] for x in history]
-    scores = {"BIG": 0.0, "SMALL": 0.0}
-    seen = 0
+    recent = sizes[-window:]
+    recent_last_run = trailing_run(recent)
 
-    for i in range(window, len(sizes) - 1):
-        seq = sizes[i-window:i]
-        next_size = sizes[i]
+    big_hits = 0
+    small_hits = 0
+    total_matches = 0
 
-        # pattern templates
-        last_run = trailing_run(seq)
-        alt = alternating_score(seq, min(len(seq), 10))
-        block = block_score(seq, min(len(seq), 10))
-        ratio = recent_big_ratio(seq, min(len(seq), 20))
+    for start in range(0, len(sizes) - window - 1):
+        slice_seq = sizes[start:start + window]
+        if len(slice_seq) < window:
+            continue
 
-        match = False
-        if last_run >= 3:
-            match = True
-        if alt >= 0.6:
-            match = True
-        if block:
-            match = True
-        if abs(ratio - 0.5) > 0.2:
-            match = True
+        # pattern similarity:
+        sim = 0.0
+        # same last run intensity
+        if trailing_run(slice_seq) == recent_last_run:
+            sim += 0.4
+        # same sign distribution
+        if abs(ratio_big(slice_seq, window) - ratio_big(recent, window)) <= 0.2:
+            sim += 0.3
+        # same alternation behavior
+        if abs(alternating_score(slice_seq, window) - alternating_score(recent, window)) <= 0.25:
+            sim += 0.2
+        # same block tendency
+        if block_pattern(slice_seq, window) == block_pattern(recent, window):
+            sim += 0.1
 
-        if match:
-            seen += 1
-            if next_size == 1:
-                scores["BIG"] += 1.0
+        if sim >= 0.7:
+            total_matches += 1
+            outcome = sizes[start + window]
+            if outcome == 1:
+                big_hits += 1
             else:
-                scores["SMALL"] += 1.0
+                small_hits += 1
 
-    total = scores["BIG"] + scores["SMALL"]
-    if total <= 0:
-        return {"big_score": 0.5, "small_score": 0.5, "pattern_count": 0}
+    total = big_hits + small_hits
+    if total == 0:
+        return {"big_like": 0.5, "small_like": 0.5, "strength": 0.0}
+
     return {
-        "big_score": scores["BIG"] / total,
-        "small_score": scores["SMALL"] / total,
-        "pattern_count": seen
+        "big_like": big_hits / total,
+        "small_like": small_hits / total,
+        "strength": clamp(total_matches / max(1, len(history) - window), 0.0, 1.0),
     }
 
 
-# =========================
-# PREDICTOR
-# =========================
-def choose_number(pred_dir: int, history: List[Dict[str, Any]], state_loss_streak: int) -> int:
+def number_frequency_weights(history: List[Dict[str, Any]], pred_dir: int) -> Dict[int, float]:
     nums = [x["num"] for x in history]
     recent = nums[-200:]
     freq = Counter(recent)
@@ -436,29 +367,26 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], state_loss_strea
     weights = {}
     for n in pool:
         w = 1.0
-
-        # frequency importance
         w += freq.get(n, 0) * 3.0
 
-        # number cluster preference
+        # prefer central cluster near 5-9 for BIG, 0-4 for SMALL
         if pred_dir == 1:
             if n in (6, 7, 8):
-                w += 2.0
+                w += 2.5
             if n in (5, 9):
                 w += 1.0
         else:
             if n in (1, 2, 3):
-                w += 2.0
+                w += 2.5
             if n in (0, 4):
                 w += 1.0
 
-        # avoid repeated stale numbers
-        recent_window = recent[-20:]
-        if recent_window.count(n) >= 4:
+        # avoid stale repeated numbers
+        if recent.count(n) >= 4:
             w *= 0.35
 
-        # after heavy loss streak, avoid repeating obvious trap numbers
-        if state_loss_streak >= 2:
+        # after consecutive losses, avoid obvious trap numbers
+        if STATE.loss_streak >= 2:
             if pred_dir == 1 and n <= 4:
                 w *= 0.2
             if pred_dir == 0 and n >= 5:
@@ -466,12 +394,20 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], state_loss_strea
 
         weights[n] = w
 
+    return weights
+
+
+def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
+    weights = number_frequency_weights(history, pred_dir)
     if not weights:
-        return random.choice(pool)
+        return random.choice(list(range(10)))
 
     return max(weights, key=weights.get)
 
 
+# =========================
+# MAIN PREDICTOR
+# =========================
 def generate_prediction():
     if len(STATE.history) < CFG.min_history:
         return None
@@ -479,84 +415,97 @@ def generate_prediction():
     history = STATE.history[-1000:]
     sizes = [x["size"] for x in history]
     nums = [x["num"] for x in history]
-    market = analyze_history(history)
-    memory = build_pattern_memory(history, window=12)
 
-    # --- base side probability ---
-    p_big = market["side_bias"]
+    # --------- regime-based signals ----------
+    regime = detect_regime(sizes)
+    trend_run = trailing_run(sizes)
+    recent_ratio = ratio_big(sizes, 20)
+    alt = alternating_score(sizes, 12)
+    block = block_pattern(sizes, 10)
+    vol = volatility(sizes, 20)
 
-    # 1. alternation: reversal bias
-    if market["regime"] == "ALTERNATING":
+    # ---------- layer 1: trend / reversal ----------
+    p_big = recent_ratio
+
+    if regime == "ALTERNATING":
         p_big = 1.0 - sizes[-1]
-    # 2. trap pattern: reverse streak
-    elif market["regime"] == "TRAP":
+    elif regime == "TRAP":
         p_big = 1.0 - sizes[-1]
-    # 3. trend pattern: continue with momentum
-    elif market["regime"] == "TREND":
+    elif regime == "BLOCK":
+        p_big = 1.0 - sizes[-1]
+    elif regime == "TREND":
         p_big = sizes[-1]
-    # 4. block pattern: likely break
-    elif market["regime"] == "BLOCK":
-        p_big = 1.0 - sizes[-1]
-    # 5. choppy: use recent ratio more gently
-    elif market["regime"] == "CHOPPY":
-        p_big = 0.5 + (market["side_bias"] - 0.5) * 0.8
+    elif regime == "CHOPPY":
+        p_big = 0.5 + (recent_ratio - 0.5) * 0.8
 
-    # 6. memory bank adjustment
-    if memory["pattern_count"] > 0:
-        if memory["big_score"] > memory["small_score"]:
-            p_big = 0.5 + (p_big - 0.5) * 0.7 + (memory["big_score"] - 0.5) * 0.6
+    # ---------- layer 2: recent memory ----------
+    memory = build_pattern_memory(history, window=12)
+    if memory["strength"] > 0.0:
+        # if similar historical patterns favored BIG
+        if memory["big_like"] > memory["small_like"]:
+            p_big = 0.5 + (p_big - 0.5) * 0.75 + (memory["big_like"] - 0.5) * 0.75
         else:
-            p_big = 0.5 + (p_big - 0.5) * 0.7 + (memory["small_score"] - 0.5) * 0.6
+            p_big = 0.5 + (p_big - 0.5) * 0.75 + (memory["small_like"] - 0.5) * 0.75
 
-    # 7. state-driven adaptive adjustment
+    # ---------- layer 3: state / rebound ----------
     if STATE.loss_streak == 1:
         p_big = 1.0 - sizes[-1]
     elif STATE.loss_streak >= 2:
         p_big = 1.0 - majority_dir(sizes, 6)
 
-    p_big = clamp(p_big, 0.05, 0.95)
+    # ---------- layer 4: momentum from streaks ----------
+    if trend_run >= 5:
+        p_big = sizes[-1]
+    elif trend_run >= 3:
+        p_big = 1.0 - sizes[-1]  # trap reversal
 
+    # ---------- layer 5: volatility smoothing ----------
+    if vol > 0.55:
+        p_big = 0.5 + (p_big - 0.5) * 0.75
+
+    p_big = clamp(p_big, 0.05, 0.95)
     pred_dir = 1 if p_big >= 0.5 else 0
 
-    # Risk stake
+    # ---------- risk sizing ----------
     stake = "1x"
     if STATE.loss_streak >= 2:
         stake = "0.5x"
     elif STATE.win_streak >= 2:
         stake = "2x"
 
-    # Mode
+    # ---------- mode ----------
     if STATE.loss_streak >= 2:
         mode = "CONTRARIAN"
     elif STATE.loss_streak == 1:
         mode = "REBOUND"
-    elif market["regime"] == "TRAP":
+    elif regime == "TRAP":
         mode = "ANTI-TRAP"
-    elif market["regime"] == "TREND":
+    elif regime == "TREND":
         mode = "TREND"
-    elif market["regime"] == "ALTERNATING":
+    elif regime == "ALTERNATING":
         mode = "REVERSAL"
     else:
         mode = "DYNAMIC"
 
-    # Target number
+    # ---------- choose number ----------
     num = choose_number(pred_dir, history, STATE.loss_streak)
     issue = str(int(STATE.history[-1]["issue"]) + 1)
 
-    # Build signal metadata
-    signal_names = []
-    if market["patterns"]["alternating"] >= 0.5:
-        signal_names.append("Alternating")
-    if market["patterns"]["block_pattern"]:
-        signal_names.append("Block")
-    if market["trend_run"] >= 3:
-        signal_names.append("Trap")
-    if market["patterns"]["volatility"] > 0.5:
-        signal_names.append("Volatile")
-    if memory["pattern_count"] > 0:
-        signal_names.append("Pattern-Memory")
+    # signal names
+    sigs = []
+    if regime == "ALTERNATING":
+        sigs.append("Alternating")
+    if regime == "BLOCK":
+        sigs.append("Block")
+    if regime == "TRAP":
+        sigs.append("Trap")
+    if vol > 0.5:
+        sigs.append("Volatile")
+    if memory["strength"] > 0.0:
+        sigs.append("Pattern-Memory")
+    if not sigs:
+        sigs.append("Baseline")
 
-    # Confidence
     confidence = int(50 + abs(p_big - 0.5) * 100)
     confidence = max(55, min(99, confidence))
 
@@ -569,17 +518,19 @@ def generate_prediction():
         "raw_conf": confidence,
         "consensus": max(p_big, 1 - p_big),
         "mode": mode,
-        "regime": market["regime"],
-        "logic": ", ".join(signal_names) if signal_names else "Baseline",
-        "sigs": [{"name": s, "dir": pred_dir} for s in signal_names],
+        "regime": regime,
+        "logic": ", ".join(sigs),
+        "sigs": [{"name": s, "dir": pred_dir} for s in sigs],
         "stake": stake,
         "details": {
-            "market": market,
+            "regime": regime,
+            "recent_ratio": recent_ratio,
+            "alternating_score": alt,
+            "trend_run": trend_run,
+            "volatility": vol,
             "memory": memory,
             "loss_streak": STATE.loss_streak,
-            "win_streak": STATE.win_streak,
-            "pred_dir": pred_dir,
-            "issue": issue
+            "win_streak": STATE.win_streak
         }
     }
 
@@ -606,24 +557,23 @@ async def fetch_data(session):
             if not isinstance(payload, dict):
                 return False
 
-            items = payload.get("data", {}).get("list", [])
-            if not items:
+            data_list = payload.get("data", {}).get("list", [])
+            if not data_list:
                 return False
 
-            # sort by issue number
-            items.sort(key=lambda x: int(x.get("issueNumber", x.get("issue", 0))))
+            data_list.sort(key=lambda x: int(x.get("issueNumber", x.get("issue", 0))))
 
             out = []
             seen = set()
-            for item in items:
+            for item in data_list:
                 try:
                     issue = str(item.get("issueNumber", item.get("issue", "")))
                     if not issue or issue in seen:
                         continue
                     seen.add(issue)
 
-                    num = safe_int(item.get("number", item.get("value", 0)), 0)
-
+                    raw_num = item.get("number", item.get("value", 0))
+                    num = safe_int(raw_num, 0)
                     if num < 0 or num > 9:
                         continue
 
@@ -639,13 +589,14 @@ async def fetch_data(session):
                 STATE.history = out[-1000:]
                 return True
             return False
+
     except Exception as e:
         log.warning(f"Fetch failed: {e}")
         return False
 
 
 # =========================
-# FORMAT
+# FORMATTING
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(
@@ -672,7 +623,6 @@ def format_prediction(p, recent_rows):
 {recent_text}━━━━━━━━━━━━━━━━━━
 ⚡ <i>{h(CFG.bot_name)}</i>
 """
-
 
 def format_result(res):
     return (
@@ -705,7 +655,6 @@ async def send_msg(app, text, retries=3):
 # =========================
 async def worker_loop(app, session):
     last_processed_issue = None
-
     while True:
         try:
             if await fetch_data(session):
