@@ -1,10 +1,10 @@
 """
-V901 FIXED WORKING VERSION
+V902 FINAL WORKING VERSION
 ================================
-- Increased timeout & retries (cloud run cold starts)
-- Removed strict Content-Type check
-- Added Local JSON Cache (works even if API is down entirely)
-- Uses User-Agent header (prevents blocking)
+- Added Dummy Web Server (Fixes Render 'Timed Out' & Restart Loop)
+- API Timeout & Retries
+- Local JSON Cache
+- Better Logging for Predictions
 """
 
 import asyncio
@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+from aiohttp import web  # NEW: For Render Web Server
 from telegram.ext import Application
-
 
 # ============================================================
 # CONFIG
@@ -37,12 +37,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_fixed_working.db")
-    cache_file: str = "history_cache.json"  # NEW: Local backup cache
+    db_path: str = os.environ.get("DB_PATH", "v902_fixed.db")
+    cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
-    request_timeout: float = 30.0  # FIXED: Increased from 12 to 30 for Cloud Run
-    bot_name: str = "V901 FIXED"
+    request_timeout: float = 30.0
+    bot_name: str = "V902 FIXED"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -58,9 +58,7 @@ class Config:
     def validate(self):
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
 
-
 CFG = Config()
-
 
 # ============================================================
 # LOGGING
@@ -75,18 +73,32 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v901_fixed.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v902_fixed.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
-
 setup_logging()
-log = logging.getLogger("v901")
-
+log = logging.getLogger("v902")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
+# ============================================================
+# DUMMY WEB SERVER (FOR RENDER HEALTH CHECK)
+# ============================================================
+async def health_check(request):
+    return web.Response(text="V902 Bot is Running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render gives a PORT env variable, default to 8080
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    log.info(f"Web Server started on port {port} (Render Health Check OK)")
 
 # ============================================================
 # STATE & CACHE HELPERS
@@ -98,7 +110,6 @@ class BotState:
         self.win_streak = 0
 
     def save_cache(self):
-        """Save history to local file so bot survives API downtime."""
         try:
             with open(CFG.cache_file, "w", encoding="utf-8") as f:
                 json.dump(self.history[-1000:], f)
@@ -106,7 +117,6 @@ class BotState:
             log.warning(f"Failed to save cache: {e}")
 
     def load_cache(self):
-        """Load history from local file on startup."""
         try:
             if os.path.exists(CFG.cache_file):
                 with open(CFG.cache_file, "r", encoding="utf-8") as f:
@@ -117,9 +127,7 @@ class BotState:
         except Exception as e:
             log.warning(f"Failed to load cache: {e}")
 
-
 STATE = BotState()
-
 
 # ============================================================
 # GENERAL HELPERS
@@ -127,127 +135,91 @@ STATE = BotState()
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
 
-
 def safe_int(x, default=0):
     try:
         return int(x)
     except Exception:
         return default
 
-
 def normalize_issue(value: Any) -> Optional[int]:
-    if value is None:
-        return None
+    if value is None: return None
     if isinstance(value, str):
         value = value.strip()
-        if value == "":
-            return None
-        if value.isdigit():
-            return int(value)
+        if value == "": return None
+        if value.isdigit(): return int(value)
         digits = "".join(ch for ch in value if ch.isdigit())
-        if digits:
-            return int(digits)
-    try:
-        return int(value)
-    except Exception:
-        return None
-
+        if digits: return int(digits)
+    try: return int(value)
+    except Exception: return None
 
 def trailing_run(values: List[int], target: Optional[int] = None) -> int:
-    if not values:
-        return 0
+    if not values: return 0
     last = values[-1] if target is None else target
     run = 1
     for i in range(len(values) - 2, -1, -1):
-        if values[i] == last:
-            run += 1
-        else:
-            break
+        if values[i] == last: run += 1
+        else: break
     return run
 
-
 def ratio_big(values: List[int], window: int = 20) -> float:
-    if not values:
-        return 0.5
+    if not values: return 0.5
     arr = values[-window:]
     return sum(arr) / len(arr)
 
-
 def majority_dir(values: List[int], window: int = 6) -> int:
-    if not values:
-        return 1
+    if not values: return 1
     arr = values[-window:]
     return 1 if sum(arr) >= (len(arr) / 2) else 0
 
-
 def alternating_score(values: List[int], window: int = 12) -> float:
-    if len(values) < 2:
-        return 0.0
+    if len(values) < 2: return 0.0
     arr = values[-window:]
     changes = 0
     for i in range(1, len(arr)):
-        if arr[i] != arr[i - 1]:
-            changes += 1
+        if arr[i] != arr[i - 1]: changes += 1
     return changes / max(1, len(arr) - 1)
 
-
 def block_pattern(values: List[int], window: int = 10) -> bool:
-    if len(values) < 4:
-        return False
+    if len(values) < 4: return False
     arr = values[-window:]
     for i in range(len(arr) - 3):
         a, b, c, d = arr[i:i + 4]
-        if a == b and c == d and a != c:
-            return True
+        if a == b and c == d and a != c: return True
     return False
 
-
 def volatility(values: List[int], window: int = 20) -> float:
-    if len(values) < 2:
-        return 0.0
+    if len(values) < 2: return 0.0
     arr = values[-window:]
     diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
-
 def detect_regime(sizes: List[int]) -> str:
-    if len(sizes) < 8:
-        return "COLD"
+    if len(sizes) < 8: return "COLD"
     run = trailing_run(sizes)
     alt = alternating_score(sizes, 10)
     bp = block_pattern(sizes, 10)
     ratio = ratio_big(sizes, 10)
 
-    if alt >= 0.65:
-        return "ALTERNATING"
-    if bp:
-        return "BLOCK"
-    if run >= 3:
-        return "TRAP"
-    if run >= 5:
-        return "TREND"
-    if abs(ratio - 0.5) <= 0.12:
-        return "CHOPPY"
+    if alt >= 0.65: return "ALTERNATING"
+    if bp: return "BLOCK"
+    if run >= 3: return "TRAP"
+    if run >= 5: return "TREND"
+    if abs(ratio - 0.5) <= 0.12: return "CHOPPY"
     return "CYCLE"
 
-
 def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
-    if len(history) < window + 4:
-        return 0.0
+    if len(history) < window + 4: return 0.0
     current = tuple(x["size"] for x in history[-window:])
     repeats = 0
     for i in range(len(history) - window - 1, 0, -1):
         prev = tuple(x["size"] for x in history[i:i + window])
         if prev == current:
             repeats += 1
-            if repeats >= 2:
-                break
+            if repeats >= 2: break
     return min(0.45, repeats * 0.14)
 
-
 def signal_strength(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8:
-        return 0.2
+    if len(history) < 8: return 0.2
     sizes = [x["size"] for x in history]
     regime = detect_regime(sizes)
     run = trailing_run(sizes)
@@ -264,7 +236,6 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     if abs(ratio - 0.5) > 0.18: s += 0.15
     if alt >= 0.6: s += 0.15
     return min(1.0, s)
-
 
 # ============================================================
 # STORAGE
@@ -340,8 +311,7 @@ class Storage:
         for row in rows:
             issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake = row
             act = history_dict.get(str(issue)) or history_dict.get(issue)
-            if act is None:
-                continue
+            if act is None: continue
 
             act_size = "BIG" if act["size"] == 1 else "SMALL"
             win = (p_size == act_size)
@@ -465,9 +435,7 @@ class Storage:
                 if n in (0, 4): weights[n] += 1.0
         return weights
 
-
 STORE = Storage(CFG.db_path)
-
 
 # ============================================================
 # DEEP PATTERN & PREDICTION LOGIC
@@ -475,7 +443,6 @@ STORE = Storage(CFG.db_path)
 def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not history: return {}
     sizes = [x["size"] for x in history]
-    nums = [x["num"] for x in history]
     regime = detect_regime(sizes)
     return {
         "last": sizes[-1], "run": trailing_run(sizes), "ratio_big": ratio_big(sizes, 20),
@@ -487,14 +454,8 @@ def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
     if len(history) < 8: return 0.5
     sizes = [x["size"] for x in history]
-    matches = []
-    for window in [3, 5, 8, 12, 20, 30, 50, 100]:
-        if len(sizes) < window: continue
-        key = f"{window}:{json.dumps(list(tuple(sizes[-window:])))}"
-        # Note: using STORE DB fetch directly to avoid relying on global PATTERN_DB
-        res = STORE.get_exact_pattern_probability(sizes)
-        return res["p_big"]
-    return 0.5
+    res = STORE.get_exact_pattern_probability(sizes)
+    return res["p_big"]
 
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -663,7 +624,6 @@ def learn_from_resolution(res: dict):
     for name in ["Exact", "Trend", "Alternation", "Block", "Volatility", "Bias"]:
         STORE.update_model_state(name, bool(res["win"]))
 
-
 # ============================================================
 # API PARSE & FETCH
 # ============================================================
@@ -698,9 +658,8 @@ async def fetch_data(session):
     urls = CFG.api_urls()
     
     for url in urls:
-        for retry in range(5):  # Increased retries
+        for retry in range(5):
             try:
-                # Added User-Agent to avoid blocks
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
                 async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
                     if r.status == 429:
@@ -713,7 +672,6 @@ async def fetch_data(session):
                         log.warning("HTTP %s from %s", r.status, url)
                         break
                     
-                    # Removed strict Content-Type check. Just try to parse JSON.
                     try:
                         payload = await r.json(content_type=None)
                     except Exception as e:
@@ -723,7 +681,7 @@ async def fetch_data(session):
                     parsed = parse_history_payload(payload)
                     if parsed:
                         STATE.history = parsed[-1000:]
-                        STATE.save_cache()  # Save to local cache on success
+                        STATE.save_cache()
                         log.info("Fetched history from %s -> %d records", url, len(parsed))
                         return True
                     
@@ -743,7 +701,6 @@ async def fetch_data(session):
 
     log.warning("All API endpoints failed and no local cache exists.")
     return False
-
 
 # ============================================================
 # FORMATTING & TELEGRAM
@@ -784,7 +741,6 @@ async def send_msg(app, text, retries=3):
             await asyncio.sleep(1)
     return False
 
-
 # ============================================================
 # WORKER & MAIN
 # ============================================================
@@ -811,6 +767,8 @@ async def worker_loop(app, session):
                     p = generate_prediction()
                     if p:
                         STORE.save_prediction(p)
+                        # Log prediction being sent
+                        log.info(f"Sending Prediction for Issue: {next_issue}")
                         await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
                         last_processed_issue = latest_issue
 
@@ -822,9 +780,10 @@ async def worker_loop(app, session):
 
 async def main():
     CFG.validate()
-    STATE.load_cache()  # Load history from disk immediately on startup
+    STATE.load_cache()
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
+    
     async with app:
         await app.start()
         try:
@@ -833,6 +792,9 @@ async def main():
         except Exception:
             log.exception("Telegram verification failed. Check TG_TOKEN.")
             return
+
+        # NEW: Start Dummy Web Server for Render Health Check
+        await start_web_server()
 
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(worker_loop(app, session))
