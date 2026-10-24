@@ -1,13 +1,13 @@
 """
-V900 BEST MODEL - MULTI-LAYER INTELLIGENCE PREDICTOR
-====================================================
-- Reads last 1000 results
-- Learns exact multi-window sequence patterns
-- Ensemble of independent models
-- Dynamic weighted scoring
-- Safe risk gating
-- Always predicts, but reduces stake when weak
-- Telegram bot + SQLite persistence
+V900 BEST MODEL - FAST REAL-TIME INTELLIGENCE
+===========================================
+- reads last 1000 results
+- exact pattern memory by window
+- multi-model ensemble
+- anti-trap after losses
+- fast processing for on-time round predictions
+- no skip: low-risk fallback on weak evidence
+- Telegram bot + SQLite storage
 """
 
 import asyncio
@@ -43,11 +43,11 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_best_model.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_best_fast.db")
     log_dir: str = "logs"
-    fetch_every: float = 2.0
-    request_timeout: float = 15.0
-    bot_name: str = "V900 BEST MODEL"
+    fetch_every: float = 1.0
+    request_timeout: float = 12.0
+    bot_name: str = "V900 BEST FAST MODEL"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -74,7 +74,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_best_model.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_best_fast.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -180,53 +180,8 @@ def detect_regime(sizes: List[int]) -> str:
     return "CYCLE"
 
 
-def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
-    if len(history) < window + 4:
-        return 0.0
-
-    current = tuple(x["size"] for x in history[-window:])
-    repeats = 0
-    for i in range(len(history) - window - 1, 0, -1):
-        prev = tuple(x["size"] for x in history[i:i + window])
-        if prev == current:
-            repeats += 1
-            if repeats >= 2:
-                break
-    return min(0.35, repeats * 0.12)
-
-
-def signal_strength(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8:
-        return 0.2
-
-    sizes = [x["size"] for x in history]
-    regime = detect_regime(sizes)
-    run = trailing_run(sizes)
-    alt = alternating_score(sizes, 12)
-    bp = block_pattern(sizes, 10)
-    ratio = ratio_big(sizes, 20)
-
-    s = 0.0
-    if regime == "TRAP":
-        s += 0.35
-    if regime == "TREND":
-        s += 0.25
-    if regime == "ALTERNATING":
-        s += 0.30
-    if bp:
-        s += 0.20
-    if run >= 3:
-        s += 0.25
-    if abs(ratio - 0.5) > 0.18:
-        s += 0.15
-    if alt >= 0.6:
-        s += 0.15
-
-    return min(1.0, s)
-
-
 # =========================
-# DATABASE
+# STORAGE
 # =========================
 class Storage:
     def __init__(self, path: str):
@@ -339,7 +294,7 @@ class Storage:
                 "p_big": p_big if p_big is not None else 0.5,
                 "calibrated_conf": cal_conf or 50,
                 "consensus": consensus or 0.5,
-                "stake": stake or "1x",
+                "stake": stake or "1x"
             })
 
         return resolved
@@ -348,7 +303,7 @@ class Storage:
         with self._conn() as c:
             rows = c.execute(
                 "SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
-                (limit,),
+                (limit,)
             ).fetchall()
         return rows[::-1]
 
@@ -358,7 +313,7 @@ class Storage:
             if row is None:
                 c.execute(
                     "INSERT INTO signal_weights (name, weight, hits, misses, updated_at) VALUES (?, ?, 0, 0, ?)",
-                    (name, 1.0, time.time()),
+                    (name, 1.0, time.time())
                 )
 
     def get_signal_weight(self, name: str) -> float:
@@ -388,7 +343,7 @@ class Storage:
 
             c.execute(
                 "UPDATE signal_weights SET weight=?, hits=?, misses=?, updated_at=? WHERE name=?",
-                (new_weight, hits, misses, time.time(), name),
+                (new_weight, hits, misses, time.time(), name)
             )
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
@@ -431,10 +386,8 @@ class Storage:
         with self._conn() as c:
             row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (actual_num,)).fetchone()
             if row is None:
-                c.execute(
-                    "INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
-                    (actual_num, 0, 0, 0),
-                )
+                c.execute("INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
+                          (actual_num, 0, 0, 0))
                 row = (0, 0, 0)
 
             big_count, small_count, total_count = row
@@ -487,6 +440,7 @@ class Storage:
 
         total_count = sum(m["count"] for m in matches)
         weighted_p_big = sum(m["p_big"] * m["count"] for m in matches) / total_count
+
         return {
             "p_big": weighted_p_big,
             "matched": len(matches),
@@ -646,7 +600,7 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # =========================
-# SIGNALS / NUMBER PICK
+# SIGNALS + NUMBER SELECTION
 # =========================
 def candidate_signals(history: List[Dict[str, Any]]) -> List[Tuple[str, int, float, str]]:
     if not history:
@@ -750,7 +704,6 @@ def generate_prediction() -> Dict[str, Any]:
     history = STATE.history[-1000:]
     sizes = [x["size"] for x in history]
 
-    # ensemble probability
     ensemble = ensemble_probability(history)
     p_big = ensemble["p_big"]
 
@@ -785,7 +738,14 @@ def generate_prediction() -> Dict[str, Any]:
 
     strength = signal_strength(history)
 
-    if strength < 0.45:
+    # anti-loss recovery
+    if STATE.loss_streak >= 1:
+        mode = "ANTI-TRAP"
+        stake = "0.25x"
+        confidence = 60
+        pred_dir = 1 - pred_dir
+        p_big = 1.0 - p_big
+    elif strength < 0.45:
         mode = "LOW-EDGE"
         stake = "0.25x"
         confidence = 58
@@ -799,12 +759,6 @@ def generate_prediction() -> Dict[str, Any]:
         stake = "1x" if STATE.loss_streak < 2 else "0.5x"
         confidence = 70
         mode = "DYNAMIC"
-
-    if STATE.loss_streak >= 2:
-        pred_dir = 1 - pred_dir
-        p_big = 1.0 - p_big
-        mode = "CONTRARIAN"
-        stake = "0.25x"
 
     if confidence < 58:
         confidence = 58
@@ -842,6 +796,8 @@ def generate_prediction() -> Dict[str, Any]:
             "stale_penalty": stale,
             "signal_strength": strength,
             "regime": regime,
+            "loss_streak": STATE.loss_streak,
+            "win_streak": STATE.win_streak,
         },
     }
 
@@ -944,6 +900,7 @@ def format_prediction(p, recent_rows):
 ⚡ <i>{h(CFG.bot_name)}</i>
 """
 
+
 def format_result(res):
     return (
         f"🎯 <b>Result</b>\n"
@@ -963,7 +920,7 @@ async def send_msg(app, text, retries=3):
             await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
             return True
         except (TimedOut, NetworkError):
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
         except Exception as e:
             log.error(f"Send error: {e}")
             break
@@ -1001,7 +958,7 @@ async def worker_loop(app, session):
             await asyncio.sleep(CFG.fetch_every)
         except Exception as e:
             log.exception(f"Loop error: {e}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
 
 async def handle_ping(request):
@@ -1013,6 +970,7 @@ async def handle_ping(request):
 # =========================
 async def main():
     CFG.validate()
+
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
 
     async with app:
