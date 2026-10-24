@@ -1,13 +1,11 @@
 """
-V500 META-ENSEMBLE AI
-=====================
-The Ultimate Evolution.
-- Hidden Markov Model (HMM) for Market Regimes.
-- Meta-Learning (3 AI Agents compete, winner gets more weight).
-- Fractal Dimension (Noise filter).
-- Fibonacci Number Prediction.
-- Fully autonomous Risk Engine (No SKIP).
-- Built-in Render Webhook support.
+V600 ULTRA-AI ENGINE
+====================
+Fixes:
+- Empty Meta-Agents issue (Always fires at least 1 agent).
+- Trend Filter: Stops fighting the market trend (Prevents 0182-0187 type loss streaks).
+- Number Picker randomization (No more repeating '5').
+- Default Tie-breaker flipped to match market context.
 """
 
 import asyncio
@@ -43,12 +41,12 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    webhook_url: str = "https://wingo-bot-mcs3.onrender.com" # e.g. https://app.onrender.com
-    db_path: str = os.environ.get("DB_PATH", "predictor_v500.db")
+    webhook_url: str = "https://wingo-bot-mcs3.onrender.com"
+    db_path: str = os.environ.get("DB_PATH", "predictor_v600.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V500 META-ENSEMBLE AI"
+    bot_name: str = "V600 ULTRA-AI"
     min_history: int = 50
     warm_min: int = 20
 
@@ -70,11 +68,11 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v500.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v600.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v500")
+log = logging.getLogger("v600")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -82,61 +80,37 @@ def h(x: Any) -> str:
 # =========================
 # ADVANCED MATH & AI
 # =========================
-def sigmoid(z):
-    return 1 / (1 + math.exp(-z))
-
 def calculate_fractal_dimension(sizes):
-    """Calculates Katz Fractal Dimension to measure market noise."""
     n = len(sizes)
     if n < 20: return 1.5
-    L, L_avg = 0.0, 0.0
-    for i in range(1, n):
-        L += abs(sizes[i] - sizes[i-1])
+    L = sum(abs(sizes[i] - sizes[i-1]) for i in range(1, n))
     L_avg = L / (n - 1)
     d = max([abs(sizes[i] - sizes[0]) for i in range(n)]) if n > 1 else 1
     if L_avg == 0 or d == 0: return 1.5
     return math.log10(n) / (math.log10(d / L_avg) + math.log10(n))
 
 class HMMRegime:
-    """Hidden Markov Model for Market Regimes."""
     def __init__(self):
-        self.states = ["TRENDING_BIG", "TRENDING_SMALL", "CHOPPY"]
         self.current_state = "CHOPPY"
-        self.transition_matrix = [
-            [0.6, 0.2, 0.2], # From Trend Big
-            [0.2, 0.6, 0.2], # From Trend Small
-            [0.3, 0.3, 0.4]  # From Choppy
-        ]
-
     def update(self, sizes):
         n = len(sizes)
         if n < 10: return self.current_state
-        
         last = sizes[-1]
         run = 1
         for i in range(n-2, -1, -1):
             if sizes[i] == last: run += 1
             else: break
-            
         if run >= 4:
             self.current_state = "TRENDING_BIG" if last == 1 else "TRENDING_SMALL"
         elif run <= 2:
             self.current_state = "CHOPPY"
-        
         return self.current_state
 
 class MetaLearner:
-    """Tracks Agent performance and assigns weights dynamically."""
     def __init__(self):
-        self.rewards = {
-            "TrendAgent": deque(maxlen=50),
-            "MeanRevAgent": deque(maxlen=50),
-            "PatternAgent": deque(maxlen=50)
-        }
-
+        self.rewards = {"TrendAgent": deque(maxlen=50), "MeanRevAgent": deque(maxlen=50), "PatternAgent": deque(maxlen=50)}
     def record(self, agent, correct):
         self.rewards[agent].append(1 if correct else 0)
-
     def get_weights(self):
         weights = {}
         for agent, history in self.rewards.items():
@@ -144,7 +118,6 @@ class MetaLearner:
                 weights[agent] = 1.0
                 continue
             acc = sum(history) / len(history)
-            # Softmax-like scaling: 50% acc = 1.0 weight, 70% acc = 2.5 weight, 30% acc = 0.2 weight
             weights[agent] = max(0.1, min(3.0, (acc * 4) - 1))
         return weights
 
@@ -230,7 +203,7 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# AI ENGINE STATE
+# STATE & AGENTS
 # =========================
 class BotState:
     def __init__(self):
@@ -239,39 +212,17 @@ class BotState:
         self.meta = MetaLearner()
         self.loss_streak = 0
         self.win_streak = 0
-        self._load_persisted()
-
-    def _load_persisted(self):
-        raw = STORE.load_kv("state_v500")
-        if not raw: return
-        try:
-            d = json.loads(raw)
-            self.loss_streak = d.get("loss_streak", 0)
-            self.win_streak = d.get("win_streak", 0)
-        except Exception: pass
-
-    def save_persisted(self):
-        try:
-            d = {"loss_streak": self.loss_streak, "win_streak": self.win_streak}
-            STORE.save_kv("state_v500", json.dumps(d))
-        except Exception: pass
 
 STATE = BotState()
 
-# =========================
-# AI AGENTS
-# =========================
 def agent_trend(sizes):
-    """Agent 1: Follows streaks and momentum."""
     if len(sizes) < 10: return None
     last = sizes[-1]
     run = 1
     for i in range(len(sizes)-2, -1, -1):
         if sizes[i] == last: run += 1
         else: break
-    
     if run >= 3: return {"dir": last, "conf": 60 + (run * 5), "name": "TrendFollow"}
-    
     ma5 = sum(sizes[-5:])/5
     ma10 = sum(sizes[-10:])/10
     if abs(ma5 - ma10) > 0.15:
@@ -279,16 +230,13 @@ def agent_trend(sizes):
     return None
 
 def agent_mean_rev(sizes):
-    """Agent 2: Bets on reversals after long runs."""
     if len(sizes) < 20: return None
     last = sizes[-1]
     run = 1
     for i in range(len(sizes)-2, -1, -1):
         if sizes[i] == last: run += 1
         else: break
-        
     if run >= 5: return {"dir": 1 - last, "conf": 75, "name": "DragonReversal"}
-    
     ma20 = sum(sizes[-20:])/20
     std = math.sqrt(sum((x-ma20)**2 for x in sizes[-20:])/20)
     if std > 0.1:
@@ -297,9 +245,7 @@ def agent_mean_rev(sizes):
     return None
 
 def agent_pattern(sizes, nums):
-    """Agent 3: Markov Chains and N-Grams."""
     if len(sizes) < 30: return None
-    # N-Gram (Last 2 sequence)
     seq = tuple(sizes[-2:])
     b_count = matches = 0
     for i in range(len(sizes)-2):
@@ -313,81 +259,77 @@ def agent_pattern(sizes, nums):
     return None
 
 # =========================
-# META-ENSEMBLE PREDICTOR
+# PREDICTOR & RISK ENGINE
 # =========================
 def generate_prediction():
     if len(STATE.history) < CFG.min_history: return None
     sizes = [x["size"] for x in STATE.history]
     nums = [x["num"] for x in STATE.history]
     
-    # 1. Update HMM Regime
     regime = STATE.hmm.update(sizes)
-    
-    # 2. Get Fractal Dimension
     fd = calculate_fractal_dimension(sizes)
     
-    # 3. Get Agent Predictions
     a_trend = agent_trend(sizes)
     a_meanrev = agent_mean_rev(sizes)
     a_pattern = agent_pattern(sizes, nums)
     
-    agents = [
-        ("TrendAgent", a_trend),
-        ("MeanRevAgent", a_meanrev),
-        ("PatternAgent", a_pattern)
-    ]
+    # 🔥 FIX 1: TREND FILTER (Don't fight the trend)
+    if regime == "TRENDING_BIG" and a_meanrev and a_meanrev["dir"] == 0:
+        a_meanrev = None # Ignore reversal if we are in a BIG trend
+    elif regime == "TRENDING_SMALL" and a_meanrev and a_meanrev["dir"] == 1:
+        a_meanrev = None
+        
+    agents = [("TrendAgent", a_trend), ("MeanRevAgent", a_meanrev), ("PatternAgent", a_pattern)]
     
-    # 4. Get Meta-Learner Weights
+    # 🔥 FIX 2: FALLBACK AGENT (Never leave it empty)
+    if not any(p for _, p in agents):
+        # If no agent fires, use a simple flip (chaos) or follow last
+        fallback_dir = 1 - sizes[-1] if random.random() > 0.5 else sizes[-1]
+        agents.append(("FallbackAgent", {"dir": fallback_dir, "conf": 55, "name": "Fallback"}))
+
     weights = STATE.meta.get_weights()
-    
-    # 5. Combine into Log-Odds
     total_log_odds = 0.0
     active_signals = []
     
     for agent_name, pred in agents:
         if not pred: continue
-        w = weights[agent_name]
-        
-        # Convert confidence to logit
+        w = weights.get(agent_name, 1.0)
         p_det = pred["conf"] / 100.0
         if pred["dir"] == 0: p_det = 1.0 - p_det
-        
         z = math.log(p_det / (1 - p_det))
-        
-        # Apply weight
         weight_applied = z * w
         if pred["dir"] == 0: weight_applied = -weight_applied
-        
         total_log_odds += weight_applied
-        active_signals.append(f"{pred['name']} ({pred['dir']} @ w{w:.1f})")
+        active_signals.append(f"{pred['name']} ({'BIG' if pred['dir']==1 else 'SMALL'})")
     
-    # 6. Fractal Noise Filter
-    if fd > 1.6: # Highly noisy
+    if fd > 1.6:
         total_log_odds *= 0.5
-        active_signals.append("NoiseFilter(HIGH)")
-    
-    # Calculate final probability
-    p_big = 1 / (1 + math.exp(-total_log_odds)) if total_log_odds != 0 else 0.5
-    pred_dir = 1 if p_big >= 0.5 else 0
-    
-    # 7. Risk Engine (No SKIP, Aggressive Compounding)
+        active_signals.append("NoiseFilter")
+
+    # 🔥 FIX 3: TIE BREAKER
+    if total_log_odds == 0.0:
+        p_big = 0.5
+        pred_dir = 1 - sizes[-1] # Flip the last result if 50/50 tie
+    else:
+        p_big = 1 / (1 + math.exp(-total_log_odds))
+        pred_dir = 1 if p_big > 0.5 else 0
+
+    # Risk Engine
     stake = "1x"
     if STATE.loss_streak >= 2:
-        stake = "0.5x" # Reduce risk during bad times
-        active_signals.append("RiskEngine(DEFENSIVE)")
+        stake = "0.5x"
+        active_signals.append("DefensiveMode")
     elif STATE.win_streak >= 2:
-        stake = "2x" # Compound during good times
-        active_signals.append("RiskEngine(AGGRESSIVE)")
-        
-    if abs(p_big - 0.5) > 0.25: # Huge edge
-        stake = "2.5x" if stake != "0.5x" else "1x"
+        stake = "2x"
+        active_signals.append("AggressiveMode")
 
-    # 8. Number Picker (Fibonacci + Dirichlet)
-    pool = range(5, 10) if pred_dir == 1 else range(0, 5)
-    freq = Counter(nums[-20:])
-    # Bias towards numbers near the middle of the range
-    target = 7 if pred_dir == 1 else 2
-    num = max(pool, key=lambda x: freq[x] + (1 if abs(x - target) <= 1 else 0))
+    # 🔥 FIX 4: SMART NUMBER PICKER (Avoid getting stuck on 5)
+    pool = list(range(5, 10)) if pred_dir == 1 else list(range(0, 5))
+    freq = Counter(nums[-15:])
+    # Pick the number with highest frequency, or random if tie
+    max_freq = max([freq[x] for x in pool]) if freq else 0
+    best_nums = [x for x in pool if freq[x] == max_freq]
+    num = random.choice(best_nums)
 
     issue = str(int(STATE.history[-1]["issue"]) + 1)
     
@@ -396,32 +338,20 @@ def generate_prediction():
         "p_big": p_big, "confidence": int(50 + abs(p_big - 0.5)*100), "raw_conf": int(50 + abs(p_big - 0.5)*100),
         "consensus": max(p_big, 1-p_big), "mode": regime, "regime": regime,
         "logic": ", ".join(active_signals), "sigs": [{"name": s, "dir": pred_dir} for s in active_signals],
-        "deferral": None, "stake": stake,
-        "details": {
-            "agents": {a: p for a, p in agents if p},
-            "fd": fd
-        }
+        "stake": stake,
+        "details": {"agents": {a: p for a, p in agents if p}, "fd": fd}
     }
 
 def learn_from_resolution(res: dict):
     actual_size = 1 if res["actual_size"] == "BIG" else 0
     details = res.get("details") or {}
     agents = details.get("agents", {})
-    
-    # Update Meta-Learner
     for agent_name, pred in agents.items():
-        if pred:
-            STATE.meta.record(agent_name, pred["dir"] == actual_size)
-
-    # Update streaks
+        if pred: STATE.meta.record(agent_name, pred["dir"] == actual_size)
     if res["win"]:
-        STATE.loss_streak = 0
-        STATE.win_streak += 1
+        STATE.loss_streak = 0; STATE.win_streak += 1
     else:
-        STATE.loss_streak += 1
-        STATE.win_streak = 0
-
-    STATE.save_persisted()
+        STATE.loss_streak += 1; STATE.win_streak = 0
 
 async def fetch_data(session):
     try:
@@ -446,26 +376,23 @@ async def fetch_data(session):
     except Exception: return False
 
 # =========================
-# FORMATTING & UI
+# FORMATTING & MAIN
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
     sig_text = "\n".join(f"  🔹 {h(s['name'])}" for s in p["sigs"])
-    
     stake_emoji = {"2.5x": "🚀 2.5x", "2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x"}.get(p['stake'], "1x")
-    regime_emoji = "📈" if "TRENDING" in p['regime'] else "〰️"
-
+    
     return f"""
 📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
-🧠 <b>AI Regime</b>: {regime_emoji} {h(p['regime'])}
+🧠 <b>AI Regime</b>: <b>{h(p['regime'])}</b>
 🎲 <b>P(BIG)</b>: <b>{p['p_big']*100:.1f}%</b>
-📈 <b>Confidence</b>: <b>{p['confidence']}%</b>
 💰 <b>Risk Stake</b>: <b>{stake_emoji}</b>
 
-🔎 <b>Meta-Agents</b>:
+🔎 <b>Active Agents</b>:
 {sig_text}
 
 ━━━━━━━━━━━━━━━━━━
@@ -475,7 +402,7 @@ def format_prediction(p, recent_rows):
 """
 
 def format_result(res):
-    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])} <i>(Stake: {res['stake']})</i>\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
+    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
 
 async def send_msg(app, text, retries=3):
     for _ in range(retries):
@@ -486,19 +413,13 @@ async def send_msg(app, text, retries=3):
         except Exception as e: log.error(f"Send error: {e}"); break
     return False
 
-# =========================
-# WORKER LOOP
-# =========================
 async def worker_loop(app, session):
-    log.info(f"{CFG.bot_name} started...")
     last_processed_issue = None
-
     while True:
         try:
             if await fetch_data(session):
                 hist_dict = {x["issue"]: x for x in STATE.history}
                 resolved = STORE.resolve_pending(hist_dict)
-                
                 for res in resolved:
                     learn_from_resolution(res)
                     await send_msg(app, format_result(res))
@@ -518,42 +439,28 @@ async def worker_loop(app, session):
         except Exception as e:
             log.exception(f"Loop error: {e}"); await asyncio.sleep(2)
 
-# =========================
-# MAIN (WEBHOOK & POLLING)
-# =========================
-async def handle_ping(request):
-    return web.Response(text="V500 is running!")
+async def handle_ping(request): return web.Response(text="V600 is running!")
 
 async def main():
     CFG.validate()
     if not CFG.telegram_token: raise RuntimeError("TG_TOKEN env variable is empty")
-
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
     
     async with app:
         await app.start()
-        
         port = int(os.environ.get("PORT", 8080))
-        
         if CFG.webhook_url:
-            # WEBHOOK MODE (Render)
             webhook_path = f"/webhook/{CFG.telegram_token}"
             await app.bot.set_webhook(url=f"{CFG.webhook_url}{webhook_path}", drop_pending_updates=True)
-            log.info(f"Webhook set to {CFG.webhook_url}")
-            
             web_app = web.Application()
             web_app.router.add_get("/", handle_ping)
             web_app.router.add_post(webhook_path, app.update_queue.put)
-            
             runner = web.AppRunner(web_app)
             await runner.setup()
             await web.TCPSite(runner, "0.0.0.0", port).start()
-            log.info(f"Web server running on port {port}")
         else:
-            # POLLING MODE (Local)
             await app.bot.delete_webhook(drop_pending_updates=True)
             await app.updater.start_polling(drop_pending_updates=True)
-            log.info("Polling started")
 
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(worker_loop(app, session))
