@@ -1,14 +1,10 @@
 """
-V900 FIXED WORKING VERSION
+V901 FIXED WORKING VERSION
 ================================
-- Only uses real API URL by default
-- No google.com fallback
-- JSON-only parsing
-- 429 retry/backoff
-- uses last-good history if API fails
-- exact issue matching
-- robust Telegram sending
-- safe Render startup
+- Increased timeout & retries (cloud run cold starts)
+- Removed strict Content-Type check
+- Added Local JSON Cache (works even if API is down entirely)
+- Uses User-Agent header (prevents blocking)
 """
 
 import asyncio
@@ -42,10 +38,11 @@ class Config:
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
     db_path: str = os.environ.get("DB_PATH", "v900_fixed_working.db")
+    cache_file: str = "history_cache.json"  # NEW: Local backup cache
     log_dir: str = "logs"
     fetch_every: float = 1.0
-    request_timeout: float = 12.0
-    bot_name: str = "V900 FIXED"
+    request_timeout: float = 30.0  # FIXED: Increased from 12 to 30 for Cloud Run
+    bot_name: str = "V901 FIXED"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -78,17 +75,50 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_fixed_working.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v901_fixed.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 
 setup_logging()
-log = logging.getLogger("v900")
+log = logging.getLogger("v901")
 
 
 def h(x: Any) -> str:
     return html.escape(str(x))
+
+
+# ============================================================
+# STATE & CACHE HELPERS
+# ============================================================
+class BotState:
+    def __init__(self):
+        self.history = []
+        self.loss_streak = 0
+        self.win_streak = 0
+
+    def save_cache(self):
+        """Save history to local file so bot survives API downtime."""
+        try:
+            with open(CFG.cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.history[-1000:], f)
+        except Exception as e:
+            log.warning(f"Failed to save cache: {e}")
+
+    def load_cache(self):
+        """Load history from local file on startup."""
+        try:
+            if os.path.exists(CFG.cache_file):
+                with open(CFG.cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list) and data:
+                        self.history = data
+                        log.info(f"Loaded {len(self.history)} records from local cache.")
+        except Exception as e:
+            log.warning(f"Failed to load cache: {e}")
+
+
+STATE = BotState()
 
 
 # ============================================================
@@ -108,7 +138,6 @@ def safe_int(x, default=0):
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None:
         return None
-
     if isinstance(value, str):
         value = value.strip()
         if value == "":
@@ -118,7 +147,6 @@ def normalize_issue(value: Any) -> Optional[int]:
         digits = "".join(ch for ch in value if ch.isdigit())
         if digits:
             return int(digits)
-
     try:
         return int(value)
     except Exception:
@@ -185,7 +213,6 @@ def volatility(values: List[int], window: int = 20) -> float:
 def detect_regime(sizes: List[int]) -> str:
     if len(sizes) < 8:
         return "COLD"
-
     run = trailing_run(sizes)
     alt = alternating_score(sizes, 10)
     bp = block_pattern(sizes, 10)
@@ -207,7 +234,6 @@ def detect_regime(sizes: List[int]) -> str:
 def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
     if len(history) < window + 4:
         return 0.0
-
     current = tuple(x["size"] for x in history[-window:])
     repeats = 0
     for i in range(len(history) - window - 1, 0, -1):
@@ -222,7 +248,6 @@ def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> fl
 def signal_strength(history: List[Dict[str, Any]]) -> float:
     if len(history) < 8:
         return 0.2
-
     sizes = [x["size"] for x in history]
     regime = detect_regime(sizes)
     run = trailing_run(sizes)
@@ -231,28 +256,14 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     ratio = ratio_big(sizes, 20)
 
     s = 0.0
-    if regime == "TRAP":
-        s += 0.35
-    if regime == "TREND":
-        s += 0.25
-    if regime == "ALTERNATING":
-        s += 0.30
-    if bp:
-        s += 0.20
-    if run >= 3:
-        s += 0.25
-    if abs(ratio - 0.5) > 0.18:
-        s += 0.15
-    if alt >= 0.6:
-        s += 0.15
-
+    if regime == "TRAP": s += 0.35
+    if regime == "TREND": s += 0.25
+    if regime == "ALTERNATING": s += 0.30
+    if bp: s += 0.20
+    if run >= 3: s += 0.25
+    if abs(ratio - 0.5) > 0.18: s += 0.15
+    if alt >= 0.6: s += 0.15
     return min(1.0, s)
-
-
-# ============================================================
-# PATTERN MEMORY
-# ============================================================
-PATTERN_DB: Dict[str, Dict[str, int]] = {}
 
 
 # ============================================================
@@ -280,38 +291,24 @@ class Storage:
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS signal_weights (
-                    name TEXT PRIMARY KEY,
-                    weight REAL DEFAULT 1.0,
-                    hits INTEGER DEFAULT 0,
-                    misses INTEGER DEFAULT 0,
-                    updated_at REAL DEFAULT 0
+                    name TEXT PRIMARY KEY, weight REAL DEFAULT 1.0, hits INTEGER DEFAULT 0,
+                    misses INTEGER DEFAULT 0, updated_at REAL DEFAULT 0
                 )
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS pattern_stats (
-                    pattern_key TEXT PRIMARY KEY,
-                    window INTEGER,
-                    big_count INTEGER DEFAULT 0,
-                    small_count INTEGER DEFAULT 0,
-                    total_count INTEGER DEFAULT 0,
-                    last_seen REAL DEFAULT 0
+                    pattern_key TEXT PRIMARY KEY, window INTEGER, big_count INTEGER DEFAULT 0,
+                    small_count INTEGER DEFAULT 0, total_count INTEGER DEFAULT 0, last_seen REAL DEFAULT 0
                 )
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS num_stats (
-                    num INTEGER PRIMARY KEY,
-                    big_count INTEGER DEFAULT 0,
-                    small_count INTEGER DEFAULT 0,
-                    total_count INTEGER DEFAULT 0
+                    num INTEGER PRIMARY KEY, big_count INTEGER DEFAULT 0, small_count INTEGER DEFAULT 0, total_count INTEGER DEFAULT 0
                 )
             """)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS model_state (
-                    name TEXT PRIMARY KEY,
-                    weight REAL DEFAULT 1.0,
-                    wins INTEGER DEFAULT 0,
-                    losses INTEGER DEFAULT 0,
-                    updated_at REAL DEFAULT 0
+                    name TEXT PRIMARY KEY, weight REAL DEFAULT 1.0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, updated_at REAL DEFAULT 0
                 )
             """)
             c.execute("CREATE TABLE IF NOT EXISTS state_kv (key TEXT PRIMARY KEY, value TEXT)")
@@ -342,265 +339,130 @@ class Storage:
 
         for row in rows:
             issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake = row
-            act = history_dict.get(str(issue))
-            if act is None:
-                act = history_dict.get(issue)
+            act = history_dict.get(str(issue)) or history_dict.get(issue)
             if act is None:
                 continue
 
             act_size = "BIG" if act["size"] == 1 else "SMALL"
             win = (p_size == act_size)
 
-            if win and p_num == act["num"]:
-                status = "JACK 🏆"
-            elif win:
-                status = "WIN ✅"
-            else:
-                status = "LOSS ❌"
+            if win and p_num == act["num"]: status = "JACK 🏆"
+            elif win: status = "WIN ✅"
+            else: status = "LOSS ❌"
 
             with self._conn() as c:
-                c.execute(
-                    "UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?",
-                    (status, act["num"], act_size, issue)
-                )
+                c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?", (status, act["num"], act_size, issue))
 
             resolved.append({
-                "issue": issue,
-                "size": p_size,
-                "num": p_num,
-                "actual_num": act["num"],
-                "actual_size": act_size,
-                "status": status,
-                "mode": mode,
-                "win": win,
-                "raw_conf": raw_conf,
-                "regime": regime,
+                "issue": issue, "size": p_size, "num": p_num, "actual_num": act["num"],
+                "actual_size": act_size, "status": status, "mode": mode, "win": win,
+                "raw_conf": raw_conf, "regime": regime,
                 "details": json.loads(details_json) if details_json else {},
                 "sigs": json.loads(sigs_json) if sigs_json else [],
                 "p_big": p_big if p_big is not None else 0.5,
-                "calibrated_conf": cal_conf or 50,
-                "consensus": consensus or 0.5,
-                "stake": stake or "1x"
+                "calibrated_conf": cal_conf or 50, "consensus": consensus or 0.5, "stake": stake or "1x"
             })
-
         return resolved
 
     def recent_outcomes(self, limit: int = 12):
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
-                (limit,)
-            ).fetchall()
+            rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
     def ensure_signal(self, name: str):
         with self._conn() as c:
-            row = c.execute("SELECT weight FROM signal_weights WHERE name=?", (name,)).fetchone()
-            if row is None:
-                c.execute(
-                    "INSERT INTO signal_weights (name, weight, hits, misses, updated_at) VALUES (?, ?, 0, 0, ?)",
-                    (name, 1.0, time.time())
-                )
+            if c.execute("SELECT weight FROM signal_weights WHERE name=?", (name,)).fetchone() is None:
+                c.execute("INSERT INTO signal_weights (name, weight, hits, misses, updated_at) VALUES (?, ?, 0, 0, ?)", (name, 1.0, time.time()))
 
     def update_signal_weight(self, name: str, outcome_correct: bool):
         self.ensure_signal(name)
         with self._conn() as c:
             row = c.execute("SELECT weight, hits, misses FROM signal_weights WHERE name=?", (name,)).fetchone()
-            if row is None:
-                current = 1.0
-                hits = 0
-                misses = 0
-            else:
-                current, hits, misses = row
-                current = float(current)
-
+            current, hits, misses = row if row else (1.0, 0, 0)
+            current = float(current)
             if outcome_correct:
-                new_weight = clamp(current * 1.12, 0.35, 6.0)
-                hits += 1
+                new_weight = clamp(current * 1.12, 0.35, 6.0); hits += 1
             else:
-                new_weight = clamp(current * 0.82, 0.2, 6.0)
-                misses += 1
-
-            c.execute(
-                "UPDATE signal_weights SET weight=?, hits=?, misses=?, updated_at=? WHERE name=?",
-                (new_weight, hits, misses, time.time(), name)
-            )
+                new_weight = clamp(current * 0.82, 0.2, 6.0); misses += 1
+            c.execute("UPDATE signal_weights SET weight=?, hits=?, misses=?, updated_at=? WHERE name=?", (new_weight, hits, misses, time.time(), name))
 
     def ensure_model_state(self, name: str):
         with self._conn() as c:
-            row = c.execute("SELECT weight FROM model_state WHERE name=?", (name,)).fetchone()
-            if row is None:
-                c.execute(
-                    "INSERT INTO model_state (name, weight, wins, losses, updated_at) VALUES (?, ?, 0, 0, ?)",
-                    (name, 1.0, time.time())
-                )
+            if c.execute("SELECT weight FROM model_state WHERE name=?", (name,)).fetchone() is None:
+                c.execute("INSERT INTO model_state (name, weight, wins, losses, updated_at) VALUES (?, ?, 0, 0, ?)", (name, 1.0, time.time()))
 
     def update_model_state(self, name: str, correct: bool):
         self.ensure_model_state(name)
         with self._conn() as c:
             row = c.execute("SELECT weight, wins, losses FROM model_state WHERE name=?", (name,)).fetchone()
-            if row is None:
-                current = 1.0
-                wins = 0
-                losses = 0
-            else:
-                current, wins, losses = row
-                current = float(current)
-
+            current, wins, losses = row if row else (1.0, 0, 0)
+            current = float(current)
             if correct:
-                new_weight = clamp(current * 1.18, 0.25, 10.0)
-                wins += 1
+                new_weight = clamp(current * 1.18, 0.25, 10.0); wins += 1
             else:
-                new_weight = clamp(current * 0.82, 0.18, 10.0)
-                losses += 1
-
-            c.execute(
-                "UPDATE model_state SET weight=?, wins=?, losses=?, updated_at=? WHERE name=?",
-                (new_weight, wins, losses, time.time(), name)
-            )
+                new_weight = clamp(current * 0.82, 0.18, 10.0); losses += 1
+            c.execute("UPDATE model_state SET weight=?, wins=?, losses=?, updated_at=? WHERE name=?", (new_weight, wins, losses, time.time(), name))
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
         for window in [3, 5, 8, 12, 20, 30, 50, 100]:
-            if len(sizes) < window:
-                continue
+            if len(sizes) < window: continue
             seq = tuple(sizes[-window:])
             key = f"{window}:{json.dumps(list(seq))}"
-
             with self._conn() as c:
-                row = c.execute(
-                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
-                    (key,),
-                ).fetchone()
-
+                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
                 if row is None:
-                    c.execute(
-                        "INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-                        (key, window, 0, 0, 0, time.time()),
-                    )
+                    c.execute("INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, 0, 0, 0, ?)", (key, window, time.time()))
                     row = (0, 0, 0)
-
                 big_count, small_count, total_count = row
-                big_count = int(big_count)
-                small_count = int(small_count)
-                total_count = int(total_count)
-
-                if actual_size == 1:
-                    big_count += 1
-                else:
-                    small_count += 1
+                if actual_size == 1: big_count += 1
+                else: small_count += 1
                 total_count += 1
-
-                c.execute(
-                    "UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?",
-                    (big_count, small_count, total_count, time.time(), key),
-                )
-
-                PATTERN_DB[key] = {
-                    "big": big_count,
-                    "total": total_count,
-                }
+                c.execute("UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?", (big_count, small_count, total_count, time.time(), key))
 
     def update_num_memory(self, actual_num: int, actual_size: int):
         with self._conn() as c:
             row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (actual_num,)).fetchone()
             if row is None:
-                c.execute("INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
-                          (actual_num, 0, 0, 0))
+                c.execute("INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, 0, 0, 0)", (actual_num,))
                 row = (0, 0, 0)
-
             big_count, small_count, total_count = row
-            big_count = int(big_count)
-            small_count = int(small_count)
-            total_count = int(total_count)
-
-            if actual_size == 1:
-                big_count += 1
-            else:
-                small_count += 1
+            if actual_size == 1: big_count += 1
+            else: small_count += 1
             total_count += 1
-
-            c.execute(
-                "UPDATE num_stats SET big_count=?, small_count=?, total_count=? WHERE num=?",
-                (big_count, small_count, total_count, actual_num),
-            )
+            c.execute("UPDATE num_stats SET big_count=?, small_count=?, total_count=? WHERE num=?", (big_count, small_count, total_count, actual_num))
 
     def get_exact_pattern_probability(self, sizes: List[int]) -> Dict[str, Any]:
         matches = []
         for window in [3, 5, 8, 12, 20, 30, 50, 100]:
-            if len(sizes) < window:
-                continue
+            if len(sizes) < window: continue
             seq = tuple(sizes[-window:])
             key = f"{window}:{json.dumps(list(seq))}"
-
             with self._conn() as c:
-                row = c.execute(
-                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
-                    (key,),
-                ).fetchone()
-
-            if row is None:
-                continue
-
-            big_count, small_count, total_count = row
-            if total_count <= 0:
-                continue
-            p_big = big_count / total_count
-            matches.append({
-                "window": window,
-                "p_big": p_big,
-                "count": int(total_count),
-                "big_count": int(big_count),
-                "small_count": int(small_count),
-            })
-
-        if not matches:
-            return {"p_big": 0.5, "matched": 0, "matches": []}
-
+                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+            if row and row[2] > 0:
+                big_count, small_count, total_count = row
+                matches.append({"window": window, "p_big": big_count / total_count, "count": int(total_count)})
+        if not matches: return {"p_big": 0.5, "matched": 0, "matches": []}
         total_count = sum(m["count"] for m in matches)
         weighted_p_big = sum(m["p_big"] * m["count"] for m in matches) / total_count
-        return {
-            "p_big": weighted_p_big,
-            "matched": len(matches),
-            "matches": matches,
-        }
+        return {"p_big": weighted_p_big, "matched": len(matches), "matches": matches}
 
     def get_num_bias(self, pred_dir: int, pool: List[int]) -> Dict[int, float]:
         weights = {}
         for n in pool:
             with self._conn() as c:
                 row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (n,)).fetchone()
-
-            if row is None:
-                big_count = 0
-                small_count = 0
-                total_count = 0
-            else:
-                big_count, small_count, total_count = row
-                big_count = int(big_count)
-                small_count = int(small_count)
-                total_count = int(total_count)
-
-            if total_count <= 0:
-                p_big = 0.5
-            else:
-                p_big = big_count / total_count
-
+            big_count, small_count, total_count = row if row else (0, 0, 0)
+            p_big = big_count / total_count if total_count > 0 else 0.5
+            
             if pred_dir == 1:
                 weights[n] = 1.0 + p_big * 4.0
+                if n in (6, 7, 8): weights[n] += 2.0
+                if n in (5, 9): weights[n] += 1.0
             else:
                 weights[n] = 1.0 + (1.0 - p_big) * 4.0
-
-            if pred_dir == 1:
-                if n in (6, 7, 8):
-                    weights[n] += 2.0
-                if n in (5, 9):
-                    weights[n] += 1.0
-            else:
-                if n in (1, 2, 3):
-                    weights[n] += 2.0
-                if n in (0, 4):
-                    weights[n] += 1.0
-
+                if n in (1, 2, 3): weights[n] += 2.0
+                if n in (0, 4): weights[n] += 1.0
         return weights
 
 
@@ -608,127 +470,56 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# STATE
-# ============================================================
-class BotState:
-    def __init__(self):
-        self.history = []
-        self.loss_streak = 0
-        self.win_streak = 0
-
-
-STATE = BotState()
-
-
-# ============================================================
-# DEEP PATTERN FEATURES
+# DEEP PATTERN & PREDICTION LOGIC
 # ============================================================
 def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not history:
-        return {}
-
+    if not history: return {}
     sizes = [x["size"] for x in history]
     nums = [x["num"] for x in history]
     regime = detect_regime(sizes)
-
     return {
-        "last": sizes[-1],
-        "run": trailing_run(sizes),
-        "ratio_big": ratio_big(sizes, 20),
-        "ratio_big_10": ratio_big(sizes, 10),
-        "ratio_big_30": ratio_big(sizes, 30),
-        "volatility": volatility(sizes, 20),
-        "alternation": alternating_score(sizes, 12),
-        "block": 1.0 if block_pattern(sizes, 10) else 0.0,
-        "regime": regime,
+        "last": sizes[-1], "run": trailing_run(sizes), "ratio_big": ratio_big(sizes, 20),
+        "volatility": volatility(sizes, 20), "alternation": alternating_score(sizes, 12),
+        "block": 1.0 if block_pattern(sizes, 10) else 0.0, "regime": regime,
         "stale_penalty": stale_pattern_penalty(history, 12),
-        "recent_big_count": sum(1 for s in sizes[-12:] if s == 1),
-        "recent_small_count": sum(1 for s in sizes[-12:] if s == 0),
-        "last_3": tuple(sizes[-3:]),
-        "last_5": tuple(sizes[-5:]),
-        "last_8": tuple(sizes[-8:]),
-        "last_10": tuple(sizes[-10:]),
-        "num_last": nums[-1] if nums else None,
-        "num_freq": Counter(nums[-20:]),
-        "size_freq": Counter(sizes[-20:]),
-        "big_run_count": sum(1 for i in range(1, len(sizes)) if sizes[i] == 1 and sizes[i-1] == 1),
-        "small_run_count": sum(1 for i in range(1, len(sizes)) if sizes[i] == 0 and sizes[i-1] == 0),
-        "parity_big": sum(1 for n in nums[-20:] if n % 2 == 1),
-        "parity_small": sum(1 for n in nums[-20:] if n % 2 == 0),
     }
 
-
-# ============================================================
-# EXACT SUFFIX MEMORY
-# ============================================================
 def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8:
-        return 0.5
-
+    if len(history) < 8: return 0.5
     sizes = [x["size"] for x in history]
     matches = []
-
     for window in [3, 5, 8, 12, 20, 30, 50, 100]:
-        if len(sizes) < window:
-            continue
-        seq = tuple(sizes[-window:])
-        key = f"{window}:{json.dumps(list(seq))}"
-        if key in PATTERN_DB:
-            total = PATTERN_DB[key]["total"]
-            big = PATTERN_DB[key]["big"]
-            if total > 0:
-                matches.append((window, big / total, total))
-
-    if not matches:
-        return 0.5
-
-    total_weight = sum(v for _, _, v in matches)
-    if total_weight <= 0:
-        return 0.5
-
-    return sum(p * v for _, p, v in matches) / total_weight
-
+        if len(sizes) < window: continue
+        key = f"{window}:{json.dumps(list(tuple(sizes[-window:])))}"
+        # Note: using STORE DB fetch directly to avoid relying on global PATTERN_DB
+        res = STORE.get_exact_pattern_probability(sizes)
+        return res["p_big"]
+    return 0.5
 
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     run = trailing_run(sizes)
-    if run >= 5:
-        return 1.0 if sizes[-1] == 1 else 0.0
-    if run >= 3:
-        return 1.0 if sizes[-1] == 0 else 0.0
+    if run >= 5: return 1.0 if sizes[-1] == 1 else 0.0
+    if run >= 3: return 1.0 if sizes[-1] == 0 else 0.0
     return 0.5
-
 
 def model_alternation(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
-    alt = alternating_score(sizes, 12)
-    if alt >= 0.6:
-        return 1.0 - sizes[-1]
-    return 0.5
-
+    return 1.0 - sizes[-1] if alternating_score(sizes, 12) >= 0.6 else 0.5
 
 def model_block(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
-    if block_pattern(sizes, 10):
-        return 1.0 - sizes[-1]
-    return 0.5
-
+    return 1.0 - sizes[-1] if block_pattern(sizes, 10) else 0.5
 
 def model_volatility(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
-    vol = volatility(sizes, 20)
-    if vol > 0.5:
-        return 1.0 - sizes[-1]
-    return 0.5
-
+    return 1.0 - sizes[-1] if volatility(sizes, 20) > 0.5 else 0.5
 
 def model_bias(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     ratio = ratio_big(sizes, 20)
-    if abs(ratio - 0.5) > 0.18:
-        return 1.0 if ratio >= 0.5 else 0.0
+    if abs(ratio - 0.5) > 0.18: return 1.0 if ratio >= 0.5 else 0.0
     return 0.5
-
 
 def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     scores = [
@@ -739,155 +530,27 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         ("Volatility", model_volatility(history)),
         ("Bias", model_bias(history)),
     ]
-
-    weights = {
-        "Exact": 0.35,
-        "Trend": 0.15,
-        "Alternation": 0.15,
-        "Block": 0.10,
-        "Volatility": 0.10,
-        "Bias": 0.15,
-    }
-
+    weights = {"Exact": 0.35, "Trend": 0.15, "Alternation": 0.15, "Block": 0.10, "Volatility": 0.10, "Bias": 0.15}
     regime = detect_regime([x["size"] for x in history])
-    if regime == "TRAP":
-        weights["Exact"] += 0.10
-        weights["Alternation"] += 0.10
-    if regime == "TREND":
-        weights["Trend"] += 0.15
-    if regime == "ALTERNATING":
-        weights["Alternation"] += 0.15
-    if regime == "BLOCK":
-        weights["Block"] += 0.12
+    if regime == "TRAP": weights["Exact"] += 0.10; weights["Alternation"] += 0.10
+    if regime == "TREND": weights["Trend"] += 0.15
+    if regime == "ALTERNATING": weights["Alternation"] += 0.15
+    if regime == "BLOCK": weights["Block"] += 0.12
 
     total_weight = sum(weights.values())
-    final = 0.0
-    for name, score in scores:
-        final += score * weights.get(name, 0.10)
-
-    final = final / total_weight
-    return {
-        "p_big": clamp(final, 0.05, 0.95),
-        "weights": weights,
-        "scores": scores,
-    }
-
-
-def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    sizes = [x["size"] for x in history]
-    ensemble = ensemble_probability(history)
-    p_big = ensemble["p_big"]
-
-    regime = detect_regime(sizes)
-
-    if regime == "TRAP":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "ALTERNATING":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "BLOCK":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "TREND":
-        p_big = sizes[-1]
-    elif regime == "CHOPPY":
-        p_big = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
-
-    stale = stale_pattern_penalty(history, 12)
-    if stale > 0:
-        p_big = p_big * (1.0 - stale)
-
-    strength = signal_strength(history)
-    if strength < 0.45:
-        p_big = 0.5
-
-    pred_dir = 1 if p_big >= 0.5 else 0
-    return {
-        "pred_dir": pred_dir,
-        "p_big": clamp(p_big, 0.05, 0.95),
-        "strength": strength,
-    }
-
-
-def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
-    sizes = [x["size"] for x in history]
-    exact_p = exact_suffix_memory(history)
-    regime = detect_regime(sizes)
-    last = sizes[-1]
-    run = trailing_run(sizes)
-
-    score = 0.5
-    score = (score * 0.40) + (exact_p * 0.60)
-
-    if regime == "TRAP":
-        score = 1.0 - last
-    elif regime == "ALTERNATING":
-        score = 1.0 - last
-    elif regime == "BLOCK":
-        score = 1.0 - last
-    elif regime == "TREND":
-        score = last
-    elif regime == "CHOPPY":
-        score = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
-    else:
-        score = ratio_big(sizes, 20)
-
-    if run >= 3:
-        score = 1.0 - last
-
-    if loss_streak >= 1:
-        score = 1.0 - last
-    if loss_streak >= 2:
-        score = 1.0 - majority_dir(sizes, 6)
-
-    stale = stale_pattern_penalty(history, 12)
-    if stale > 0:
-        score = score * (1.0 - stale)
-        score = 1.0 - score
-
-    strength = signal_strength(history)
-    if strength < 0.45:
-        score = 0.5
-    elif strength < 0.60:
-        score = 0.5 + (score - 0.5) * 0.6
-
-    score = clamp(score, 0.05, 0.95)
-    pred_dir = 1 if score >= 0.5 else 0
-
-    return {
-        "pred_dir": pred_dir,
-        "p_big": score,
-        "strength": strength,
-    }
-
+    final = sum(score * weights.get(name, 0.10) for name, score in scores) / total_weight
+    return {"p_big": clamp(final, 0.05, 0.95)}
 
 def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
-    if not history:
-        return {"pred_dir": 1, "p_big": 0.5, "reason": "empty"}
-
+    if not history: return {"pred_dir": 1, "p_big": 0.5, "reason": "empty"}
     sizes = [x["size"] for x in history]
     regime = detect_regime(sizes)
-    features = deep_pattern_features(history)
-
-    exact_p = exact_suffix_memory(history)
-    trend_p = model_trend(history)
-    alt_p = model_alternation(history)
-    block_p = model_block(history)
-    bias_p = model_bias(history)
-    vol_p = model_volatility(history)
-
-    score = (
-        0.30 * exact_p +
-        0.18 * trend_p +
-        0.15 * alt_p +
-        0.14 * block_p +
-        0.13 * bias_p +
-        0.10 * vol_p
-    )
+    
+    score = ensemble_probability(history)["p_big"]
 
     if loss_streak >= 1:
         score = 1.0 - score
-        if regime in ["TRAP", "ALTERNATING", "BLOCK"]:
-            score = 1.0 - sizes[-1]
-
+        if regime in ["TRAP", "ALTERNATING", "BLOCK"]: score = 1.0 - sizes[-1]
     if loss_streak >= 2:
         score = 1.0 - majority_dir(sizes, 6)
 
@@ -896,44 +559,23 @@ def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str
         score = score * (1.0 - stale)
         score = 1.0 - score
 
-    if regime == "TRAP":
-        score = 1.0 - sizes[-1]
-    elif regime == "ALTERNATING":
-        score = 1.0 - sizes[-1]
-    elif regime == "BLOCK":
-        score = 1.0 - sizes[-1]
-    elif regime == "TREND":
-        score = sizes[-1]
+    if regime in ["TRAP", "ALTERNATING", "BLOCK"]: score = 1.0 - sizes[-1]
+    elif regime == "TREND": score = sizes[-1]
 
     score = clamp(score, 0.05, 0.95)
-
     strength = signal_strength(history)
-    if strength < 0.45:
-        score = 0.5
-
-    pred_dir = 1 if score >= 0.5 else 0
-
+    if strength < 0.45: score = 0.5
+    
     return {
-        "pred_dir": pred_dir,
-        "p_big": score,
-        "strength": strength,
-        "regime": regime,
-        "features": features,
+        "pred_dir": 1 if score >= 0.5 else 0, "p_big": score, 
+        "strength": strength, "regime": regime, "features": deep_pattern_features(history)
     }
 
-
-# ============================================================
-# NUMBER PICKER
-# ============================================================
 def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
     nums = [x["num"] for x in history]
     recent = nums[-250:]
     freq = Counter(recent)
-
     pool = list(range(5, 10)) if pred_dir == 1 else list(range(0, 5))
-    if not pool:
-        pool = list(range(10))
-
     score = defaultdict(float)
 
     bias_map = STORE.get_num_bias(pred_dir, pool)
@@ -943,130 +585,64 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 
     if recent:
         last_num = recent[-1]
-        if pred_dir == 1:
-            for n in range(5, 10):
-                if n != last_num:
-                    score[n] += 0.8
-        else:
-            for n in range(0, 5):
-                if n != last_num:
-                    score[n] += 0.8
+        for n in pool:
+            if n != last_num: score[n] += 0.8
 
     if pred_dir == 1:
-        for n in (6, 7, 8):
-            score[n] += 2.2
-        for n in (5, 9):
-            score[n] += 1.0
+        for n in (6, 7, 8): score[n] += 2.2
+        for n in (5, 9): score[n] += 1.0
     else:
-        for n in (1, 2, 3):
-            score[n] += 2.2
-        for n in (0, 4):
-            score[n] += 1.0
+        for n in (1, 2, 3): score[n] += 2.2
+        for n in (0, 4): score[n] += 1.0
 
     for n in pool:
-        if recent.count(n) >= 4:
-            score[n] *= 0.25
+        if recent.count(n) >= 4: score[n] *= 0.25
 
     if loss_streak >= 2:
         if pred_dir == 1:
-            for n in range(0, 5):
-                score[n] *= 0.12
+            for n in range(0, 5): score[n] *= 0.12
         else:
-            for n in range(5, 10):
-                score[n] *= 0.12
+            for n in range(5, 10): score[n] *= 0.12
 
-    if not score:
-        return random.choice(pool)
+    return max(score, key=score.get) if score else random.choice(pool)
 
-    return max(score, key=score.get)
-
-
-# ============================================================
-# FINAL PREDICTION
-# ============================================================
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
         fallback_dir = 1 if random.random() >= 0.5 else 0
         issue = str(int(STATE.history[-1]["issue"]) + 1) if STATE.history else "1"
         return {
-            "issue": issue,
-            "size": "BIG" if fallback_dir == 1 else "SMALL",
+            "issue": issue, "size": "BIG" if fallback_dir == 1 else "SMALL",
             "num": random.choice([5, 6, 7, 8, 9]) if fallback_dir == 1 else random.choice([0, 1, 2, 3, 4]),
-            "p_big": 0.5,
-            "confidence": 55,
-            "raw_conf": 55,
-            "consensus": 0.5,
-            "mode": "FALLBACK",
-            "regime": "COLD",
-            "logic": "Fallback",
-            "sigs": [{"name": "Fallback", "dir": fallback_dir}],
-            "stake": "0.25x",
+            "p_big": 0.5, "confidence": 55, "raw_conf": 55, "consensus": 0.5,
+            "mode": "FALLBACK", "regime": "COLD", "logic": "Fallback",
+            "sigs": [{"name": "Fallback", "dir": fallback_dir}], "stake": "0.25x",
             "details": {"fallback": True},
         }
 
     history = STATE.history[-2000:]
     side = side_prediction(history, STATE.loss_streak)
-    p_big = side["p_big"]
-    pred_dir = side["pred_dir"]
+    p_big, pred_dir, strength, regime = side["p_big"], side["pred_dir"], side["strength"], side["regime"]
 
-    strength = side["strength"]
-    regime = side["regime"]
+    if STATE.loss_streak >= 1: confidence, stake = 60, "0.25x"
+    elif strength < 0.45: confidence, stake = 58, "0.25x"
+    elif strength < 0.65: confidence, stake = 62, "0.5x"
+    else: confidence, stake = 72, "1x"
 
-    if STATE.loss_streak >= 1:
-        confidence = 60
-        stake = "0.25x"
-    elif strength < 0.45:
-        confidence = 58
-        stake = "0.25x"
-    elif strength < 0.65:
-        confidence = 62
-        stake = "0.5x"
-    else:
-        confidence = 72
-        stake = "1x"
-
-    if STATE.loss_streak >= 2:
-        confidence = 55
-        stake = "0.25x"
+    if STATE.loss_streak >= 2: confidence, stake = 55, "0.25x"
 
     num = choose_number(pred_dir, history, STATE.loss_streak)
     issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
-    sigs = []
-    if regime == "TRAP":
-        sigs.append({"name": "Trap", "dir": pred_dir})
-    if regime == "TREND":
-        sigs.append({"name": "Trend", "dir": pred_dir})
-    if regime == "ALTERNATING":
-        sigs.append({"name": "Alternating", "dir": pred_dir})
-    if regime == "BLOCK":
-        sigs.append({"name": "Block", "dir": pred_dir})
-    if not sigs:
-        sigs.append({"name": "Baseline", "dir": pred_dir})
-
+    sigs = [{"name": regime, "dir": pred_dir}] if regime in ["TRAP", "TREND", "ALTERNATING", "BLOCK"] else [{"name": "Baseline", "dir": pred_dir}]
     mode = "SUPER-RECOVERY" if STATE.loss_streak >= 2 else ("RECOVERY" if STATE.loss_streak >= 1 else "NORMAL")
 
     return {
-        "issue": issue,
-        "size": "BIG" if pred_dir == 1 else "SMALL",
-        "num": num,
-        "p_big": round(clamp(p_big, 0.05, 0.95), 4),
-        "confidence": confidence,
-        "raw_conf": confidence,
-        "consensus": max(p_big, 1 - p_big),
-        "mode": mode,
-        "regime": regime,
-        "logic": ", ".join(s["name"] for s in sigs),
-        "sigs": sigs,
-        "stake": stake,
-        "details": {
-            "strength": strength,
-            "loss_streak": STATE.loss_streak,
-            "regime": regime,
-            "features": side["features"],
-        }
+        "issue": issue, "size": "BIG" if pred_dir == 1 else "SMALL", "num": num,
+        "p_big": round(clamp(p_big, 0.05, 0.95), 4), "confidence": confidence,
+        "raw_conf": confidence, "consensus": max(p_big, 1 - p_big), "mode": mode,
+        "regime": regime, "logic": ", ".join(s["name"] for s in sigs), "sigs": sigs,
+        "stake": stake, "details": {"strength": strength, "loss_streak": STATE.loss_streak, "regime": regime, "features": side["features"]}
     }
-
 
 def learn_from_resolution(res: dict):
     if res["win"]:
@@ -1077,147 +653,103 @@ def learn_from_resolution(res: dict):
         STATE.win_streak = 0
 
     for sig in res.get("sigs", []):
-        name = sig.get("name")
-        if name:
-            STORE.update_signal_weight(name, bool(res["win"]))
+        if sig.get("name"): STORE.update_signal_weight(sig["name"], bool(res["win"]))
 
     if STATE.history:
         actual_size = 1 if res["actual_size"] == "BIG" else 0
         STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
         STORE.update_num_memory(int(res["actual_num"]), actual_size)
 
-    model_names = ["Exact", "Trend", "Alternation", "Block", "Volatility", "Bias"]
-    for name in model_names:
-        STORE.ensure_model_state(name)
+    for name in ["Exact", "Trend", "Alternation", "Block", "Volatility", "Bias"]:
         STORE.update_model_state(name, bool(res["win"]))
 
 
 # ============================================================
-# API PARSE
+# API PARSE & FETCH
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
-    if payload is None:
-        return []
-
-    if isinstance(payload, list):
-        items = payload
+    if payload is None: return []
+    if isinstance(payload, list): items = payload
     elif isinstance(payload, dict):
         if "data" in payload and isinstance(payload["data"], dict):
-            data = payload["data"]
-            if "list" in data and isinstance(data["list"], list):
-                items = data["list"]
-            elif isinstance(data, list):
-                items = data
-            else:
-                items = []
-        elif "result" in payload and isinstance(payload["result"], list):
-            items = payload["result"]
-        elif "items" in payload and isinstance(payload["items"], list):
-            items = payload["items"]
-        elif "history" in payload and isinstance(payload["history"], list):
-            items = payload["history"]
+            items = payload["data"].get("list", [])
+        elif "data" in payload and isinstance(payload["data"], list):
+            items = payload["data"]
         else:
-            items = []
-    else:
-        items = []
+            items = payload.get("result", payload.get("items", payload.get("history", [])))
+    else: items = []
 
-    out = []
-    seen = set()
-
+    out, seen = [], set()
     for item in items:
-        try:
-            if not isinstance(item, dict):
-                continue
+        if not isinstance(item, dict): continue
+        issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
+        if issue is None: continue
+        if str(issue) in seen: continue
+        seen.add(str(issue))
 
-            issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
-            if issue is None:
-                issue = normalize_issue(item.get("issue"))
-            if issue is None:
-                continue
-
-            if str(issue) in seen:
-                continue
-            seen.add(str(issue))
-
-            num = safe_int(item.get("number", item.get("value", 0)), 0)
-            if num < 0 or num > 9:
-                continue
-
-            out.append({
-                "issue": str(issue),
-                "num": num,
-                "size": 1 if num >= 5 else 0
-            })
-        except Exception:
-            continue
-
+        num = safe_int(item.get("number", item.get("value", 0)), 0)
+        if 0 <= num <= 9:
+            out.append({"issue": str(issue), "num": num, "size": 1 if num >= 5 else 0})
+            
     out.sort(key=lambda x: int(x["issue"]))
     return out
 
-
-# ============================================================
-# FETCH DATA WITH BACKOFF
-# ============================================================
 async def fetch_data(session):
     urls = CFG.api_urls()
-    last_good = [x for x in STATE.history]
-
+    
     for url in urls:
-        try:
-            for retry in range(3):
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
-                        if r.status == 429:
-                            wait = (retry + 1) * 2
-                            log.warning("429 from %s. retrying in %ss", url, wait)
-                            await asyncio.sleep(wait)
-                            continue
-
-                        if r.status != 200:
-                            log.warning("HTTP %s from %s", r.status, url)
-                            break
-
-                        content_type = r.headers.get("Content-Type", "").lower()
-                        if "application/json" not in content_type and "text/json" not in content_type:
-                            log.warning("Non-JSON response from %s -> %s", url, content_type)
-                            break
-
-                        payload = await r.json()
-                        parsed = parse_history_payload(payload)
-
-                        if parsed:
-                            STATE.history = parsed[-1000:]
-                            log.info("Fetched history from %s -> %d records", url, len(parsed))
-                            return True
-
-                        log.warning("Empty history payload from %s", url)
+        for retry in range(5):  # Increased retries
+            try:
+                # Added User-Agent to avoid blocks
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
+                    if r.status == 429:
+                        wait = min((retry + 1) * 2, 10)
+                        log.warning("429 from %s. retrying in %ss", url, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    
+                    if r.status != 200:
+                        log.warning("HTTP %s from %s", r.status, url)
                         break
+                    
+                    # Removed strict Content-Type check. Just try to parse JSON.
+                    try:
+                        payload = await r.json(content_type=None)
+                    except Exception as e:
+                        log.warning(f"Failed to parse JSON from {url}: {e}")
+                        break
+                        
+                    parsed = parse_history_payload(payload)
+                    if parsed:
+                        STATE.history = parsed[-1000:]
+                        STATE.save_cache()  # Save to local cache on success
+                        log.info("Fetched history from %s -> %d records", url, len(parsed))
+                        return True
+                    
+                    log.warning("Empty history payload from %s", url)
+                    break
+                    
+            except asyncio.TimeoutError:
+                log.warning("Timeout on %s (attempt %d/5)", url, retry + 1)
+                await asyncio.sleep((retry + 1) * 3)
+            except Exception as e:
+                log.warning("Retry %s failed for %s: %s", retry + 1, url, e)
+                await asyncio.sleep((retry + 1) * 3)
 
-                except Exception as e:
-                    log.warning("Retry %s failed for %s: %s", retry + 1, url, e)
-                    await asyncio.sleep((retry + 1) * 2)
-                    continue
-
-        except Exception as e:
-            log.warning("Fetch exception on %s: %s", url, e)
-
-    if last_good:
-        STATE.history = last_good
-        log.warning("Using last known good history because all API endpoints failed.")
+    if STATE.history:
+        log.warning("Using last known good/cached history because all API endpoints failed.")
         return True
 
-    log.warning("All API endpoints failed and no last-good history exists.")
+    log.warning("All API endpoints failed and no local cache exists.")
     return False
 
 
 # ============================================================
-# FORMATTING
+# FORMATTING & TELEGRAM
 # ============================================================
 def format_prediction(p, recent_rows):
-    recent_text = "".join(
-        f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n"
-        for r in recent_rows[-12:]
-    )
+    recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
     sig_text = "\n".join(f"  🕵️ {h(s['name'])}" for s in p["sigs"])
     stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
 
@@ -1239,38 +771,13 @@ def format_prediction(p, recent_rows):
 ⚡ <i>{h(CFG.bot_name)}</i>
 """
 
-
 def format_result(res):
-    return (
-        f"🎯 <b>Result</b>\n"
-        f"Period: <code>{h(res['issue'][-4:])}</code>\n"
-        f"Pred: {h(res['size'])} {h(res['num'])}\n"
-        f"Act: {h(res['actual_size'])} {h(res['actual_num'])}\n"
-        f"<b>{h(res['status'])}</b>"
-    )
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-async def verify_telegram(app):
-    try:
-        me = await app.bot.get_me()
-        log.info("Telegram verified. Bot username: %s", me.username)
-        return True
-    except Exception:
-        log.exception("Telegram verification failed")
-        return False
-
+    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
 
 async def send_msg(app, text, retries=3):
     for attempt in range(retries):
         try:
-            await app.bot.send_message(
-                chat_id=CFG.parse_chat_id(),
-                text=text,
-                parse_mode="HTML"
-            )
+            await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
             return True
         except Exception as e:
             log.exception("Telegram send failed attempt %s/%s: %s", attempt + 1, retries, e)
@@ -1279,21 +786,16 @@ async def send_msg(app, text, retries=3):
 
 
 # ============================================================
-# WORKER
+# WORKER & MAIN
 # ============================================================
 async def worker_loop(app, session):
     last_processed_issue = None
-
     while True:
         try:
             if await fetch_data(session):
-                hist_dict: Dict[str, Dict[str, Any]] = {}
-                for x in STATE.history:
-                    issue_key = str(x["issue"])
-                    hist_dict[issue_key] = x
-
+                hist_dict = {str(x["issue"]): x for x in STATE.history}
                 resolved = STORE.resolve_pending(hist_dict)
-
+                
                 for res in resolved:
                     learn_from_resolution(res)
                     await send_msg(app, format_result(res))
@@ -1305,41 +807,36 @@ async def worker_loop(app, session):
                 latest_issue = STATE.history[-1]["issue"]
                 next_issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
-                if latest_issue != last_processed_issue:
-                    if not STORE.prediction_exists(next_issue):
-                        p = generate_prediction()
-                        if p:
-                            STORE.save_prediction(p)
-                            await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
-                            last_processed_issue = latest_issue
+                if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
+                    p = generate_prediction()
+                    if p:
+                        STORE.save_prediction(p)
+                        await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
+                        last_processed_issue = latest_issue
 
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
         except Exception as e:
             log.exception(f"Loop error: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
-
-# ============================================================
-# MAIN
-# ============================================================
 async def main():
     CFG.validate()
+    STATE.load_cache()  # Load history from disk immediately on startup
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
-
     async with app:
         await app.start()
-
-        ok = await verify_telegram(app)
-        if not ok:
-            log.error("Bot not valid. Check TG_TOKEN and TG_CHAT.")
+        try:
+            me = await app.bot.get_me()
+            log.info("Telegram verified. Bot username: %s", me.username)
+        except Exception:
+            log.exception("Telegram verification failed. Check TG_TOKEN.")
             return
 
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(worker_loop(app, session))
             await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
