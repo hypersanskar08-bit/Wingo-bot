@@ -1,4 +1,3 @@
-python name=main.py
 """
 V900 ADVANCED + PERIOD FIXED + SYNTAX FIXED
 ===========================================
