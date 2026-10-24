@@ -1,12 +1,12 @@
 """
-V900 BEST FAST MODEL - FULL FIXED CODE
-======================================
-- Reads last 1000 results from API
+V900 BEST FAST MODEL - FULL FIXED TELEGRAM VERSION
+===================================================
+- Reads last 1000 results
 - Exact multi-window pattern memory
-- Ensemble of pattern models
-- Risk-aware fallback
-- Telegram bot + SQLite
-- Render-ready fixed version
+- Ensemble model
+- Anti-trap logic
+- Telegram validation + safe sending
+- Render-ready
 """
 
 import asyncio
@@ -956,16 +956,28 @@ def format_result(res):
 # =========================
 # TELEGRAM SEND
 # =========================
+async def verify_telegram(app):
+    try:
+        me = await app.bot.get_me()
+        log.info("Telegram verified successfully. Bot username: %s", me.username)
+        return True
+    except Exception:
+        log.exception("Telegram verification failed. Check TG_TOKEN and chat_id.")
+        return False
+
+
 async def send_msg(app, text, retries=3):
-    for _ in range(retries):
+    for attempt in range(retries):
         try:
-            await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
+            await app.bot.send_message(
+                chat_id=CFG.parse_chat_id(),
+                text=text,
+                parse_mode="HTML"
+            )
             return True
-        except (TimedOut, NetworkError):
-            await asyncio.sleep(1)
         except Exception as e:
-            log.error(f"Send error: {e}")
-            break
+            log.exception("Telegram send failed attempt %s/%s: %s", attempt + 1, retries, e)
+            await asyncio.sleep(1)
     return False
 
 
@@ -1017,6 +1029,12 @@ async def main():
 
     async with app:
         await app.start()
+
+        ok = await verify_telegram(app)
+        if not ok:
+            log.error("Bot is not valid. Confirm TG_TOKEN and TG_CHAT.")
+            return
+
         port = int(os.environ.get("PORT", 8080))
 
         if CFG.webhook_url:
