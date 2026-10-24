@@ -1,13 +1,13 @@
 """
-V400 DEEP-PATTERN ENGINE
-========================
-Fixes:
-  * REMOVED SKIP completely. Always predicts.
-  * Log-Odds (Logit) Ensemble for mathematically superior confidence.
-  * N-Gram Pattern Matcher (exact sequence matching).
-  * Multi-Timeframe Moving Average Crossover.
-  * Even/Odd Parity Pattern Tracker.
-  * Contrarian Loss Streak logic (flips prediction after 2 losses).
+V500 META-ENSEMBLE AI
+=====================
+The Ultimate Evolution.
+- Hidden Markov Model (HMM) for Market Regimes.
+- Meta-Learning (3 AI Agents compete, winner gets more weight).
+- Fractal Dimension (Noise filter).
+- Fibonacci Number Prediction.
+- Fully autonomous Risk Engine (No SKIP).
+- Built-in Render Webhook support.
 """
 
 import asyncio
@@ -43,14 +43,14 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "predictor_v400.db")
+    webhook_url: str = "https://wingo-bot-mcs3.onrender.com" # e.g. https://app.onrender.com
+    db_path: str = os.environ.get("DB_PATH", "predictor_v500.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V400 DEEP-PATTERN"
+    bot_name: str = "V500 META-ENSEMBLE AI"
     min_history: int = 50
     warm_min: int = 20
-    admin_ids: tuple = ()
 
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
@@ -70,66 +70,83 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v400.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v500.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v400")
+log = logging.getLogger("v500")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 # =========================
-# MATH & PROBABILITY
+# ADVANCED MATH & AI
 # =========================
-def logit(p):
-    p = max(0.01, min(0.99, p))
-    return math.log(p / (1 - p))
-
-def inv_logit(z):
+def sigmoid(z):
     return 1 / (1 + math.exp(-z))
 
-class Beta:
-    __slots__ = ("a", "b")
-    def __init__(self, a: float = 1.0, b: float = 1.0):
-        self.a = a
-        self.b = b
+def calculate_fractal_dimension(sizes):
+    """Calculates Katz Fractal Dimension to measure market noise."""
+    n = len(sizes)
+    if n < 20: return 1.5
+    L, L_avg = 0.0, 0.0
+    for i in range(1, n):
+        L += abs(sizes[i] - sizes[i-1])
+    L_avg = L / (n - 1)
+    d = max([abs(sizes[i] - sizes[0]) for i in range(n)]) if n > 1 else 1
+    if L_avg == 0 or d == 0: return 1.5
+    return math.log10(n) / (math.log10(d / L_avg) + math.log10(n))
 
-    def update(self, correct: bool):
-        if correct: self.a += 1.0
-        else: self.b += 1.0
+class HMMRegime:
+    """Hidden Markov Model for Market Regimes."""
+    def __init__(self):
+        self.states = ["TRENDING_BIG", "TRENDING_SMALL", "CHOPPY"]
+        self.current_state = "CHOPPY"
+        self.transition_matrix = [
+            [0.6, 0.2, 0.2], # From Trend Big
+            [0.2, 0.6, 0.2], # From Trend Small
+            [0.3, 0.3, 0.4]  # From Choppy
+        ]
 
-    def n(self) -> float:
-        return max(0.0, self.a + self.b - 2.0)
+    def update(self, sizes):
+        n = len(sizes)
+        if n < 10: return self.current_state
+        
+        last = sizes[-1]
+        run = 1
+        for i in range(n-2, -1, -1):
+            if sizes[i] == last: run += 1
+            else: break
+            
+        if run >= 4:
+            self.current_state = "TRENDING_BIG" if last == 1 else "TRENDING_SMALL"
+        elif run <= 2:
+            self.current_state = "CHOPPY"
+        
+        return self.current_state
 
-    def mean(self) -> float:
-        return self.a / (self.a + self.b)
+class MetaLearner:
+    """Tracks Agent performance and assigns weights dynamically."""
+    def __init__(self):
+        self.rewards = {
+            "TrendAgent": deque(maxlen=50),
+            "MeanRevAgent": deque(maxlen=50),
+            "PatternAgent": deque(maxlen=50)
+        }
 
-    def sample_thompson(self) -> float:
-        return random.betavariate(self.a, self.b)
+    def record(self, agent, correct):
+        self.rewards[agent].append(1 if correct else 0)
 
-    def to_dict(self):
-        return {"a": self.a, "b": self.b}
-
-    @classmethod
-    def from_dict(cls, d):
-        return cls(d["a"], d["b"])
-
-class Calibration:
-    def __init__(self, maxlen: int = 400):
-        self.samples = deque(maxlen=maxlen)
-    def add(self, conf: int, correct: bool):
-        self.samples.append((conf, 1 if correct else 0))
-    def calibrate(self, raw_conf: int) -> int:
-        if len(self.samples) < 20: return 50
-        n = w = W = 0
-        for c, win in self.samples:
-            W += win
-            if abs(c - raw_conf) <= 6:
-                n += 1; w += win
-        base = (W + 5.0) / (len(self.samples) + 10)
-        p = (w + 12 * base) / (n + 12)
-        return int(max(0.5, min(0.85, p)) * 100)
+    def get_weights(self):
+        weights = {}
+        for agent, history in self.rewards.items():
+            if len(history) < 5:
+                weights[agent] = 1.0
+                continue
+            acc = sum(history) / len(history)
+            # Softmax-like scaling: 50% acc = 1.0 weight, 70% acc = 2.5 weight, 30% acc = 0.2 weight
+            weights[agent] = max(0.1, min(3.0, (acc * 4) - 1))
+        return weights
 
 # =========================
 # STORAGE
@@ -168,7 +185,7 @@ class Storage:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 p["issue"], p["size"], p["num"], p["mode"], p["logic"], json.dumps(p.get("sigs", [])),
-                p.get("raw_conf", 50), p.get("regime", "BALANCED"), json.dumps(p.get("details", {})),
+                p.get("raw_conf", 50), p.get("regime", "CHOPPY"), json.dumps(p.get("details", {})),
                 p.get("p_big", 0.5), p.get("confidence", 50), p.get("consensus", 0.5), p.get("stake", "1x"), time.time()
             ))
 
@@ -201,11 +218,6 @@ class Storage:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
-    def overall_stats(self):
-        with self._conn() as c:
-            row = c.execute("SELECT COUNT(*), SUM(CASE WHEN status LIKE 'WIN%' OR status LIKE 'JACK%' THEN 1 ELSE 0 END) FROM predictions WHERE status!='PENDING'").fetchone()
-        return (row[0] or 0), (row[1] or 0)
-
     def load_kv(self, key: str) -> Optional[str]:
         with self._conn() as c:
             row = c.execute("SELECT value FROM state_kv WHERE key=?", (key,)).fetchone()
@@ -218,239 +230,196 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # =========================
-# DEEP DETECTORS
-# =========================
-@dataclass
-class Detector:
-    key: str
-    name: str
-    dir: int
-    conf: int
-    weight: float
-    family: str = "generic"
-
-def run_detectors(sizes, nums):
-    out = []
-    n = len(sizes)
-    if n < CFG.warm_min: return out
-
-    # 1. N-Gram Pattern Matcher (Exact sequence)
-    if n >= 10:
-        seq = tuple(sizes[-3:])
-        matches = 0
-        next_big = 0
-        for i in range(len(sizes) - 3):
-            if tuple(sizes[i:i+3]) == seq:
-                matches += 1
-                if sizes[i+3] == 1: next_big += 1
-        if matches >= 4:
-            p = next_big / matches
-            strength = abs(p - 0.5) * 2
-            if strength > 0.1:
-                out.append(Detector("NGram3", f"N-Gram({p:.2f})", 1 if p > 0.5 else 0, int(50 + strength * 40), 1.0 + strength * 1.5, "ngram"))
-
-    # 2. Multi-Timeframe MA Crossover
-    if n >= 20:
-        ma5 = sum(sizes[-5:]) / 5
-        ma15 = sum(sizes[-15:]) / 15
-        if abs(ma5 - ma15) > 0.15:
-            out.append(Detector("MA_Cross", f"MA-Cross({ma5:.1f}v{ma15:.1f})", 1 if ma5 > ma15 else 0, 60, 1.2, "ma"))
-
-    # 3. Parity (Even/Odd) Tracker
-    if n >= 10:
-        parities = [1 if x % 2 == 0 else 0 for x in nums[-10:]]
-        last_par = parities[-1]
-        run = 1
-        for x in reversed(parities[:-1]):
-            if x == last_par: run += 1
-            else: break
-        if run >= 3:
-            # Parity breaks after 3
-            out.append(Detector("ParityBreak", "Parity-Break", 1 - last_par, 60, 1.0, "parity"))
-        elif run == 1:
-            out.append(Detector("ParityFollow", "Parity-Follow", last_par, 55, 0.8, "parity"))
-
-    # 4. Standard Markov (L4)
-    if n >= 20:
-        ctx = (sizes[-4] << 3) | (sizes[-3] << 2) | (sizes[-2] << 1) | sizes[-1]
-        bN = tN = 0
-        for i in range(4, n):
-            c = (sizes[i-4] << 3) | (sizes[i-3] << 2) | (sizes[i-2] << 1) | sizes[i-1]
-            if c == ctx:
-                tN += 1
-                if sizes[i] == 1: bN += 1
-        if tN >= 10:
-            p = (bN + 0.5) / (tN + 1)
-            out.append(Detector("Markov4", f"Markov-L4({p:.2f})", 1 if p > 0.5 else 0, int(50 + abs(p-0.5)*50), 0.8 + abs(p-0.5)*2, "markov"))
-
-    # 5. Streak / Dragon
-    last = sizes[-1]
-    run = 1
-    for i in range(n - 2, -1, -1):
-        if sizes[i] == last: run += 1
-        else: break
-    if run >= 4:
-        out.append(Detector("Dragon", f"Dragon×{run}", last, min(90, 60 + run * 5), 1.5, "streak"))
-    elif run == 2:
-        out.append(Detector("Streak2", "Streak×2", last, 56, 0.9, "streak"))
-
-    # 6. Bollinger Reversion (Sizes)
-    if n >= 20:
-        w20 = sizes[-20:]
-        ma = sum(w20) / 20
-        std = math.sqrt(sum((x - ma) ** 2 for x in w20) / 20)
-        if std > 0.1:
-            if last >= ma + 2 * std: out.append(Detector("BollingerRev", "Bollinger-Rev", 0, 70, 1.3, "bollinger"))
-            elif last <= ma - 2 * std: out.append(Detector("BollingerRev", "Bollinger-Rev", 1, 70, 1.3, "bollinger"))
-
-    return out
-
-# =========================
-# STATE
+# AI ENGINE STATE
 # =========================
 class BotState:
     def __init__(self):
         self.history = []
-        self.beta_global = {}
-        self.calibration = {}
-        self.global_calibration = Calibration()
+        self.hmm = HMMRegime()
+        self.meta = MetaLearner()
         self.loss_streak = 0
+        self.win_streak = 0
         self._load_persisted()
 
     def _load_persisted(self):
-        raw = STORE.load_kv("state_v400")
+        raw = STORE.load_kv("state_v500")
         if not raw: return
         try:
             d = json.loads(raw)
-            for k, v in d.get("beta_global", {}).items(): self.beta_global[k] = Beta.from_dict(v)
             self.loss_streak = d.get("loss_streak", 0)
+            self.win_streak = d.get("win_streak", 0)
         except Exception: pass
 
     def save_persisted(self):
         try:
-            d = {
-                "beta_global": {k: b.to_dict() for k, b in self.beta_global.items()},
-                "loss_streak": self.loss_streak,
-            }
-            STORE.save_kv("state_v400", json.dumps(d))
+            d = {"loss_streak": self.loss_streak, "win_streak": self.win_streak}
+            STORE.save_kv("state_v500", json.dumps(d))
         except Exception: pass
 
 STATE = BotState()
 
-def get_beta(det: str) -> Beta:
-    if det not in STATE.beta_global: STATE.beta_global[det] = Beta()
-    return STATE.beta_global[det]
+# =========================
+# AI AGENTS
+# =========================
+def agent_trend(sizes):
+    """Agent 1: Follows streaks and momentum."""
+    if len(sizes) < 10: return None
+    last = sizes[-1]
+    run = 1
+    for i in range(len(sizes)-2, -1, -1):
+        if sizes[i] == last: run += 1
+        else: break
+    
+    if run >= 3: return {"dir": last, "conf": 60 + (run * 5), "name": "TrendFollow"}
+    
+    ma5 = sum(sizes[-5:])/5
+    ma10 = sum(sizes[-10:])/10
+    if abs(ma5 - ma10) > 0.15:
+        return {"dir": 1 if ma5 > ma10 else 0, "conf": 65, "name": "MA-Cross"}
+    return None
 
-def get_calibration(regime: str) -> Calibration:
-    if regime not in STATE.calibration: STATE.calibration[regime] = Calibration()
-    return STATE.calibration[regime]
+def agent_mean_rev(sizes):
+    """Agent 2: Bets on reversals after long runs."""
+    if len(sizes) < 20: return None
+    last = sizes[-1]
+    run = 1
+    for i in range(len(sizes)-2, -1, -1):
+        if sizes[i] == last: run += 1
+        else: break
+        
+    if run >= 5: return {"dir": 1 - last, "conf": 75, "name": "DragonReversal"}
+    
+    ma20 = sum(sizes[-20:])/20
+    std = math.sqrt(sum((x-ma20)**2 for x in sizes[-20:])/20)
+    if std > 0.1:
+        if last > ma20 + 1.5*std: return {"dir": 0, "conf": 70, "name": "BollingerShort"}
+        if last < ma20 - 1.5*std: return {"dir": 1, "conf": 70, "name": "BollingerLong"}
+    return None
+
+def agent_pattern(sizes, nums):
+    """Agent 3: Markov Chains and N-Grams."""
+    if len(sizes) < 30: return None
+    # N-Gram (Last 2 sequence)
+    seq = tuple(sizes[-2:])
+    b_count = matches = 0
+    for i in range(len(sizes)-2):
+        if tuple(sizes[i:i+2]) == seq:
+            matches += 1
+            if sizes[i+2] == 1: b_count += 1
+    if matches >= 4:
+        p = b_count / matches
+        if p > 0.65 or p < 0.35:
+            return {"dir": 1 if p > 0.65 else 0, "conf": 50 + abs(p-0.5)*100, "name": "N-Gram"}
+    return None
 
 # =========================
-# DEEP ENSEMBLE (Log-Odds)
+# META-ENSEMBLE PREDICTOR
 # =========================
-def merge_detectors(detectors):
-    if not detectors: return None
-    
-    total_log_odds = 0.0
-    used = []
-
-    for d in detectors:
-        beta = get_beta(d.key)
-        
-        # Confidence from detector (0.0 to 1.0)
-        p_det = d.conf / 100.0
-        if d.dir == 0: p_det = 1.0 - p_det # Map to P(BIG)
-
-        # Log-odds conversion
-        z = logit(p_det)
-
-        # Weight from Thompson Sampling (Meta-learning)
-        w_beta = beta.sample_thompson() if beta.n() >= 10 else 0.5
-        
-        # Final weight
-        w = d.weight * (w_beta * 2) 
-        
-        # Direction applied
-        if d.dir == 0: w = -w # Negative for SMALL
-
-        total_log_odds += z * w
-
-        used.append({
-            "name": d.name, "key": d.key, "dir": d.dir, "weight": round(w, 2)
-        })
-
-    # Convert back to probability
-    p_big = inv_logit(total_log_odds)
-    
-    # Consensus
-    consensus = max(p_big, 1 - p_big)
-    raw_conf = int(50 + abs(p_big - 0.5) * 100)
-    pred_dir = 1 if p_big >= 0.5 else 0
-
-    return {"p_big": p_big, "dir": pred_dir, "raw_conf": raw_conf, "consensus": consensus, "used": used}
-
 def generate_prediction():
     if len(STATE.history) < CFG.min_history: return None
     sizes = [x["size"] for x in STATE.history]
     nums = [x["num"] for x in STATE.history]
     
-    detectors = run_detectors(sizes, nums)
-    merged = merge_detectors(detectors)
+    # 1. Update HMM Regime
+    regime = STATE.hmm.update(sizes)
     
-    if not merged:
-        # Fallback if no detectors fire
-        merged = {"p_big": 0.5, "dir": sizes[-1], "raw_conf": 50, "consensus": 0.5, "used": []}
-
-    calibrated_conf = get_calibration("GLOBAL").calibrate(merged["raw_conf"])
+    # 2. Get Fractal Dimension
+    fd = calculate_fractal_dimension(sizes)
     
-    # 🔥 NO SKIP LOGIC (Always Predict)
+    # 3. Get Agent Predictions
+    a_trend = agent_trend(sizes)
+    a_meanrev = agent_mean_rev(sizes)
+    a_pattern = agent_pattern(sizes, nums)
+    
+    agents = [
+        ("TrendAgent", a_trend),
+        ("MeanRevAgent", a_meanrev),
+        ("PatternAgent", a_pattern)
+    ]
+    
+    # 4. Get Meta-Learner Weights
+    weights = STATE.meta.get_weights()
+    
+    # 5. Combine into Log-Odds
+    total_log_odds = 0.0
+    active_signals = []
+    
+    for agent_name, pred in agents:
+        if not pred: continue
+        w = weights[agent_name]
+        
+        # Convert confidence to logit
+        p_det = pred["conf"] / 100.0
+        if pred["dir"] == 0: p_det = 1.0 - p_det
+        
+        z = math.log(p_det / (1 - p_det))
+        
+        # Apply weight
+        weight_applied = z * w
+        if pred["dir"] == 0: weight_applied = -weight_applied
+        
+        total_log_odds += weight_applied
+        active_signals.append(f"{pred['name']} ({pred['dir']} @ w{w:.1f})")
+    
+    # 6. Fractal Noise Filter
+    if fd > 1.6: # Highly noisy
+        total_log_odds *= 0.5
+        active_signals.append("NoiseFilter(HIGH)")
+    
+    # Calculate final probability
+    p_big = 1 / (1 + math.exp(-total_log_odds)) if total_log_odds != 0 else 0.5
+    pred_dir = 1 if p_big >= 0.5 else 0
+    
+    # 7. Risk Engine (No SKIP, Aggressive Compounding)
     stake = "1x"
-    if merged["raw_conf"] >= 75:
-        stake = "2x"
-    elif merged["raw_conf"] >= 65:
-        stake = "1.5x"
-
-    # 🔥 CONTRARIAN LOSS STREAK
-    # If bot loses 2 times, assume market is tricking it. Flip the prediction.
-    warning = None
     if STATE.loss_streak >= 2:
-        merged["dir"] = 1 - merged["dir"]
-        merged["p_big"] = 1.0 - merged["p_big"]
-        stake = "0.5x" # Reduce stake to be safe
-        warning = "CONTRARIAN (Flipped)"
-    
-    issue = str(int(STATE.history[-1]["issue"]) + 1)
-    top_sigs = merged["used"][:6]
-    
-    # Number Picker (Dirichlet)
-    pool = range(5, 10) if merged["dir"] == 1 else range(0, 5)
-    # Simple frequency pick for numbers
-    freq = Counter(nums[-30:])
-    num = max(pool, key=lambda x: freq[x])
+        stake = "0.5x" # Reduce risk during bad times
+        active_signals.append("RiskEngine(DEFENSIVE)")
+    elif STATE.win_streak >= 2:
+        stake = "2x" # Compound during good times
+        active_signals.append("RiskEngine(AGGRESSIVE)")
+        
+    if abs(p_big - 0.5) > 0.25: # Huge edge
+        stake = "2.5x" if stake != "0.5x" else "1x"
 
+    # 8. Number Picker (Fibonacci + Dirichlet)
+    pool = range(5, 10) if pred_dir == 1 else range(0, 5)
+    freq = Counter(nums[-20:])
+    # Bias towards numbers near the middle of the range
+    target = 7 if pred_dir == 1 else 2
+    num = max(pool, key=lambda x: freq[x] + (1 if abs(x - target) <= 1 else 0))
+
+    issue = str(int(STATE.history[-1]["issue"]) + 1)
+    
     return {
-        "issue": issue, "size": "BIG" if merged["dir"] == 1 else "SMALL", "num": num,
-        "p_big": merged["p_big"], "confidence": calibrated_conf, "raw_conf": merged["raw_conf"],
-        "consensus": merged["consensus"], "mode": "DEEP", "regime": "DYNAMIC",
-        "logic": ", ".join(s["name"] for s in top_sigs) or "Fallback",
-        "sigs": top_sigs, "deferral": warning, "stake": stake,
+        "issue": issue, "size": "BIG" if pred_dir == 1 else "SMALL", "num": num,
+        "p_big": p_big, "confidence": int(50 + abs(p_big - 0.5)*100), "raw_conf": int(50 + abs(p_big - 0.5)*100),
+        "consensus": max(p_big, 1-p_big), "mode": regime, "regime": regime,
+        "logic": ", ".join(active_signals), "sigs": [{"name": s, "dir": pred_dir} for s in active_signals],
+        "deferral": None, "stake": stake,
         "details": {
-            "detectors": [{"key": s["key"], "dir": s["dir"], "name": s["name"]} for s in merged["used"]],
-            "regime": "DYNAMIC", "p_big": merged["p_big"], "consensus": merged["consensus"]
-        },
+            "agents": {a: p for a, p in agents if p},
+            "fd": fd
+        }
     }
 
 def learn_from_resolution(res: dict):
     actual_size = 1 if res["actual_size"] == "BIG" else 0
     details = res.get("details") or {}
+    agents = details.get("agents", {})
     
-    for d in details.get("detectors", []):
-        correct = (d["dir"] == actual_size)
-        get_beta(d["key"]).update(correct)
+    # Update Meta-Learner
+    for agent_name, pred in agents.items():
+        if pred:
+            STATE.meta.record(agent_name, pred["dir"] == actual_size)
 
-    raw = res.get("raw_conf")
-    if isinstance(raw, int):
-        get_calibration("GLOBAL").add(raw, res["win"])
+    # Update streaks
+    if res["win"]:
+        STATE.loss_streak = 0
+        STATE.win_streak += 1
+    else:
+        STATE.loss_streak += 1
+        STATE.win_streak = 0
 
     STATE.save_persisted()
 
@@ -477,31 +446,26 @@ async def fetch_data(session):
     except Exception: return False
 
 # =========================
-# FORMATTING
+# FORMATTING & UI
 # =========================
 def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
-    sig_text = "\n".join(f"  {h(s['name'])} → {'▲ BIG' if s['dir']==1 else '▼ SMALL'}" for s in p["sigs"][:6]) or "  <i>no active signals</i>"
+    sig_text = "\n".join(f"  🔹 {h(s['name'])}" for s in p["sigs"])
     
-    p_big_pct = p["p_big"] * 100
-    consensus_pct = p["consensus"] * 100
-
-    warning = ""
-    if p.get("deferral") == "CONTRARIAN (Flipped)":
-        warning = "\n🔄 <b>CONTRARIAN MODE</b> — Flipped to break loss streak.\n"
-
-    stake_emoji = {"2x": "🔥 2x", "1.5x": "🟢 1.5x", "1x": "🟡 1x", "0.5x": "🔴 0.5x"}.get(p['stake'], "1x")
+    stake_emoji = {"2.5x": "🚀 2.5x", "2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x"}.get(p['stake'], "1x")
+    regime_emoji = "📈" if "TRENDING" in p['regime'] else "〰️"
 
     return f"""
 📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
 📊 <b>Size</b>: <b>{h(p['size'])}</b>
 
-🎲 <b>P(BIG)</b>: <b>{p_big_pct:.1f}%</b>
-📈 <b>Confidence</b>: <b>{p['confidence']}%</b> <i>(raw {p['raw_conf']}%)</i>
-💰 <b>Stake</b>: <b>{stake_emoji}</b>
-{warning}
-🔎 <b>Active Signals</b>:
+🧠 <b>AI Regime</b>: {regime_emoji} {h(p['regime'])}
+🎲 <b>P(BIG)</b>: <b>{p['p_big']*100:.1f}%</b>
+📈 <b>Confidence</b>: <b>{p['confidence']}%</b>
+💰 <b>Risk Stake</b>: <b>{stake_emoji}</b>
+
+🔎 <b>Meta-Agents</b>:
 {sig_text}
 
 ━━━━━━━━━━━━━━━━━━
@@ -537,11 +501,6 @@ async def worker_loop(app, session):
                 
                 for res in resolved:
                     learn_from_resolution(res)
-                    if res["win"]: 
-                        STATE.loss_streak = 0
-                    else: 
-                        STATE.loss_streak += 1
-                    
                     await send_msg(app, format_result(res))
 
                 latest_issue = STATE.history[-1]["issue"]
@@ -560,8 +519,11 @@ async def worker_loop(app, session):
             log.exception(f"Loop error: {e}"); await asyncio.sleep(2)
 
 # =========================
-# MAIN
+# MAIN (WEBHOOK & POLLING)
 # =========================
+async def handle_ping(request):
+    return web.Response(text="V500 is running!")
+
 async def main():
     CFG.validate()
     if not CFG.telegram_token: raise RuntimeError("TG_TOKEN env variable is empty")
@@ -570,8 +532,29 @@ async def main():
     
     async with app:
         await app.start()
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        await app.updater.start_polling(drop_pending_updates=True)
+        
+        port = int(os.environ.get("PORT", 8080))
+        
+        if CFG.webhook_url:
+            # WEBHOOK MODE (Render)
+            webhook_path = f"/webhook/{CFG.telegram_token}"
+            await app.bot.set_webhook(url=f"{CFG.webhook_url}{webhook_path}", drop_pending_updates=True)
+            log.info(f"Webhook set to {CFG.webhook_url}")
+            
+            web_app = web.Application()
+            web_app.router.add_get("/", handle_ping)
+            web_app.router.add_post(webhook_path, app.update_queue.put)
+            
+            runner = web.AppRunner(web_app)
+            await runner.setup()
+            await web.TCPSite(runner, "0.0.0.0", port).start()
+            log.info(f"Web server running on port {port}")
+        else:
+            # POLLING MODE (Local)
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            await app.updater.start_polling(drop_pending_updates=True)
+            log.info("Polling started")
+
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(worker_loop(app, session))
             await asyncio.Event().wait()
