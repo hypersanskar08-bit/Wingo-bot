@@ -1,11 +1,8 @@
 """
-V600 ULTRA-AI ENGINE
-====================
-Fixes:
-- Empty Meta-Agents issue (Always fires at least 1 agent).
-- Trend Filter: Stops fighting the market trend (Prevents 0182-0187 type loss streaks).
-- Number Picker randomization (No more repeating '5').
-- Default Tie-breaker flipped to match market context.
+V650 ULTRA-AI (BUG FIXED)
+=========================
+- FIXED: Double-negative log-odds bug (SMALL was turning into BIG).
+- FIXED: Trend Agent now correctly dictates the final direction.
 """
 
 import asyncio
@@ -35,18 +32,18 @@ from telegram.error import TimedOut, NetworkError
 # =========================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAFulww2_9jPKSwUdwAmTwZjYJw1KTPNisA"
+    telegram_token: str = "8611789455:AAFexWc48dhJKgcUK-hkCpRQowbGTm_Bwx0"
     chat_id_raw: str = "1264164655"
     source_api_url: str = os.environ.get(
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
     webhook_url: str = "https://wingo-bot-mcs3.onrender.com"
-    db_path: str = os.environ.get("DB_PATH", "predictor_v600.db")
+    db_path: str = os.environ.get("DB_PATH", "predictor_v650.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V600 ULTRA-AI"
+    bot_name: str = "V650 ULTRA-AI"
     min_history: int = 50
     warm_min: int = 20
 
@@ -68,11 +65,11 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v600.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v650.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v600")
+log = logging.getLogger("v650")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -80,15 +77,6 @@ def h(x: Any) -> str:
 # =========================
 # ADVANCED MATH & AI
 # =========================
-def calculate_fractal_dimension(sizes):
-    n = len(sizes)
-    if n < 20: return 1.5
-    L = sum(abs(sizes[i] - sizes[i-1]) for i in range(1, n))
-    L_avg = L / (n - 1)
-    d = max([abs(sizes[i] - sizes[0]) for i in range(n)]) if n > 1 else 1
-    if L_avg == 0 or d == 0: return 1.5
-    return math.log10(n) / (math.log10(d / L_avg) + math.log10(n))
-
 class HMMRegime:
     def __init__(self):
         self.current_state = "CHOPPY"
@@ -267,23 +255,20 @@ def generate_prediction():
     nums = [x["num"] for x in STATE.history]
     
     regime = STATE.hmm.update(sizes)
-    fd = calculate_fractal_dimension(sizes)
     
     a_trend = agent_trend(sizes)
     a_meanrev = agent_mean_rev(sizes)
     a_pattern = agent_pattern(sizes, nums)
     
-    # 🔥 FIX 1: TREND FILTER (Don't fight the trend)
+    # Filter trend against mean reversion
     if regime == "TRENDING_BIG" and a_meanrev and a_meanrev["dir"] == 0:
-        a_meanrev = None # Ignore reversal if we are in a BIG trend
+        a_meanrev = None
     elif regime == "TRENDING_SMALL" and a_meanrev and a_meanrev["dir"] == 1:
         a_meanrev = None
         
     agents = [("TrendAgent", a_trend), ("MeanRevAgent", a_meanrev), ("PatternAgent", a_pattern)]
     
-    # 🔥 FIX 2: FALLBACK AGENT (Never leave it empty)
     if not any(p for _, p in agents):
-        # If no agent fires, use a simple flip (chaos) or follow last
         fallback_dir = 1 - sizes[-1] if random.random() > 0.5 else sizes[-1]
         agents.append(("FallbackAgent", {"dir": fallback_dir, "conf": 55, "name": "Fallback"}))
 
@@ -294,25 +279,27 @@ def generate_prediction():
     for agent_name, pred in agents:
         if not pred: continue
         w = weights.get(agent_name, 1.0)
-        p_det = pred["conf"] / 100.0
-        if pred["dir"] == 0: p_det = 1.0 - p_det
-        z = math.log(p_det / (1 - p_det))
-        weight_applied = z * w
-        if pred["dir"] == 0: weight_applied = -weight_applied
-        total_log_odds += weight_applied
+        
+        # 🔥 CRITICAL BUG FIX: Correct Log-Odds Calculation
+        p = pred["conf"] / 100.0
+        p = max(0.01, min(0.99, p)) # Prevent math domain errors
+        
+        # Calculate log-odds based on prediction direction
+        if pred["dir"] == 1:  # BIG
+            log_odds = math.log(p / (1 - p))
+        else:  # SMALL
+            log_odds = -math.log(p / (1 - p)) # Negative log-odds for SMALL
+            
+        total_log_odds += log_odds * w
         active_signals.append(f"{pred['name']} ({'BIG' if pred['dir']==1 else 'SMALL'})")
     
-    if fd > 1.6:
-        total_log_odds *= 0.5
-        active_signals.append("NoiseFilter")
-
-    # 🔥 FIX 3: TIE BREAKER
+    # If total log odds is 0, default to last result's opposite
     if total_log_odds == 0.0:
-        p_big = 0.5
-        pred_dir = 1 - sizes[-1] # Flip the last result if 50/50 tie
-    else:
-        p_big = 1 / (1 + math.exp(-total_log_odds))
-        pred_dir = 1 if p_big > 0.5 else 0
+        total_log_odds = 0.1 if sizes[-1] == 0 else -0.1
+
+    # Calculate final P(BIG) correctly
+    p_big = 1 / (1 + math.exp(-total_log_odds))
+    pred_dir = 1 if p_big > 0.5 else 0
 
     # Risk Engine
     stake = "1x"
@@ -323,10 +310,9 @@ def generate_prediction():
         stake = "2x"
         active_signals.append("AggressiveMode")
 
-    # 🔥 FIX 4: SMART NUMBER PICKER (Avoid getting stuck on 5)
+    # Smart Number Picker
     pool = list(range(5, 10)) if pred_dir == 1 else list(range(0, 5))
     freq = Counter(nums[-15:])
-    # Pick the number with highest frequency, or random if tie
     max_freq = max([freq[x] for x in pool]) if freq else 0
     best_nums = [x for x in pool if freq[x] == max_freq]
     num = random.choice(best_nums)
@@ -338,8 +324,7 @@ def generate_prediction():
         "p_big": p_big, "confidence": int(50 + abs(p_big - 0.5)*100), "raw_conf": int(50 + abs(p_big - 0.5)*100),
         "consensus": max(p_big, 1-p_big), "mode": regime, "regime": regime,
         "logic": ", ".join(active_signals), "sigs": [{"name": s, "dir": pred_dir} for s in active_signals],
-        "stake": stake,
-        "details": {"agents": {a: p for a, p in agents if p}, "fd": fd}
+        "stake": stake, "details": {"agents": {a: p for a, p in agents if p}}
     }
 
 def learn_from_resolution(res: dict):
@@ -439,7 +424,7 @@ async def worker_loop(app, session):
         except Exception as e:
             log.exception(f"Loop error: {e}"); await asyncio.sleep(2)
 
-async def handle_ping(request): return web.Response(text="V600 is running!")
+async def handle_ping(request): return web.Response(text="V650 is running!")
 
 async def main():
     CFG.validate()
