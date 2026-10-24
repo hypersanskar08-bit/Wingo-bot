@@ -32,7 +32,7 @@ from telegram.error import TimedOut, NetworkError
 # =========================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAFexWc48dhJKgcUK-hkCpRQowbGTm_Bwx0"
+    telegram_token: str = "8611789455:AAH_GCZP4vLI4M-rF8knnPAartqucT51X7U"
     chat_id_raw: str = "1264164655"
     source_api_url: str = os.environ.get(
         "API_URL",
