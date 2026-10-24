@@ -1,14 +1,14 @@
 """
-V900 ULTRA DEEP ADVANCED FINAL VERSION
-=====================================
-- Deep adaptive pattern analysis
-- Exact suffix memory
-- Multi-model side prediction
-- Recovery engine after losses
-- Robust API retry/backoff
-- Exact issue-key matching
-- Telegram integration
-- Render-ready
+V900 FIXED WORKING VERSION
+================================
+- Only uses real API URL by default
+- No google.com fallback
+- JSON-only parsing
+- 429 retry/backoff
+- uses last-good history if API fails
+- exact issue matching
+- robust Telegram sending
+- safe Render startup
 """
 
 import asyncio
@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from aiohttp import web
 from telegram.ext import Application
 
 
@@ -38,17 +37,15 @@ from telegram.ext import Application
 class Config:
     telegram_token: str = os.environ.get("TG_TOKEN", "8611789455:AAH_GCZP4vLI4M-rF8knnPAartqucT51X7U")
     chat_id_raw: str = os.environ.get("TG_CHAT", "1264164655")
-    webhook_url: str = os.environ.get("WEBHOOK_URL", "https://wingo-bot-mcs3.onrender.com")
     source_api_urls: str = os.environ.get(
         "API_URLS",
-        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000,"
-        "https://www.google.com/"
+        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_ultra_deep.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_fixed_working.db")
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 12.0
-    bot_name: str = "V900 ULTRA DEEP"
+    bot_name: str = "V900 FIXED"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -81,7 +78,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_ultra_deep.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_fixed_working.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -95,7 +92,7 @@ def h(x: Any) -> str:
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
@@ -210,6 +207,7 @@ def detect_regime(sizes: List[int]) -> str:
 def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
     if len(history) < window + 4:
         return 0.0
+
     current = tuple(x["size"] for x in history[-window:])
     repeats = 0
     for i in range(len(history) - window - 1, 0, -1):
@@ -403,12 +401,6 @@ class Storage:
                     "INSERT INTO signal_weights (name, weight, hits, misses, updated_at) VALUES (?, ?, 0, 0, ?)",
                     (name, 1.0, time.time())
                 )
-
-    def get_signal_weight(self, name: str) -> float:
-        self.ensure_signal(name)
-        with self._conn() as c:
-            row = c.execute("SELECT weight FROM signal_weights WHERE name=?", (name,)).fetchone()
-            return float(row[0]) if row else 1.0
 
     def update_signal_weight(self, name: str, outcome_correct: bool):
         self.ensure_signal(name)
@@ -867,9 +859,6 @@ def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[st
     }
 
 
-# ============================================================
-# SIDE PREDICTOR
-# ============================================================
 def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
     if not history:
         return {"pred_dir": 1, "p_big": 0.5, "reason": "empty"}
@@ -946,6 +935,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
         pool = list(range(10))
 
     score = defaultdict(float)
+
     bias_map = STORE.get_num_bias(pred_dir, pool)
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
@@ -1187,6 +1177,11 @@ async def fetch_data(session):
                             log.warning("HTTP %s from %s", r.status, url)
                             break
 
+                        content_type = r.headers.get("Content-Type", "").lower()
+                        if "application/json" not in content_type and "text/json" not in content_type:
+                            log.warning("Non-JSON response from %s -> %s", url, content_type)
+                            break
+
                         payload = await r.json()
                         parsed = parse_history_payload(payload)
 
@@ -1284,14 +1279,6 @@ async def send_msg(app, text, retries=3):
 
 
 # ============================================================
-# HTTP HANDLER
-# ============================================================
-async def webhook_handler(request):
-    await app.update_queue.put(request)
-    return web.Response(text="OK")
-
-
-# ============================================================
 # WORKER
 # ============================================================
 async def worker_loop(app, session):
@@ -1311,6 +1298,10 @@ async def worker_loop(app, session):
                     learn_from_resolution(res)
                     await send_msg(app, format_result(res))
 
+                if not STATE.history:
+                    await asyncio.sleep(CFG.fetch_every)
+                    continue
+
                 latest_issue = STATE.history[-1]["issue"]
                 next_issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
@@ -1329,10 +1320,6 @@ async def worker_loop(app, session):
             await asyncio.sleep(1)
 
 
-async def handle_ping(request):
-    return web.Response(text="V900 is running!")
-
-
 # ============================================================
 # MAIN
 # ============================================================
@@ -1348,23 +1335,6 @@ async def main():
         if not ok:
             log.error("Bot not valid. Check TG_TOKEN and TG_CHAT.")
             return
-
-        port = int(os.environ.get("PORT", 8080))
-
-        if CFG.webhook_url:
-            webhook_path = f"/webhook/{CFG.telegram_token}"
-            await app.bot.set_webhook(url=f"{CFG.webhook_url}{webhook_path}", drop_pending_updates=True)
-
-            web_app = web.Application()
-            web_app.router.add_get("/", handle_ping)
-            web_app.router.add_post(webhook_path, webhook_handler)
-
-            runner = web.AppRunner(web_app)
-            await runner.setup()
-            await web.TCPSite(runner, "0.0.0.0", port).start()
-        else:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-            await app.updater.start_polling(drop_pending_updates=True)
 
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(worker_loop(app, session))
