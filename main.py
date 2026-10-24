@@ -1,13 +1,13 @@
 """
-V900 ULTIMATE PATTERN ENGINE
-===========================
-- Reads last 1000 results from API
-- Detects multi-window pattern families
-- Learns by similar-pattern matching
-- Reweights signals over time
-- Uses adaptive risk control
-- Stronger number selection
-- Telegram bot
+V900 ULTIMATE AUTO-LEARNING PATTERN ENGINE
+==========================================
+- API-driven 1000-result memory
+- Exact sequence pattern memory table
+- Similar-pattern match scoring
+- Adaptive signal calibration
+- Strong loss protection
+- Number selection from historical big/small number stats
+- Telegram bot integration
 """
 
 import asyncio
@@ -86,6 +86,109 @@ def h(x: Any) -> str:
 
 
 # =========================
+# HELPERS
+# =========================
+def clamp(v: float, low: float, high: float) -> float:
+    return max(low, min(high, v))
+
+
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def trailing_run(values: List[int], target: Optional[int] = None) -> int:
+    if not values:
+        return 0
+    last = values[-1] if target is None else target
+    run = 1
+    for i in range(len(values) - 2, -1, -1):
+        if values[i] == last:
+            run += 1
+        else:
+            break
+    return run
+
+
+def ratio_big(values: List[int], window: int = 20) -> float:
+    if not values:
+        return 0.5
+    arr = values[-window:]
+    return sum(arr) / len(arr)
+
+
+def majority_dir(values: List[int], window: int = 6) -> int:
+    if not values:
+        return 1
+    arr = values[-window:]
+    return 1 if sum(arr) >= (len(arr) / 2) else 0
+
+
+def alternating_score(values: List[int], window: int = 12) -> float:
+    if len(values) < 2:
+        return 0.0
+    arr = values[-window:]
+    changes = 0
+    for i in range(1, len(arr)):
+        if arr[i] != arr[i - 1]:
+            changes += 1
+    return changes / max(1, len(arr) - 1)
+
+
+def block_pattern(values: List[int], window: int = 10) -> bool:
+    if len(values) < 4:
+        return False
+    arr = values[-window:]
+    for i in range(len(arr) - 3):
+        a, b, c, d = arr[i:i+4]
+        if a == b and c == d and a != c:
+            return True
+    return False
+
+
+def volatility(values: List[int], window: int = 20) -> float:
+    if len(values) < 2:
+        return 0.0
+    arr = values[-window:]
+    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
+    return sum(diffs) / max(1, len(diffs))
+
+
+def sequence_fingerprint(sizes: List[int], windows: Optional[List[int]] = None) -> List[Tuple[int, Tuple[int, ...]]]:
+    if windows is None:
+        windows = [3, 5, 8, 12, 20]
+    out = []
+    for w in windows:
+        if len(sizes) >= w:
+            out.append((w, tuple(sizes[-w:])))
+    return out
+
+
+def detect_regime(sizes: List[int]) -> str:
+    if len(sizes) < 8:
+        return "COLD"
+
+    run = trailing_run(sizes)
+    alt = alternating_score(sizes, 10)
+    block = block_pattern(sizes, 10)
+    ratio = ratio_big(sizes, 10)
+
+    if alt >= 0.65:
+        return "ALTERNATING"
+    if block:
+        return "BLOCK"
+    if run >= 3:
+        return "TRAP"
+    if run >= 5:
+        return "TREND"
+    if abs(ratio - 0.5) <= 0.12:
+        return "CHOPPY"
+    return "CYCLE"
+
+
+# =========================
 # STORAGE
 # =========================
 class Storage:
@@ -115,6 +218,24 @@ class Storage:
                     hits INTEGER DEFAULT 0,
                     misses INTEGER DEFAULT 0,
                     updated_at REAL DEFAULT 0
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pattern_stats (
+                    pattern_key TEXT PRIMARY KEY,
+                    window INTEGER,
+                    big_count INTEGER DEFAULT 0,
+                    small_count INTEGER DEFAULT 0,
+                    total_count INTEGER DEFAULT 0,
+                    last_seen REAL DEFAULT 0
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS num_stats (
+                    num INTEGER PRIMARY KEY,
+                    big_count INTEGER DEFAULT 0,
+                    small_count INTEGER DEFAULT 0,
+                    total_count INTEGER DEFAULT 0
                 )
             """)
             c.execute("CREATE TABLE IF NOT EXISTS state_kv (key TEXT PRIMARY KEY, value TEXT)")
@@ -222,10 +343,10 @@ class Storage:
                 current = float(current)
 
             if outcome_correct:
-                new_weight = clamp(current * 1.12, 0.35, 5.0)
+                new_weight = clamp(current * 1.15, 0.35, 6.0)
                 hits += 1
             else:
-                new_weight = clamp(current * 0.82, 0.25, 5.0)
+                new_weight = clamp(current * 0.80, 0.2, 6.0)
                 misses += 1
 
             c.execute(
@@ -233,11 +354,130 @@ class Storage:
                 (new_weight, hits, misses, time.time(), name)
             )
 
-    def get_all_signal_weights(self) -> Dict[str, float]:
-        with self._conn() as c:
-            rows = c.execute("SELECT name, weight FROM signal_weights ORDER BY weight DESC").fetchall()
-            return {name: float(weight) for name, weight in rows}
+    def update_pattern_memory(self, sizes: List[int], actual_size: int):
+        """
+        Store all sequence patterns by window size.
+        actual_size: 1 for BIG, 0 for SMALL.
+        """
+        for window in [3, 5, 8, 12, 20]:
+            if len(sizes) < window:
+                continue
+            seq = sizes[-window:]
+            key = f"{window}:{json.dumps(seq)}"
+            with self._conn() as c:
+                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+                if row is None:
+                    c.execute(
+                        "INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+                        (key, window, 0, 0, 0, time.time())
+                    )
+                    row = (0, 0, 0)
 
+                big_count, small_count, total_count = row
+                big_count = int(big_count)
+                small_count = int(small_count)
+                total_count = int(total_count)
+
+                if actual_size == 1:
+                    big_count += 1
+                else:
+                    small_count += 1
+                total_count += 1
+
+                c.execute(
+                    "UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?",
+                    (big_count, small_count, total_count, time.time(), key)
+                )
+
+    def update_num_memory(self, actual_num: int, actual_size: int):
+        with self._conn() as c:
+            row = c.execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (actual_num,)).fetchone()
+            if row is None:
+                c.execute(
+                    "INSERT INTO num_stats (num, big_count, small_count, total_count) VALUES (?, ?, ?, ?)",
+                    (actual_num, 0, 0, 0)
+                )
+                row = (0, 0, 0)
+
+            big_count, small_count, total_count = row
+            big_count = int(big_count)
+            small_count = int(small_count)
+            total_count = int(total_count)
+
+            if actual_size == 1:
+                big_count += 1
+            else:
+                small_count += 1
+            total_count += 1
+
+            c.execute(
+                "UPDATE num_stats SET big_count=?, small_count=?, total_count=? WHERE num=?",
+                (big_count, small_count, total_count, actual_num)
+            )
+
+    def get_pattern_probability(self, sizes: List[int]) -> Dict[str, float]:
+        out = {"p_big": 0.5, "matched": 0, "weights": []}
+        for window in [3, 5, 8, 12, 20]:
+            if len(sizes) < window:
+                continue
+            seq = sizes[-window:]
+            key = f"{window}:{json.dumps(seq)}"
+            with self._conn() as c:
+                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+            if row is None:
+                continue
+
+            big_count, small_count, total_count = row
+            big_count = int(big_count)
+            small_count = int(small_count)
+            total_count = int(total_count)
+
+            if total_count <= 0:
+                continue
+
+            p = big_count / total_count
+            out["matched"] += 1
+            out["weights"].append((window, p, total_count))
+            out["p_big"] = (out["p_big"] + p) / 2.0 if out["matched"] > 0 else p
+
+        if not out["weights"]:
+            out["p_big"] = 0.5
+
+        return out
+
+    def get_num_bias(self, pred_dir: int, pool: List[int]) -> Dict[int, float]:
+        weights = {}
+        for n in pool:
+            row = self._conn().execute("SELECT big_count, small_count, total_count FROM num_stats WHERE num=?", (n,)).fetchone()
+            if row is None:
+                row = (0, 0, 0)
+            big_count, small_count, total_count = row
+            big_count = int(big_count)
+            small_count = int(small_count)
+            total_count = int(total_count)
+
+            if total_count <= 0:
+                weights[n] = 1.0
+            else:
+                p_big = big_count / total_count
+                if pred_dir == 1:
+                    weights[n] = 1.0 + (p_big * 3.0)
+                else:
+                    weights[n] = 1.0 + ((1.0 - p_big) * 3.0)
+
+            # slight preference normalized for side
+            if pred_dir == 1:
+                if n in (6, 7, 8):
+                    weights[n] += 1.5
+                if n in (5, 9):
+                    weights[n] += 0.8
+            else:
+                if n in (1, 2, 3):
+                    weights[n] += 1.5
+                if n in (0, 4):
+                    weights[n] += 0.8
+
+        return weights
 
 STORE = Storage(CFG.db_path)
 
@@ -256,139 +496,6 @@ STATE = BotState()
 
 
 # =========================
-# HELPERS
-# =========================
-def clamp(v: float, low: float, high: float) -> float:
-    return max(low, min(high, v))
-
-
-def safe_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-
-def trailing_run(values: List[int], target: Optional[int] = None) -> int:
-    if not values:
-        return 0
-    last = values[-1] if target is None else target
-    run = 1
-    for i in range(len(values) - 2, -1, -1):
-        if values[i] == last:
-            run += 1
-        else:
-            break
-    return run
-
-
-def ratio_big(values: List[int], window: int = 20) -> float:
-    if not values:
-        return 0.5
-    arr = values[-window:]
-    return sum(arr) / len(arr)
-
-
-def majority_dir(values: List[int], window: int = 6) -> int:
-    if not values:
-        return 1
-    arr = values[-window:]
-    return 1 if sum(arr) >= (len(arr) / 2) else 0
-
-
-def alternating_score(values: List[int], window: int = 12) -> float:
-    if len(values) < 2:
-        return 0.0
-    arr = values[-window:]
-    changes = 0
-    for i in range(1, len(arr)):
-        if arr[i] != arr[i - 1]:
-            changes += 1
-    return changes / max(1, len(arr) - 1)
-
-
-def block_pattern(values: List[int], window: int = 10) -> bool:
-    if len(values) < 4:
-        return False
-    arr = values[-window:]
-    for i in range(len(arr) - 3):
-        a, b, c, d = arr[i:i+4]
-        if a == b and c == d and a != c:
-            return True
-    return False
-
-
-def volatility(values: List[int], window: int = 20) -> float:
-    if len(values) < 2:
-        return 0.0
-    arr = values[-window:]
-    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
-    return sum(diffs) / max(1, len(diffs))
-
-
-def sequence_fingerprint(sizes: List[int], windows: Optional[List[int]] = None) -> List[Tuple[int, Tuple[int, ...]]]:
-    if windows is None:
-        windows = [3, 5, 8, 12]
-    out = []
-    for w in windows:
-        if len(sizes) >= w:
-            out.append((w, tuple(sizes[-w:])))
-    return out
-
-
-# =========================
-# PATTERN MEMORY
-# =========================
-def pattern_memory_score(history: List[Dict[str, Any]], current_sizes: List[int]) -> Dict[str, float]:
-    """
-    Compare current recent sequence fingerprints against earlier similar ones.
-    """
-    if len(history) < 10 or len(current_sizes) < 5:
-        return {"big_like": 0.5, "small_like": 0.5, "strength": 0.0}
-
-    current_fp = sequence_fingerprint(current_sizes)
-
-    big_hits = 0
-    small_hits = 0
-    total = 0
-
-    for idx in range(len(history) - 4):
-        prev = [x["size"] for x in history[max(0, idx - 50):idx + 1]]
-        if len(prev) < 5:
-            continue
-
-        fp = sequence_fingerprint(prev)
-        if not fp:
-            continue
-
-        match = False
-        for w, chunk in fp:
-            for cw, cchunk in current_fp:
-                if w == cw and chunk == cchunk:
-                    match = True
-                    break
-            if match:
-                break
-
-        if match:
-            total += 1
-            nxt = history[idx + 1].get("size", 0)
-            if nxt == 1:
-                big_hits += 1
-            else:
-                small_hits += 1
-
-    if total == 0:
-        return {"big_like": 0.5, "small_like": 0.5, "strength": 0.0}
-
-    return {
-        "big_like": big_hits / total,
-        "small_like": small_hits / total,
-        "strength": clamp(total / max(1, len(history)), 0.0, 1.0)
-    }
-
-
-# =========================
 # CANDIDATE SIGNALS
 # =========================
 def candidate_signals(history: List[Dict[str, Any]]) -> List[Tuple[str, int, float, str]]:
@@ -402,57 +509,29 @@ def candidate_signals(history: List[Dict[str, Any]]) -> List[Tuple[str, int, flo
     block = block_pattern(sizes, 10)
     ratio = ratio_big(sizes, 20)
     vol = volatility(sizes, 20)
-    mem = pattern_memory_score(history, sizes)
 
     signals: List[Tuple[str, int, float, str]] = []
 
     if run >= 3:
-        signals.append(("Trap", 1 - sizes[-1], 1.8, "Streak likely consumed, reversal expected."))
+        signals.append(("Trap", 1 - sizes[-1], 1.9, "Streak trap: likely reversal."))
     if run >= 5:
-        signals.append(("Trend", sizes[-1], 1.5, "Strong momentum continuation likely."))
+        signals.append(("Trend", sizes[-1], 1.5, "Momentum continuation is alive."))
     if alt >= 0.6:
-        signals.append(("Alternating", 1 - sizes[-1], 1.7, "Alternating sequence suggests reversal."))
+        signals.append(("Alternating", 1 - sizes[-1], 1.7, "Alternation suggests a flip."))
     if block:
-        signals.append(("Block", 1 - sizes[-1], 1.5, "Block structure often breaks into reversal."))
+        signals.append(("Block", 1 - sizes[-1], 1.6, "Block pattern often breaks."))
     if abs(ratio - 0.5) > 0.2:
-        signals.append(("Bias", 1 if ratio >= 0.5 else 0, 1.2, "Recent imbalance favors one side."))
+        signals.append(("Bias", 1 if ratio >= 0.5 else 0, 1.2, "Side imbalance is present."))
     if vol > 0.5:
-        signals.append(("Volatile", 1 - sizes[-1], 1.0, "Volatility raises reversal probability."))
-    if mem["strength"] > 0.0:
-        dominant_dir = 1 if mem["big_like"] >= mem["small_like"] else 0
-        signals.append(("Pattern-Memory", dominant_dir, 2.0, "Similar earlier sequences point to this side."))
-
-    # Add extra signal if regime is trap / break / dynamic
+        signals.append(("Volatile", 1 - sizes[-1], 1.1, "High volatility increases reversal chance."))
     if regime in ("TRAP", "BLOCK", "ALTERNATING"):
-        signals.append(("Regime-Flip", 1 - sizes[-1], 1.3, "Current regime is break-sensitive."))
+        signals.append(("Regime-Flip", 1 - sizes[-1], 1.3, "Regime break is likely."))
 
     return signals
 
 
-def detect_regime(sizes: List[int]) -> str:
-    if len(sizes) < 8:
-        return "COLD"
-
-    run = trailing_run(sizes)
-    alt = alternating_score(sizes, 10)
-    block = block_pattern(sizes, 10)
-    ratio = ratio_big(sizes, 10)
-
-    if alt >= 0.65:
-        return "ALTERNATING"
-    if block:
-        return "BLOCK"
-    if run >= 3:
-        return "TRAP"
-    if run >= 5:
-        return "TREND"
-    if abs(ratio - 0.5) <= 0.12:
-        return "CHOPPY"
-    return "CYCLE"
-
-
 # =========================
-# NUMBER SELECTION
+# NUMBER CHOICE
 # =========================
 def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int) -> int:
     nums = [x["num"] for x in history]
@@ -463,55 +542,47 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
     if not pool:
         pool = list(range(10))
 
-    # Pattern-based historical score
-    score_map: Dict[int, float] = defaultdict(float)
+    score: Dict[int, float] = defaultdict(float)
 
-    # Use recent sequence match to retrieve actual number outcomes
-    for idx in range(10, len(history) - 1):
-        prev = [x["size"] for x in history[max(0, idx - 12):idx + 1]]
-        if len(prev) < 6:
-            continue
-
-        cur = [x["size"] for x in history[-12:]]
-        if len(cur) < 6:
-            continue
-
-        # weak sequence match
-        if prev[-6:] == cur[-6:]:
-            outcome_num = history[idx]["num"]
-            outcome_dir = 1 if history[idx]["size"] == 1 else 0
-            if outcome_dir == pred_dir:
-                score_map[outcome_num] += 3.0
-            else:
-                score_map[outcome_num] -= 1.0
-
+    # Direct bias from num_stats
+    num_map = STORE.get_num_bias(pred_dir, pool)
     for n in pool:
-        score_map[n] += freq.get(n, 0) * 3.0
+        score[n] += num_map.get(n, 1.0)
 
-        if pred_dir == 1:
-            if n in (6, 7, 8):
-                score_map[n] += 2.2
-            if n in (5, 9):
-                score_map[n] += 1.0
-        else:
-            if n in (1, 2, 3):
-                score_map[n] += 2.2
-            if n in (0, 4):
-                score_map[n] += 1.0
+    # Recent frequency
+    for n in pool:
+        score[n] += freq.get(n, 0) * 3.0
 
+    # Prefer central cluster
+    if pred_dir == 1:
+        for n in (6, 7, 8):
+            score[n] += 2.0
+        for n in (5, 9):
+            score[n] += 1.0
+    else:
+        for n in (1, 2, 3):
+            score[n] += 2.0
+        for n in (0, 4):
+            score[n] += 1.0
+
+    # avoid stale repeats
+    for n in pool:
         if recent.count(n) >= 4:
-            score_map[n] *= 0.25
+            score[n] *= 0.25
 
-        if loss_streak >= 2:
-            if pred_dir == 1 and n <= 4:
-                score_map[n] *= 0.2
-            if pred_dir == 0 and n >= 5:
-                score_map[n] *= 0.2
+    # after heavy losses, punish obvious trap numbers
+    if loss_streak >= 2:
+        if pred_dir == 1:
+            for n in range(0, 5):
+                score[n] *= 0.2
+        else:
+            for n in range(5, 10):
+                score[n] *= 0.2
 
-    if not score_map:
+    if not score:
         return random.choice(pool)
 
-    return max(score_map, key=score_map.get)
+    return max(score, key=score.get)
 
 
 # =========================
@@ -524,10 +595,11 @@ def generate_prediction():
     history = STATE.history[-1000:]
     sizes = [x["size"] for x in history]
     regime = detect_regime(sizes)
+    pattern_prob = STORE.get_pattern_probability(sizes)
+    p_big = pattern_prob["p_big"]
 
+    # candidate signals weighted by live calibration
     signals = candidate_signals(history)
-
-    # Weighted vote with calibrated weights
     big_weight = 0.0
     small_weight = 0.0
     total_weight = 0.0
@@ -540,12 +612,22 @@ def generate_prediction():
             small_weight += calibrated
         total_weight += calibrated
 
-    if total_weight <= 0:
-        p_big = ratio_big(sizes, 20)
-    else:
-        p_big = big_weight / total_weight
+    if total_weight > 0:
+        p_big = (p_big * 0.5) + ((big_weight / total_weight) * 0.5)
 
-    # State-based adjustments
+    # regime override
+    if regime == "ALTERNATING":
+        p_big = 1.0 - sizes[-1]
+    elif regime == "TRAP":
+        p_big = 1.0 - sizes[-1]
+    elif regime == "BLOCK":
+        p_big = 1.0 - sizes[-1]
+    elif regime == "TREND":
+        p_big = sizes[-1]
+    elif regime == "CHOPPY":
+        p_big = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.8
+
+    # state override
     if STATE.loss_streak == 1:
         p_big = 1.0 - sizes[-1]
     elif STATE.loss_streak >= 2:
@@ -556,27 +638,17 @@ def generate_prediction():
     if trailing_run(sizes) >= 5:
         p_big = sizes[-1]
 
-    if regime == "ALTERNATING":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "BLOCK":
-        p_big = 1.0 - sizes[-1]
-    elif regime == "CHOPPY":
-        p_big = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
-
     p_big = clamp(p_big, 0.05, 0.95)
     pred_dir = 1 if p_big >= 0.5 else 0
 
-    # Risk stake
+    # stake
     stake = "1x"
     if STATE.loss_streak >= 2:
         stake = "0.5x"
     elif STATE.win_streak >= 2:
         stake = "2x"
 
-    if STATE.loss_streak == 1 and abs(p_big - 0.5) < 0.15:
-        stake = "0.5x"
-
-    # Mode
+    # mode
     if STATE.loss_streak >= 2:
         mode = "CONTRARIAN"
     elif STATE.loss_streak == 1:
@@ -631,7 +703,7 @@ def generate_prediction():
             "regime": regime,
             "loss_streak": STATE.loss_streak,
             "win_streak": STATE.win_streak,
-            "p_big": p_big
+            "pattern_prob": pattern_prob
         }
     }
 
@@ -644,12 +716,18 @@ def learn_from_resolution(res: dict):
         STATE.loss_streak += 1
         STATE.win_streak = 0
 
-    for s in res.get("sigs", []):
-        sig_name = s.get("name")
-        if not sig_name:
-            continue
-        signal_was_correct = bool(res.get("win"))
-        STORE.update_signal_weight(sig_name, signal_was_correct)
+    # update emotion/weights
+    for sig in res.get("sigs", []):
+        name = sig.get("name")
+        if name:
+            STORE.update_signal_weight(name, bool(res["win"]))
+
+    # update sequence pattern memory
+    if "history" in STATE.__dict__ and STATE.history:
+        # build actual size int
+        actual_size = 1 if res["actual_size"] == "BIG" else 0
+        STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
+        STORE.update_num_memory(res["actual_num"], actual_size)
 
 
 # =========================
