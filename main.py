@@ -1,12 +1,13 @@
 """
-V900 DEEP ADAPTIVE PATTERN ANALYZER
-===================================
-- Multi-model intelligent predictor
-- Deep pattern tracking across all possible views
-- Learns every 12-24 hrs from real outcomes
-- Adaptive weights update after each result
-- Recovery after loss streak
-- Exact issue resolution and safe Telegram sending
+V900 ULTRA DEEP ADVANCED FINAL VERSION
+=====================================
+- Deep adaptive pattern analysis
+- Exact suffix memory
+- Multi-model side prediction
+- Recovery engine after losses
+- Robust API retry/backoff
+- Exact issue-key matching
+- Telegram integration
 - Render-ready
 """
 
@@ -23,11 +24,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
-from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application
 
 
@@ -44,11 +44,11 @@ class Config:
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000,"
         "https://www.google.com/"
     )
-    db_path: str = os.environ.get("DB_PATH", "v900_deep_adaptive.db")
+    db_path: str = os.environ.get("DB_PATH", "v900_ultra_deep.db")
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 12.0
-    bot_name: str = "V900 DEEP ADAPTIVE"
+    bot_name: str = "V900 ULTRA DEEP"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -81,7 +81,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_deep_adaptive.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_ultra_deep.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -95,7 +95,7 @@ def h(x: Any) -> str:
 
 
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
@@ -111,6 +111,7 @@ def safe_int(x, default=0):
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None:
         return None
+
     if isinstance(value, str):
         value = value.strip()
         if value == "":
@@ -120,6 +121,7 @@ def normalize_issue(value: Any) -> Optional[int]:
         digits = "".join(ch for ch in value if ch.isdigit())
         if digits:
             return int(digits)
+
     try:
         return int(value)
     except Exception:
@@ -208,7 +210,6 @@ def detect_regime(sizes: List[int]) -> str:
 def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
     if len(history) < window + 4:
         return 0.0
-
     current = tuple(x["size"] for x in history[-window:])
     repeats = 0
     for i in range(len(history) - window - 1, 0, -1):
@@ -628,7 +629,7 @@ STATE = BotState()
 
 
 # ============================================================
-# ADVANCED DEEP FEATURE ANALYZER
+# DEEP PATTERN FEATURES
 # ============================================================
 def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not history:
@@ -638,7 +639,7 @@ def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     nums = [x["num"] for x in history]
     regime = detect_regime(sizes)
 
-    features = {
+    return {
         "last": sizes[-1],
         "run": trailing_run(sizes),
         "ratio_big": ratio_big(sizes, 20),
@@ -664,11 +665,210 @@ def deep_pattern_features(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "parity_small": sum(1 for n in nums[-20:] if n % 2 == 0),
     }
 
-    return features
+
+# ============================================================
+# EXACT SUFFIX MEMORY
+# ============================================================
+def exact_suffix_memory(history: List[Dict[str, Any]]) -> float:
+    if len(history) < 8:
+        return 0.5
+
+    sizes = [x["size"] for x in history]
+    matches = []
+
+    for window in [3, 5, 8, 12, 20, 30, 50, 100]:
+        if len(sizes) < window:
+            continue
+        seq = tuple(sizes[-window:])
+        key = f"{window}:{json.dumps(list(seq))}"
+        if key in PATTERN_DB:
+            total = PATTERN_DB[key]["total"]
+            big = PATTERN_DB[key]["big"]
+            if total > 0:
+                matches.append((window, big / total, total))
+
+    if not matches:
+        return 0.5
+
+    total_weight = sum(v for _, _, v in matches)
+    if total_weight <= 0:
+        return 0.5
+
+    return sum(p * v for _, p, v in matches) / total_weight
+
+
+def model_trend(history: List[Dict[str, Any]]) -> float:
+    sizes = [x["size"] for x in history]
+    run = trailing_run(sizes)
+    if run >= 5:
+        return 1.0 if sizes[-1] == 1 else 0.0
+    if run >= 3:
+        return 1.0 if sizes[-1] == 0 else 0.0
+    return 0.5
+
+
+def model_alternation(history: List[Dict[str, Any]]) -> float:
+    sizes = [x["size"] for x in history]
+    alt = alternating_score(sizes, 12)
+    if alt >= 0.6:
+        return 1.0 - sizes[-1]
+    return 0.5
+
+
+def model_block(history: List[Dict[str, Any]]) -> float:
+    sizes = [x["size"] for x in history]
+    if block_pattern(sizes, 10):
+        return 1.0 - sizes[-1]
+    return 0.5
+
+
+def model_volatility(history: List[Dict[str, Any]]) -> float:
+    sizes = [x["size"] for x in history]
+    vol = volatility(sizes, 20)
+    if vol > 0.5:
+        return 1.0 - sizes[-1]
+    return 0.5
+
+
+def model_bias(history: List[Dict[str, Any]]) -> float:
+    sizes = [x["size"] for x in history]
+    ratio = ratio_big(sizes, 20)
+    if abs(ratio - 0.5) > 0.18:
+        return 1.0 if ratio >= 0.5 else 0.0
+    return 0.5
+
+
+def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scores = [
+        ("Exact", exact_suffix_memory(history)),
+        ("Trend", model_trend(history)),
+        ("Alternation", model_alternation(history)),
+        ("Block", model_block(history)),
+        ("Volatility", model_volatility(history)),
+        ("Bias", model_bias(history)),
+    ]
+
+    weights = {
+        "Exact": 0.35,
+        "Trend": 0.15,
+        "Alternation": 0.15,
+        "Block": 0.10,
+        "Volatility": 0.10,
+        "Bias": 0.15,
+    }
+
+    regime = detect_regime([x["size"] for x in history])
+    if regime == "TRAP":
+        weights["Exact"] += 0.10
+        weights["Alternation"] += 0.10
+    if regime == "TREND":
+        weights["Trend"] += 0.15
+    if regime == "ALTERNATING":
+        weights["Alternation"] += 0.15
+    if regime == "BLOCK":
+        weights["Block"] += 0.12
+
+    total_weight = sum(weights.values())
+    final = 0.0
+    for name, score in scores:
+        final += score * weights.get(name, 0.10)
+
+    final = final / total_weight
+    return {
+        "p_big": clamp(final, 0.05, 0.95),
+        "weights": weights,
+        "scores": scores,
+    }
+
+
+def normal_predict(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    sizes = [x["size"] for x in history]
+    ensemble = ensemble_probability(history)
+    p_big = ensemble["p_big"]
+
+    regime = detect_regime(sizes)
+
+    if regime == "TRAP":
+        p_big = 1.0 - sizes[-1]
+    elif regime == "ALTERNATING":
+        p_big = 1.0 - sizes[-1]
+    elif regime == "BLOCK":
+        p_big = 1.0 - sizes[-1]
+    elif regime == "TREND":
+        p_big = sizes[-1]
+    elif regime == "CHOPPY":
+        p_big = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
+
+    stale = stale_pattern_penalty(history, 12)
+    if stale > 0:
+        p_big = p_big * (1.0 - stale)
+
+    strength = signal_strength(history)
+    if strength < 0.45:
+        p_big = 0.5
+
+    pred_dir = 1 if p_big >= 0.5 else 0
+    return {
+        "pred_dir": pred_dir,
+        "p_big": clamp(p_big, 0.05, 0.95),
+        "strength": strength,
+    }
+
+
+def recovery_predict(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
+    sizes = [x["size"] for x in history]
+    exact_p = exact_suffix_memory(history)
+    regime = detect_regime(sizes)
+    last = sizes[-1]
+    run = trailing_run(sizes)
+
+    score = 0.5
+    score = (score * 0.40) + (exact_p * 0.60)
+
+    if regime == "TRAP":
+        score = 1.0 - last
+    elif regime == "ALTERNATING":
+        score = 1.0 - last
+    elif regime == "BLOCK":
+        score = 1.0 - last
+    elif regime == "TREND":
+        score = last
+    elif regime == "CHOPPY":
+        score = 0.5 + (ratio_big(sizes, 20) - 0.5) * 0.7
+    else:
+        score = ratio_big(sizes, 20)
+
+    if run >= 3:
+        score = 1.0 - last
+
+    if loss_streak >= 1:
+        score = 1.0 - last
+    if loss_streak >= 2:
+        score = 1.0 - majority_dir(sizes, 6)
+
+    stale = stale_pattern_penalty(history, 12)
+    if stale > 0:
+        score = score * (1.0 - stale)
+        score = 1.0 - score
+
+    strength = signal_strength(history)
+    if strength < 0.45:
+        score = 0.5
+    elif strength < 0.60:
+        score = 0.5 + (score - 0.5) * 0.6
+
+    score = clamp(score, 0.05, 0.95)
+    pred_dir = 1 if score >= 0.5 else 0
+
+    return {
+        "pred_dir": pred_dir,
+        "p_big": score,
+        "strength": strength,
+    }
 
 
 # ============================================================
-# MULTI-OBJECTIVE SIDE PREDICTOR
+# SIDE PREDICTOR
 # ============================================================
 def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str, Any]:
     if not history:
@@ -694,7 +894,6 @@ def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str
         0.10 * vol_p
     )
 
-    # recovery logic
     if loss_streak >= 1:
         score = 1.0 - score
         if regime in ["TRAP", "ALTERNATING", "BLOCK"]:
@@ -703,13 +902,11 @@ def side_prediction(history: List[Dict[str, Any]], loss_streak: int) -> Dict[str
     if loss_streak >= 2:
         score = 1.0 - majority_dir(sizes, 6)
 
-    # stale penalty
     stale = stale_pattern_penalty(history, 12)
     if stale > 0:
         score = score * (1.0 - stale)
         score = 1.0 - score
 
-    # exact suffix override
     if regime == "TRAP":
         score = 1.0 - sizes[-1]
     elif regime == "ALTERNATING":
@@ -749,13 +946,11 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
         pool = list(range(10))
 
     score = defaultdict(float)
-
     bias_map = STORE.get_num_bias(pred_dir, pool)
     for n in pool:
         score[n] += bias_map.get(n, 1.0)
         score[n] += freq.get(n, 0) * 2.5
 
-    # last numbers pattern
     if recent:
         last_num = recent[-1]
         if pred_dir == 1:
@@ -767,7 +962,6 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
                 if n != last_num:
                     score[n] += 0.8
 
-    # group preference
     if pred_dir == 1:
         for n in (6, 7, 8):
             score[n] += 2.2
@@ -779,7 +973,6 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
         for n in (0, 4):
             score[n] += 1.0
 
-    # avoid stale repeats
     for n in pool:
         if recent.count(n) >= 4:
             score[n] *= 0.25
@@ -799,7 +992,7 @@ def choose_number(pred_dir: int, history: List[Dict[str, Any]], loss_streak: int
 
 
 # ============================================================
-# ADVANCED PREDICTION
+# FINAL PREDICTION
 # ============================================================
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
@@ -893,23 +1086,19 @@ def learn_from_resolution(res: dict):
         STATE.loss_streak += 1
         STATE.win_streak = 0
 
-    # update model weights by correctness
     for sig in res.get("sigs", []):
         name = sig.get("name")
         if name:
             STORE.update_signal_weight(name, bool(res["win"]))
 
-    # update pattern memory and number memory
     if STATE.history:
         actual_size = 1 if res["actual_size"] == "BIG" else 0
         STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
         STORE.update_num_memory(int(res["actual_num"]), actual_size)
 
-    # update model state
     model_names = ["Exact", "Trend", "Alternation", "Block", "Volatility", "Bias"]
     for name in model_names:
         STORE.ensure_model_state(name)
-        # easy heuristic: use outcome as correctness for all because one final result is the truth
         STORE.update_model_state(name, bool(res["win"]))
 
 
@@ -977,33 +1166,52 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# FETCH
+# FETCH DATA WITH BACKOFF
 # ============================================================
 async def fetch_data(session):
     urls = CFG.api_urls()
+    last_good = [x for x in STATE.history]
+
     for url in urls:
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
-                if r.status != 200:
-                    log.warning("Fetch failed for %s: status=%s", url, r.status)
+            for retry in range(3):
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
+                        if r.status == 429:
+                            wait = (retry + 1) * 2
+                            log.warning("429 from %s. retrying in %ss", url, wait)
+                            await asyncio.sleep(wait)
+                            continue
+
+                        if r.status != 200:
+                            log.warning("HTTP %s from %s", r.status, url)
+                            break
+
+                        payload = await r.json()
+                        parsed = parse_history_payload(payload)
+
+                        if parsed:
+                            STATE.history = parsed[-1000:]
+                            log.info("Fetched history from %s -> %d records", url, len(parsed))
+                            return True
+
+                        log.warning("Empty history payload from %s", url)
+                        break
+
+                except Exception as e:
+                    log.warning("Retry %s failed for %s: %s", retry + 1, url, e)
+                    await asyncio.sleep((retry + 1) * 2)
                     continue
 
-                payload = await r.json()
-                parsed = parse_history_payload(payload)
-
-                if parsed:
-                    STATE.history = parsed[-1000:]
-                    log.info("Fetched history from %s -> %d records", url, len(parsed))
-                    return True
-
-                log.warning("Empty history payload from %s", url)
-                continue
-
         except Exception as e:
-            log.warning("Fetch failed for %s: %s", url, e)
-            continue
+            log.warning("Fetch exception on %s: %s", url, e)
 
-    log.warning("All API endpoints failed.")
+    if last_good:
+        STATE.history = last_good
+        log.warning("Using last known good history because all API endpoints failed.")
+        return True
+
+    log.warning("All API endpoints failed and no last-good history exists.")
     return False
 
 
@@ -1076,6 +1284,14 @@ async def send_msg(app, text, retries=3):
 
 
 # ============================================================
+# HTTP HANDLER
+# ============================================================
+async def webhook_handler(request):
+    await app.update_queue.put(request)
+    return web.Response(text="OK")
+
+
+# ============================================================
 # WORKER
 # ============================================================
 async def worker_loop(app, session):
@@ -1138,9 +1354,11 @@ async def main():
         if CFG.webhook_url:
             webhook_path = f"/webhook/{CFG.telegram_token}"
             await app.bot.set_webhook(url=f"{CFG.webhook_url}{webhook_path}", drop_pending_updates=True)
+
             web_app = web.Application()
             web_app.router.add_get("/", handle_ping)
-            web_app.router.add_post(webhook_path, app.update_queue.put)
+            web_app.router.add_post(webhook_path, webhook_handler)
+
             runner = web.AppRunner(web_app)
             await runner.setup()
             await web.TCPSite(runner, "0.0.0.0", port).start()
