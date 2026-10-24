@@ -55,6 +55,9 @@ class Config:
         urls = [u.strip() for u in self.source_api_urls.split(",") if u.strip()]
         return urls if urls else []
 
+    def validate(self):
+        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+
 
 CFG = Config()
 
@@ -539,7 +542,10 @@ class Storage:
         prev = tuple(prev_sizes[-3:])
         key = f"trans:{json.dumps(list(prev))}"
         with self._conn() as c:
-            row = c.execute("SELECT big_count, small_count, total_count FROM transition_stats WHERE key=?", (key,)).fetchone()
+            row = c.execute(
+                "SELECT big_count, small_count, total_count FROM transition_stats WHERE key=?",
+                (key,),
+            ).fetchone()
             if row is None:
                 c.execute(
                     "INSERT INTO transition_stats (key, big_count, small_count, total_count, last_seen) VALUES (?, ?, ?, ?, ?)",
