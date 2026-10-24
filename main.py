@@ -1,11 +1,13 @@
 """
-V900 RHYTHM-MASTER - KING MODE
-================================
-- Multi-regime ensemble predictor
-- Double-loss contrarian rebound
-- Smart anti-trap and anti-chop logic
-- Strong momentum and reversal detection
-- Adaptive staking and number picking
+V900 DEEP PATTERN MASTER
+=======================
+- Uses last 1000 results from API
+- Deep pattern memory + historical signal bank
+- Alternation / block / streak / trap / reversal / trend detection
+- Volatility and frequency scoring
+- Rebound logic after losses
+- Smart stake sizing
+- Number selection based on real pattern frequency
 """
 
 import asyncio
@@ -17,8 +19,8 @@ import os
 import random
 import sqlite3
 import time
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -41,11 +43,11 @@ class Config:
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "predictor_v900.db")
+    db_path: str = os.environ.get("DB_PATH", "predictor_v900_deep.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V900 RHYTHM-MASTER"
+    bot_name: str = "V900 DEEP PATTERN MASTER"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -67,9 +69,12 @@ def setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900.log", maxBytes=1_000_000, backupCount=2)
-    fh.setFormatter(fmt); root.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v900_deep.log", maxBytes=1_000_000, backupCount=2)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
 
 
 setup_logging()
@@ -117,7 +122,7 @@ class Storage:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 p["issue"], p["size"], p["num"], p["mode"], p["logic"], json.dumps(p.get("sigs", [])),
-                p.get("raw_conf", 50), p.get("regime", "CHOPPY"), json.dumps(p.get("details", {})),
+                p.get("raw_conf", 50), p.get("regime", "UNKNOWN"), json.dumps(p.get("details", {})),
                 p.get("p_big", 0.5), p.get("confidence", 50), p.get("consensus", 0.5), p.get("stake", "1x"), time.time()
             ))
 
@@ -136,7 +141,13 @@ class Storage:
             act = history_dict[issue]
             act_size_str = "BIG" if act["size"] == 1 else "SMALL"
             win = (p_size == act_size_str)
-            status = ("JACK 🏆" if p_num == act["num"] else "WIN ✅") if win else "LOSS ❌"
+
+            if win and p_num == act["num"]:
+                status = "JACK 🏆"
+            elif win:
+                status = "WIN ✅"
+            else:
+                status = "LOSS ❌"
 
             with self._conn() as c:
                 c.execute(
@@ -190,15 +201,17 @@ STATE = BotState()
 
 
 # =========================
-# ADVANCED PREDICTOR
+# HELPER FUNCTIONS
 # =========================
-@dataclass
-class Signal:
-    name: str
-    dir: int
-    weight: float
-    confidence: int
-    rationale: str = ""
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def safe_int(v, default=0):
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 def trailing_run(values: List[int], target: Optional[int] = None) -> int:
@@ -214,379 +227,359 @@ def trailing_run(values: List[int], target: Optional[int] = None) -> int:
     return run
 
 
-def has_alternating_pattern(values: List[int], window: int = 10) -> bool:
-    if len(values) < window:
-        return False
-    arr = values[-window:]
-    return all(arr[i] != arr[i - 1] for i in range(1, len(arr)))
+def majority_dir(values: List[int], window: int = 6) -> int:
+    if not values:
+        return 1
+    chunk = values[-window:]
+    big_count = sum(chunk)
+    return 1 if big_count >= (len(chunk) / 2) else 0
 
 
-def has_block_pattern(values: List[int], window: int = 10) -> bool:
-    if len(values) < window:
+def alternating_score(sizes: List[int], window: int = 12) -> float:
+    if len(sizes) < 2:
+        return 0.0
+    arr = sizes[-window:]
+    changes = 0
+    for i in range(1, len(arr)):
+        if arr[i] != arr[i - 1]:
+            changes += 1
+    return changes / max(1, len(arr) - 1)
+
+
+def block_score(sizes: List[int], window: int = 10) -> bool:
+    if len(sizes) < 4:
         return False
-    arr = values[-window:]
-    if len(arr) >= 4:
-        for i in range(len(arr) - 3):
-            a, b, c, d = arr[i:i+4]
-            if a == b and c == d and a != c:
-                return True
+    arr = sizes[-window:]
+    for i in range(len(arr) - 3):
+        a, b, c, d = arr[i:i+4]
+        if a == b and c == d and a != c:
+            return True
     return False
 
 
-def recent_majority(values: List[int], n: int = 5) -> int:
-    if not values:
-        return 1
-    chunk = values[-n:]
-    return 1 if sum(chunk) >= (len(chunk) / 2) else 0
+def recent_big_ratio(sizes: List[int], window: int = 20) -> float:
+    if len(sizes) < 1:
+        return 0.5
+    arr = sizes[-window:]
+    return sum(arr) / len(arr)
 
 
-def regime_of(sizes: List[int]) -> str:
-    if len(sizes) < 8:
-        return "COLD"
-
-    last_8 = sizes[-8:]
-
-    if has_alternating_pattern(sizes, 8):
-        return "REVERSAL"
-    if has_block_pattern(sizes, 10):
-        return "BLOCK"
-    if trailing_run(sizes, sizes[-1]) >= 3:
-        return "TRAP"
-    if recent_majority(sizes, 5) == sizes[-1] and len(sizes) >= 10:
-        return "TREND"
-    if abs(sum(last_8) - (len(last_8) / 2)) <= 1:
-        return "CHOPPY"
-
-    return "CYCLE"
+def volatility_score(sizes: List[int], window: int = 20) -> float:
+    if len(sizes) < 2:
+        return 0.0
+    arr = sizes[-window:]
+    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
+    return sum(diffs) / max(1, len(diffs))
 
 
-def detect_rhythm_signal(sizes: List[int]) -> Optional[Signal]:
-    if len(sizes) < 10:
-        return None
-    last_10 = sizes[-10:]
-    if has_alternating_pattern(sizes, 10):
-        dir_ = 1 - sizes[-1]
-        return Signal(
-            name="Rhythm-Alt",
-            dir=dir_,
-            weight=3.0,
-            confidence=86,
-            rationale="Alternating pattern suggests reversal against last side."
-        )
-    if last_10[-1] == last_10[-2] and last_10[-3] != last_10[-2]:
-        dir_ = 1 - sizes[-1]
-        return Signal(
-            name="Block-Break",
-            dir=dir_,
-            weight=2.5,
-            confidence=78,
-            rationale="BBSS break pattern suggests a trap shift."
-        )
-    return None
+# =========================
+# DEEP MARKET ANALYSIS
+# =========================
+def analyze_history(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not history:
+        return {
+            "side_bias": 0.5,
+            "regime": "EMPTY",
+            "patterns": [],
+            "signal_strength": 0.0,
+            "volatility": 0.0,
+            "trend_run": 0,
+            "last_size": 1,
+        }
 
+    sizes = [x["size"] for x in history]
+    nums = [x["num"] for x in history]
 
-def detect_trap_signal(sizes: List[int]) -> Optional[Signal]:
-    if len(sizes) < 6:
-        return None
+    runs = {
+        "last_run": trailing_run(sizes),
+        "last_big_run": trailing_run([1 if s == 1 else 0 for s in sizes]),
+        "last_small_run": trailing_run([1 if s == 0 else 0 for s in sizes]),
+    }
+
+    recent_ratio = recent_big_ratio(sizes, 20)
+    alt = alternating_score(sizes, 12)
+    block = block_score(sizes, 10)
     last = sizes[-1]
-    run = trailing_run(sizes)
-    if run >= 3:
-        return Signal(
-            name="Trap-Break",
-            dir=1 - last,
-            weight=4.2,
-            confidence=92,
-            rationale="3+ same-side streak is high-probability trap."
-        )
-    return None
+    last_dir = 1 if last == 1 else 0
+
+    # find dominant recent number group
+    freq = Counter(nums[-200:])
+    most_common = freq.most_common(5)
+    number_bias = {
+        "most_common": most_common[:3],
+        "big_group_score": sum(freq[n] for n in range(5, 10)),
+        "small_group_score": sum(freq[n] for n in range(0, 5)),
+    }
+
+    # side bias / confidence
+    side_bias = 0.5
+    if len(sizes) >= 10:
+        side_bias = recent_big_ratio(sizes, 10)
+
+    # regime detection
+    regime = "DYNAMIC"
+    if alt >= 0.65:
+        regime = "ALTERNATING"
+    elif block:
+        regime = "BLOCK"
+    elif runs["last_run"] >= 3:
+        regime = "TRAP"
+    elif runs["last_run"] >= 5:
+        regime = "TREND"
+    elif abs(recent_ratio - 0.5) <= 0.15:
+        regime = "CHOPPY"
+    else:
+        regime = "CYCLE"
+
+    # signal strength
+    signal_strength = 0.0
+    if alt >= 0.5:
+        signal_strength += 0.25
+    if block:
+        signal_strength += 0.20
+    if runs["last_run"] >= 3:
+        signal_strength += 0.30
+    if abs(recent_ratio - 0.5) > 0.25:
+        signal_strength += 0.15
+    signal_strength = clamp(signal_strength, 0.0, 1.0)
+
+    # direct pattern features
+    pattern_info = {
+        "alternating": alt,
+        "block_pattern": block,
+        "streak": runs["last_run"],
+        "recent_big_ratio": recent_ratio,
+        "last_side": last_dir,
+        "volatility": volatility_score(sizes, 20),
+        "number_bias": number_bias,
+    }
+
+    return {
+        "side_bias": side_bias,
+        "regime": regime,
+        "patterns": pattern_info,
+        "signal_strength": signal_strength,
+        "volatility": volatility_score(sizes, 20),
+        "trend_run": runs["last_run"],
+        "last_size": last,
+    }
 
 
-def detect_trend_signal(sizes: List[int]) -> Optional[Signal]:
-    if len(sizes) < 6:
-        return None
-    last = sizes[-1]
-    run = trailing_run(sizes)
-    if run >= 5:
-        return Signal(
-            name="Trend-Force",
-            dir=last,
-            weight=3.0,
-            confidence=80,
-            rationale="Strong trend continuation is alive."
-        )
-    if run in (1, 2):
-        return Signal(
-            name="Trend-Soft",
-            dir=last,
-            weight=1.8,
-            confidence=66,
-            rationale="Low-level continuation pressure."
-        )
-    return None
+# =========================
+# DEEP HISTORICAL MEMORY SCORING
+# =========================
+def build_pattern_memory(history: List[Dict[str, Any]], window: int = 12):
+    """
+    Builds a memory bank of pattern occurrences from the recent 1000 results.
+    Score is based on how often a similar pattern ended as BIG or SMALL.
+    """
+    if len(history) < window + 5:
+        return {
+            "big_score": 0.5,
+            "small_score": 0.5,
+            "pattern_count": 0
+        }
 
+    sizes = [x["size"] for x in history]
+    scores = {"BIG": 0.0, "SMALL": 0.0}
+    seen = 0
 
-def detect_reversal_signal(sizes: List[int]) -> Optional[Signal]:
-    if len(sizes) < 8:
-        return None
-    recent = sizes[-8:]
-    if recent.count(1) >= 6 and recent[-1] == 1:
-        return Signal(
-            name="Reversal-Fade-Big",
-            dir=0,
-            weight=2.7,
-            confidence=82,
-            rationale="Extended BIG side is likely exhausted."
-        )
-    if recent.count(0) >= 6 and recent[-1] == 0:
-        return Signal(
-            name="Reversal-Fade-Small",
-            dir=1,
-            weight=2.7,
-            confidence=82,
-            rationale="Extended SMALL side is likely exhausted."
-        )
-    return None
+    for i in range(window, len(sizes) - 1):
+        seq = sizes[i-window:i]
+        next_size = sizes[i]
 
+        # pattern templates
+        last_run = trailing_run(seq)
+        alt = alternating_score(seq, min(len(seq), 10))
+        block = block_score(seq, min(len(seq), 10))
+        ratio = recent_big_ratio(seq, min(len(seq), 20))
 
-def detect_cycle_signal(sizes: List[int]) -> Optional[Signal]:
-    if len(sizes) < 12:
-        return None
-    if has_alternating_pattern(sizes, 12):
-        return Signal(
-            name="Cycle-Flip",
-            dir=1 - sizes[-1],
-            weight=2.2,
-            confidence=72,
-            rationale="Cycle alternation points to opposite-side move."
-        )
-    return None
+        match = False
+        if last_run >= 3:
+            match = True
+        if alt >= 0.6:
+            match = True
+        if block:
+            match = True
+        if abs(ratio - 0.5) > 0.2:
+            match = True
 
+        if match:
+            seen += 1
+            if next_size == 1:
+                scores["BIG"] += 1.0
+            else:
+                scores["SMALL"] += 1.0
 
-def detect_frequency_signal(nums: List[int]) -> Optional[Signal]:
-    if len(nums) < 10:
-        return None
-    recent = nums[-20:]
-    big_numbers = [n for n in recent if n >= 5]
-    small_numbers = [n for n in recent if n < 5]
-    if len(big_numbers) > len(small_numbers):
-        return Signal(
-            name="Freq-Bias-Big",
-            dir=1,
-            weight=1.8,
-            confidence=66,
-            rationale="Recent number distribution prefers BIG side."
-        )
-    if len(small_numbers) > len(big_numbers):
-        return Signal(
-            name="Freq-Bias-Small",
-            dir=0,
-            weight=1.8,
-            confidence=66,
-            rationale="Recent number distribution prefers SMALL side."
-        )
-    return None
-
-
-def detect_loss_rebound_signal(sizes: List[int], loss_streak: int) -> Optional[Signal]:
-    if loss_streak == 0:
-        return None
-    if len(sizes) < 4:
-        return None
-    last = sizes[-1]
-
-    if loss_streak == 1:
-        return Signal(
-            name="Rebound-After-Loss",
-            dir=1 - last,
-            weight=4.8,
-            confidence=94,
-            rationale="Immediate rebound logic: reverse the last losing side."
-        )
-    if loss_streak >= 2:
-        dominant = recent_majority(sizes, 6)
-        return Signal(
-            name="Contrarian-Double-Loss",
-            dir=1 - dominant,
-            weight=5.8,
-            confidence=98,
-            rationale="Repeated losses suggest the market is likely trapping the previous pattern."
-        )
-    return None
-
-
-def weighted_choice(weights: Dict[Any, float]) -> Any:
-    total = sum(weights.values())
+    total = scores["BIG"] + scores["SMALL"]
     if total <= 0:
-        return random.choice(list(weights.keys()))
-    r = random.random() * total
-    acc = 0.0
-    for key, val in weights.items():
-        acc += val
-        if r <= acc:
-            return key
-    return max(weights, key=weights.get)
+        return {"big_score": 0.5, "small_score": 0.5, "pattern_count": 0}
+    return {
+        "big_score": scores["BIG"] / total,
+        "small_score": scores["SMALL"] / total,
+        "pattern_count": seen
+    }
 
 
-def pick_number(pred_dir: int, nums: List[int], sizes: List[int], loss_streak: int) -> int:
+# =========================
+# PREDICTOR
+# =========================
+def choose_number(pred_dir: int, history: List[Dict[str, Any]], state_loss_streak: int) -> int:
+    nums = [x["num"] for x in history]
+    recent = nums[-200:]
+    freq = Counter(recent)
+
     pool = list(range(5, 10)) if pred_dir == 1 else list(range(0, 5))
     if not pool:
         pool = list(range(10))
 
-    recent = nums[-20:]
-    freq = Counter(recent)
-    weights: Dict[int, float] = {}
-
+    weights = {}
     for n in pool:
         w = 1.0
 
-        w += freq.get(n, 0) * 2.5
+        # frequency importance
+        w += freq.get(n, 0) * 3.0
 
-        if recent:
-            nearest = min(recent, key=lambda x: abs(x - n))
-            w += max(0.0, 2.0 - abs(nearest - n)) * 1.2
-
+        # number cluster preference
         if pred_dir == 1:
             if n in (6, 7, 8):
-                w += 1.5
-            if loss_streak >= 2 and n <= 4:
-                w *= 0.25
+                w += 2.0
+            if n in (5, 9):
+                w += 1.0
         else:
             if n in (1, 2, 3):
-                w += 1.5
-            if loss_streak >= 2 and n >= 5:
-                w *= 0.25
+                w += 2.0
+            if n in (0, 4):
+                w += 1.0
 
-        if recent and len(recent) >= 6:
-            last_6 = recent[-6:]
-            if n in last_6 and recent.count(n) >= 3:
-                w *= 0.6
+        # avoid repeated stale numbers
+        recent_window = recent[-20:]
+        if recent_window.count(n) >= 4:
+            w *= 0.35
+
+        # after heavy loss streak, avoid repeating obvious trap numbers
+        if state_loss_streak >= 2:
+            if pred_dir == 1 and n <= 4:
+                w *= 0.2
+            if pred_dir == 0 and n >= 5:
+                w *= 0.2
 
         weights[n] = w
 
     if not weights:
         return random.choice(pool)
 
-    return weighted_choice(weights)
+    return max(weights, key=weights.get)
 
 
 def generate_prediction():
     if len(STATE.history) < CFG.min_history:
         return None
 
-    sizes = [x["size"] for x in STATE.history]
-    nums = [x["num"] for x in STATE.history]
+    history = STATE.history[-1000:]
+    sizes = [x["size"] for x in history]
+    nums = [x["num"] for x in history]
+    market = analyze_history(history)
+    memory = build_pattern_memory(history, window=12)
 
-    signal_list: List[Signal] = []
+    # --- base side probability ---
+    p_big = market["side_bias"]
 
-    sig = detect_rhythm_signal(sizes)
-    if sig:
-        signal_list.append(sig)
+    # 1. alternation: reversal bias
+    if market["regime"] == "ALTERNATING":
+        p_big = 1.0 - sizes[-1]
+    # 2. trap pattern: reverse streak
+    elif market["regime"] == "TRAP":
+        p_big = 1.0 - sizes[-1]
+    # 3. trend pattern: continue with momentum
+    elif market["regime"] == "TREND":
+        p_big = sizes[-1]
+    # 4. block pattern: likely break
+    elif market["regime"] == "BLOCK":
+        p_big = 1.0 - sizes[-1]
+    # 5. choppy: use recent ratio more gently
+    elif market["regime"] == "CHOPPY":
+        p_big = 0.5 + (market["side_bias"] - 0.5) * 0.8
 
-    sig = detect_trap_signal(sizes)
-    if sig:
-        signal_list.append(sig)
+    # 6. memory bank adjustment
+    if memory["pattern_count"] > 0:
+        if memory["big_score"] > memory["small_score"]:
+            p_big = 0.5 + (p_big - 0.5) * 0.7 + (memory["big_score"] - 0.5) * 0.6
+        else:
+            p_big = 0.5 + (p_big - 0.5) * 0.7 + (memory["small_score"] - 0.5) * 0.6
 
-    sig = detect_trend_signal(sizes)
-    if sig:
-        signal_list.append(sig)
+    # 7. state-driven adaptive adjustment
+    if STATE.loss_streak == 1:
+        p_big = 1.0 - sizes[-1]
+    elif STATE.loss_streak >= 2:
+        p_big = 1.0 - majority_dir(sizes, 6)
 
-    sig = detect_reversal_signal(sizes)
-    if sig:
-        signal_list.append(sig)
+    p_big = clamp(p_big, 0.05, 0.95)
 
-    sig = detect_cycle_signal(sizes)
-    if sig:
-        signal_list.append(sig)
+    pred_dir = 1 if p_big >= 0.5 else 0
 
-    sig = detect_frequency_signal(nums)
-    if sig:
-        signal_list.append(sig)
-
-    sig = detect_loss_rebound_signal(sizes, STATE.loss_streak)
-    if sig:
-        signal_list.append(sig)
-
-    if not signal_list:
-        last_3 = sizes[-3:]
-        fallback_dir = 1 if sum(last_3) >= 2 else 0
-        signal_list.append(
-            Signal(
-                name="Fallback-Majority",
-                dir=fallback_dir,
-                weight=1.2,
-                confidence=57,
-                rationale="No strong regime, using last-three majority."
-            )
-        )
-
-    big_weight = sum(s.weight for s in signal_list if s.dir == 1)
-    small_weight = sum(s.weight for s in signal_list if s.dir == 0)
-    total_weight = big_weight + small_weight
-
-    if total_weight <= 0:
-        pred_dir = 1 if random.random() >= 0.5 else 0
-        p_big = 0.5
-    else:
-        p_big = big_weight / total_weight
-        pred_dir = 1 if p_big >= 0.5 else 0
-
+    # Risk stake
     stake = "1x"
     if STATE.loss_streak >= 2:
         stake = "0.5x"
     elif STATE.win_streak >= 2:
         stake = "2x"
 
-    mode = "DYNAMIC"
-    if STATE.loss_streak == 1:
-        mode = "REBOUND"
-    elif STATE.loss_streak >= 2:
+    # Mode
+    if STATE.loss_streak >= 2:
         mode = "CONTRARIAN"
-    elif regime_of(sizes) == "TRAP":
+    elif STATE.loss_streak == 1:
+        mode = "REBOUND"
+    elif market["regime"] == "TRAP":
         mode = "ANTI-TRAP"
-    elif regime_of(sizes) == "TREND":
+    elif market["regime"] == "TREND":
         mode = "TREND"
-    elif regime_of(sizes) == "REVERSAL":
+    elif market["regime"] == "ALTERNATING":
         mode = "REVERSAL"
+    else:
+        mode = "DYNAMIC"
 
-    chosen_num = pick_number(pred_dir, nums, sizes, STATE.loss_streak)
+    # Target number
+    num = choose_number(pred_dir, history, STATE.loss_streak)
     issue = str(int(STATE.history[-1]["issue"]) + 1)
 
-    active_signals = [
-        {
-            "name": s.name,
-            "dir": "BIG" if s.dir == 1 else "SMALL",
-            "weight": round(s.weight, 2),
-            "confidence": s.confidence,
-            "rationale": s.rationale
-        }
-        for s in signal_list
-    ]
+    # Build signal metadata
+    signal_names = []
+    if market["patterns"]["alternating"] >= 0.5:
+        signal_names.append("Alternating")
+    if market["patterns"]["block_pattern"]:
+        signal_names.append("Block")
+    if market["trend_run"] >= 3:
+        signal_names.append("Trap")
+    if market["patterns"]["volatility"] > 0.5:
+        signal_names.append("Volatile")
+    if memory["pattern_count"] > 0:
+        signal_names.append("Pattern-Memory")
 
-    raw_conf = int(50 + abs(p_big - 0.5) * 100)
-    conf = max(55, min(99, raw_conf))
+    # Confidence
+    confidence = int(50 + abs(p_big - 0.5) * 100)
+    confidence = max(55, min(99, confidence))
 
     return {
         "issue": issue,
         "size": "BIG" if pred_dir == 1 else "SMALL",
-        "num": chosen_num,
+        "num": num,
         "p_big": round(p_big, 4),
-        "confidence": conf,
-        "raw_conf": conf,
+        "confidence": confidence,
+        "raw_conf": confidence,
         "consensus": max(p_big, 1 - p_big),
         "mode": mode,
-        "regime": regime_of(sizes),
-        "logic": ", ".join(f"{s['name']}({s['dir']})" for s in active_signals),
-        "sigs": [
-            {"name": s["name"], "dir": pred_dir, "weight": s["weight"], "confidence": s["confidence"]}
-            for s in active_signals
-        ],
+        "regime": market["regime"],
+        "logic": ", ".join(signal_names) if signal_names else "Baseline",
+        "sigs": [{"name": s, "dir": pred_dir} for s in signal_names],
         "stake": stake,
         "details": {
-            "agents": {s["name"]: s["dir"] for s in active_signals},
-            "regime": regime_of(sizes),
+            "market": market,
+            "memory": memory,
             "loss_streak": STATE.loss_streak,
             "win_streak": STATE.win_streak,
-            "signals": active_signals
+            "pred_dir": pred_dir,
+            "issue": issue
         }
     }
 
@@ -601,7 +594,7 @@ def learn_from_resolution(res: dict):
 
 
 # =========================
-# DATA FETCH
+# API FETCH
 # =========================
 async def fetch_data(session):
     try:
@@ -609,19 +602,19 @@ async def fetch_data(session):
             if r.status != 200:
                 return False
 
-            data = await r.json()
-            if isinstance(data, dict):
-                items = data.get("data", {}).get("list", [])
-            else:
-                items = data if isinstance(data, list) else []
+            payload = await r.json()
+            if not isinstance(payload, dict):
+                return False
 
+            items = payload.get("data", {}).get("list", [])
             if not items:
                 return False
 
+            # sort by issue number
             items.sort(key=lambda x: int(x.get("issueNumber", x.get("issue", 0))))
+
             out = []
             seen = set()
-
             for item in items:
                 try:
                     issue = str(item.get("issueNumber", item.get("issue", "")))
@@ -629,13 +622,21 @@ async def fetch_data(session):
                         continue
                     seen.add(issue)
 
-                    num = int(item.get("number", item.get("value", 0)))
-                    out.append({"issue": issue, "num": num, "size": 1 if num >= 5 else 0})
+                    num = safe_int(item.get("number", item.get("value", 0)), 0)
+
+                    if num < 0 or num > 9:
+                        continue
+
+                    out.append({
+                        "issue": issue,
+                        "num": num,
+                        "size": 1 if num >= 5 else 0
+                    })
                 except Exception:
                     continue
 
             if out:
-                STATE.history = out
+                STATE.history = out[-1000:]
                 return True
             return False
     except Exception as e:
@@ -704,6 +705,7 @@ async def send_msg(app, text, retries=3):
 # =========================
 async def worker_loop(app, session):
     last_processed_issue = None
+
     while True:
         try:
             if await fetch_data(session):
