@@ -1,10 +1,9 @@
 """
-V700 HOUSE-TRAP TRACKER
-=======================
-- TrapAgent: Detects when the game maker is breaking a streak (Fake Breakout).
-- ZigzagAgent: Detects alternating patterns to counter confusion.
-- TrendAgent: Limited to streaks of 2 to avoid falling into traps.
-- Meta-Learner dynamically switches to the agent that is beating the house.
+V800 TREND-ENFORCER
+===================
+- Smart Fallback: Follows the majority of the last 10 results (never contradicts trend).
+- Strict Override: If HMM Regime is TRENDING_SMALL, final prediction MUST be SMALL.
+- Streak Recovery: Mutes complex AI agents after losses to strictly follow the trend.
 """
 
 import asyncio
@@ -30,34 +29,26 @@ from telegram.ext import Application, CommandHandler
 from telegram.error import TimedOut, NetworkError
 
 # =========================
-# CONFIG (Hardcoded for immediate run)
+# CONFIG
 # =========================
 @dataclass
 class Config:
-    # Tumhara Token
     telegram_token: str = os.environ.get("TG_TOKEN", "8611789455:AAH_GCZP4vLI4M-rF8knnPAartqucT51X7U")
-    
-    # Tumhari Chat ID (Private Channel ya User ID)
     chat_id_raw: str = os.environ.get("TG_CHAT", "1264164655")
-    
-    # Tumhara Render Webhook URL
     webhook_url: str = os.environ.get("WEBHOOK_URL", "https://wingo-bot-mcs3.onrender.com")
-    
     source_api_url: str = os.environ.get(
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.environ.get("DB_PATH", "predictor_v700.db")
+    db_path: str = os.environ.get("DB_PATH", "predictor_v800.db")
     log_dir: str = "logs"
     fetch_every: float = 2.0
     request_timeout: float = 15.0
-    bot_name: str = "V700 HOUSE-TRAP TRACKER"
+    bot_name: str = "V800 TREND-ENFORCER"
     min_history: int = 50
-    warm_min: int = 20
 
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
-        # Return as int if it's a numeric ID (like -100... or 126...)
         return int(raw) if raw.lstrip("-").isdigit() else raw
 
     def validate(self):
@@ -74,11 +65,11 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     sh = logging.StreamHandler(); sh.setFormatter(fmt); root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v700.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v800.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt); root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v700")
+log = logging.getLogger("v800")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -97,9 +88,11 @@ class HMMRegime:
         for i in range(n-2, -1, -1):
             if sizes[i] == last: run += 1
             else: break
-        if run >= 4:
+        
+        # Strict regime definition
+        if run >= 3:
             self.current_state = "TRENDING_BIG" if last == 1 else "TRENDING_SMALL"
-        elif run <= 2:
+        elif run <= 1:
             self.current_state = "CHOPPY"
         return self.current_state
 
@@ -109,7 +102,7 @@ class MetaLearner:
             "TrapAgent": deque(maxlen=50),
             "ZigzagAgent": deque(maxlen=50),
             "TrendAgent": deque(maxlen=50),
-            "PatternAgent": deque(maxlen=50)
+            "FallbackAgent": deque(maxlen=50)
         }
     def record(self, agent, correct):
         if agent in self.rewards:
@@ -194,15 +187,6 @@ class Storage:
             rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
-    def load_kv(self, key: str) -> Optional[str]:
-        with self._conn() as c:
-            row = c.execute("SELECT value FROM state_kv WHERE key=?", (key,)).fetchone()
-        return row[0] if row else None
-
-    def save_kv(self, key: str, value: str):
-        with self._conn() as c:
-            c.execute("INSERT OR REPLACE INTO state_kv (key, value) VALUES (?, ?)", (key, value))
-
 STORE = Storage(CFG.db_path)
 
 # =========================
@@ -270,20 +254,6 @@ def agent_trend(sizes):
         return {"dir": last, "conf": 58, "name": "SafeTrend"}
     return None
 
-def agent_pattern(sizes, nums):
-    if len(sizes) < 30: return None
-    seq = tuple(sizes[-2:])
-    b_count = matches = 0
-    for i in range(len(sizes)-2):
-        if tuple(sizes[i:i+2]) == seq:
-            matches += 1
-            if sizes[i+2] == 1: b_count += 1
-    if matches >= 4:
-        p = b_count / matches
-        if p > 0.65 or p < 0.35:
-            return {"dir": 1 if p > 0.65 else 0, "conf": 50 + abs(p-0.5)*100, "name": "N-Gram"}
-    return None
-
 # =========================
 # PREDICTOR
 # =========================
@@ -297,20 +267,32 @@ def generate_prediction():
     a_trap = agent_trap(sizes)
     a_zigzag = agent_zigzag(sizes)
     a_trend = agent_trend(sizes)
-    a_pattern = agent_pattern(sizes, nums)
     
     agents = [
         ("TrapAgent", a_trap),
         ("ZigzagAgent", a_zigzag),
-        ("TrendAgent", a_trend),
-        ("PatternAgent", a_pattern)
+        ("TrendAgent", a_trend)
     ]
     
     active_agents = [(name, pred) for name, pred in agents if pred is not None]
     
+    # 🔥 SMART FALLBACK LOGIC
     if not active_agents:
-        fallback_dir = 1 - sizes[-1]
-        active_agents.append(("FallbackAgent", {"dir": fallback_dir, "conf": 55, "name": "Fallback"}))
+        # Find majority in last 10
+        last_10 = sizes[-10:]
+        majority = 1 if sum(last_10) > 5 else 0
+        # If regime says trending, override majority
+        if regime == "TRENDING_SMALL": majority = 0
+        if regime == "TRENDING_BIG": majority = 1
+        
+        active_agents.append(("FallbackAgent", {"dir": majority, "conf": 60, "name": "SmartFallback"}))
+
+    # 🔥 LOSS STREAK OVERRIDE
+    if STATE.loss_streak >= 2:
+        if regime == "TRENDING_SMALL":
+            active_agents = [("StrictTrendAgent", {"dir": 0, "conf": 80, "name": "StrictTrend"})]
+        elif regime == "TRENDING_BIG":
+            active_agents = [("StrictTrendAgent", {"dir": 1, "conf": 80, "name": "StrictTrend"})]
 
     weights = STATE.meta.get_weights()
     total_log_odds = 0.0
@@ -334,6 +316,12 @@ def generate_prediction():
 
     p_big = 1 / (1 + math.exp(-total_log_odds))
     pred_dir = 1 if p_big > 0.5 else 0
+
+    # 🔥 STRICT REGIME OVERRIDE
+    # If regime is trending but edge is weak, obey regime.
+    if abs(p_big - 0.5) < 0.10:
+        if regime == "TRENDING_SMALL": pred_dir = 0
+        elif regime == "TRENDING_BIG": pred_dir = 1
 
     stake = "1x"
     if STATE.loss_streak >= 2: stake = "0.5x"
@@ -455,7 +443,7 @@ async def worker_loop(app, session):
         except Exception as e:
             log.exception(f"Loop error: {e}"); await asyncio.sleep(2)
 
-async def handle_ping(request): return web.Response(text="V700 is running!")
+async def handle_ping(request): return web.Response(text="V800 is running!")
 
 async def main():
     CFG.validate()
@@ -466,7 +454,6 @@ async def main():
         await app.start()
         port = int(os.environ.get("PORT", 8080))
         
-        # Webhook mode if URL is provided
         if CFG.webhook_url:
             webhook_path = f"/webhook/{CFG.telegram_token}"
             await app.bot.set_webhook(url=f"{CFG.webhook_url}{webhook_path}", drop_pending_updates=True)
@@ -476,11 +463,9 @@ async def main():
             runner = web.AppRunner(web_app)
             await runner.setup()
             await web.TCPSite(runner, "0.0.0.0", port).start()
-            log.info(f"Webhook started on port {port}")
         else:
             await app.bot.delete_webhook(drop_pending_updates=True)
             await app.updater.start_polling(drop_pending_updates=True)
-            log.info("Polling started")
 
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(worker_loop(app, session))
