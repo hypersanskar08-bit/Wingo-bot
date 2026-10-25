@@ -1,10 +1,11 @@
 """
-V916 HYPER PRO PREDICTOR (FIXED VIOLET BUG)
-===========================================
-- Fixed KeyError: 'VIOLET' crash.
-- Handles 0 as RED and 5 as GREEN internally for models.
-- Dynamic Choice: Predicts only ONE (Size or Color) based on highest edge.
-- Bayesian Weights for both Size and Color.
+V916 HYPER PRO PREDICTOR (FINAL ULTIMATE FIX)
+=============================================
+- Fixed KeyError: 'logic' (Database sync issue)
+- Fixed KeyError: 'VIOLET' (Color logic)
+- Dynamic Selection: Predicts only ONE (Size or Color) based on highest Edge.
+- Strictly 1 Prediction per period.
+- Token directly applied.
 """
 
 import asyncio
@@ -12,16 +13,15 @@ import gc
 import html
 import json
 import logging
-import math
 import os
 import random
 import sqlite3
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
@@ -93,6 +93,7 @@ def clamp(v: float, low: float, high: float) -> float: return max(low, min(high,
 def safe_int(x, default=0):
     try: return int(x)
     except: return default
+
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None: return None
     if isinstance(value, str):
@@ -162,7 +163,7 @@ def detect_regime(sizes: List[int]) -> str:
 # ============================================================
 class BayesianWeights:
     def __init__(self):
-        self.size = {"Markov": 1.0, "EMA": 1.0, "DragonStreak": 1.0, "Exact": 1.0, "Trend": 1.0, "Alternation": 1.0, "Block": 1.0, "Run": 1.0, "Bias": 1.0}
+        self.size = {"Markov": 1.0, "EMA": 1.0, "Streak": 1.0, "Trend": 1.0, "Alternation": 1.0, "Bias": 1.0}
         self.color = {"ColorMarkov": 1.0, "ColorStreak": 1.0, "ColorFreq": 1.0, "ColorAlternation": 1.0}
         
     def update(self, size_votes: Dict[str, str], color_votes: Dict[str, str], actual_size: str, actual_color: str):
@@ -194,7 +195,7 @@ class BotState:
 STATE = BotState()
 
 # ============================================================
-# STORAGE
+# STORAGE (FIXED KEY ERROR)
 # ============================================================
 class Storage:
     def __init__(self, path: str):
@@ -212,11 +213,9 @@ class Storage:
                     actual_num INTEGER, actual_size TEXT, actual_color TEXT, logic TEXT, details TEXT, stake TEXT, created_at REAL
                 )
             """)
-            # Migration: Add pred_type if upgrading from old DB
-            try:
-                c.execute("ALTER TABLE predictions ADD COLUMN pred_type TEXT")
-            except sqlite3.OperationalError:
-                pass
+            # Safe migration for older databases
+            try: c.execute("ALTER TABLE predictions ADD COLUMN pred_type TEXT")
+            except sqlite3.OperationalError: pass
 
     def prediction_exists(self, issue: str) -> bool:
         with self._conn() as c: return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
@@ -226,7 +225,11 @@ class Storage:
             c.execute("""
                 INSERT OR IGNORE INTO predictions (issue, pred_type, size, num, color, logic, details, stake, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (p["issue"], p["type"], p["size"], p["num"], p["color"], p["logic"], json.dumps(p.get("details", {})), p["stake"], time.time()))
+            """, (
+                p.get("issue", ""), p.get("type", "SIZE"), p.get("size", ""), p.get("num", 0), 
+                p.get("color", ""), p.get("pattern", "N/A"), json.dumps(p.get("details", {})), 
+                p.get("stake", "1x"), time.time()
+            ))
 
     def resolve_pending(self, history_dict: Dict[str, Dict[str, Any]]):
         resolved = []
@@ -239,7 +242,7 @@ class Storage:
             if not act: continue
 
             act_size = "BIG" if act["size"] == 1 else "SMALL"
-            act_color = get_wingo_color(act["num"]) # Gets pure RED or GREEN
+            act_color = get_wingo_color(act["num"]) 
             
             win_size = (p_size == act_size) if p_size else True
             win_color = (p_color == act_color) if p_color else True
@@ -253,7 +256,7 @@ class Storage:
                 c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=?, actual_color=? WHERE issue=?", (status, act["num"], act_size, act_color, issue))
 
             resolved.append({
-                "issue": issue, "type": p_type, "size": p_size, "num": p_num, "color": p_color, "stake": stake,
+                "issue": issue, "type": p_type or "SIZE", "size": p_size, "num": p_num, "color": p_color, "stake": stake,
                 "actual_num": act["num"], "actual_size": act_size, "actual_color": act_color,
                 "status": status, "win": win, "details": json.loads(details_json) if details_json else {}
             })
@@ -308,7 +311,7 @@ def model_bias(history):
     return (1.0 if ratio >= 0.5 else 0.0) if abs(ratio - 0.5) > 0.18 else 0.5
 
 # ============================================================
-# COLOR MODELS (FIXED FOR VIOLET)
+# COLOR MODELS
 # ============================================================
 def get_colors(history): return [get_wingo_color(x["num"]) for x in history]
 
@@ -344,7 +347,7 @@ def model_color_alternation(history):
 # ============================================================
 def ensemble_size_probability(history):
     streak_p, streak_name = model_streak(history)
-    base = {"Markov": model_markov(history), "EMA": model_ema(history), "DragonStreak": streak_p, "Trend": model_trend(history), "Alternation": model_alternation(history), "Bias": model_bias(history)}
+    base = {"Markov": model_markov(history), "EMA": model_ema(history), "Streak": streak_p, "Trend": model_trend(history), "Alternation": model_alternation(history), "Bias": model_bias(history)}
     votes = {k: ("BIG" if v > 0.5 else "SMALL") for k, v in base.items()}
     
     weighted_sum = sum(prob * STATE.weights.size.get(name, 1.0) for name, prob in base.items())
@@ -363,7 +366,7 @@ def ensemble_color_probability(history):
     return clamp(final_p_red, 0.05, 0.95), votes, streak_name
 
 # ============================================================
-# FINAL PREDICTION
+# FINAL PREDICTION (FIXED LOGIC KEY)
 # ============================================================
 def generate_prediction() -> Optional[Dict[str, Any]]:
     if len(STATE.history) < CFG.min_history: return None 
@@ -413,7 +416,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     return {
         "issue": issue, "type": pred_type, "size": final_size, "color": final_color, "num": best_num,
         "p_big": round(p_big, 4), "p_red": round(p_red, 4), "confidence": confidence, "stake": stake,
-        "regime": detect_regime(sizes), "pattern": pattern,
+        "regime": detect_regime(sizes), "pattern": pattern, "logic": pattern, # <--- FIXED: Added 'logic' key
         "details": {"size_votes": size_votes, "color_votes": color_votes, "size_edge": size_edge, "color_edge": color_edge}
     }
 
@@ -427,7 +430,7 @@ def learn_from_resolution(res: dict):
             details.get("size_votes", {}), 
             details.get("color_votes", {}), 
             res["actual_size"], 
-            res["actual_color"] # This is now pure RED or GREEN
+            res["actual_color"]
         )
     STATE.save_cache()
 
