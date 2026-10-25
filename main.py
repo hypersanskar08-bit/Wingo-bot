@@ -1,12 +1,10 @@
 """
-FTW V7 REAL PATTERN TRACKER (NOISE FILTER + STRONG MATCHER)
-===========================================================
-- Tracks real patterns vs fake/noisy patterns
-- Maintains pattern hit/miss support
-- Filters stale or weak patterns
-- Uses exact suffix matching + support score + recency
-- Recovery mode + dragon protection
-- Predicts every period
+FTW V7 REAL PATTERN TRACKER (FIXED)
+===================================
+- Fixed: NameError: signal_strength is not defined
+- Added real pattern tracking and noise filtering
+- Recovery + dragon protection
+- No skip
 """
 
 import asyncio
@@ -141,7 +139,7 @@ def volatility(seq: List[int], window: int = 20) -> float:
     if len(seq) < 2:
         return 0.0
     arr = seq[-window:]
-    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
+    diffs = [abs(arr[i] - arr[i - 1)] for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 def ratio_big(seq: List[int], window: int = 20) -> float:
@@ -180,6 +178,36 @@ def detect_regime(seq: List[int]) -> str:
     if abs(ratio - 0.5) <= 0.12:
         return "CHOPPY"
     return "CYCLE"
+
+def signal_strength(history: List[Dict[str, Any]]) -> float:
+    if len(history) < 8:
+        return 0.2
+
+    seq = [x["size"] for x in history]
+    regime = detect_regime(seq)
+    run = trailing_run(seq)
+    alt = alternating_score(seq, 12)
+    bp = block_pattern(seq, 10)
+    ratio = ratio_big(seq, 20)
+
+    s = 0.0
+    if regime == "TRAP":
+        s += 0.35
+    if regime == "TREND":
+        s += 0.25
+    if regime == "ALTERNATING":
+        s += 0.30
+    if bp:
+        s += 0.20
+    if run >= 3:
+        s += 0.25
+    if abs(ratio - 0.5) > 0.18:
+        s += 0.15
+    if alt >= 0.6:
+        s += 0.15
+
+    return clamp(min(1.0, s), 0.0, 1.0)
+
 
 # ============================================================
 # STATE
@@ -321,8 +349,8 @@ PATTERN_LIBRARY = [
     ((0, 0, 0), 0, "3-SMALL DRAGON", 1.8),
     ((1, 1, 1, 1), 1, "4-BIG DRAGON", 2.2),
     ((0, 0, 0, 0), 0, "4-SMALL DRAGON", 2.2),
-    ((1, 1, 1, 1, 1), 0, "5-BIG REVERSAL", 1.9),
-    ((0, 0, 0, 0, 0), 1, "5-SMALL REVERSAL", 1.9),
+    ((1, 1, 1, 1, 1), 0, "5-BIG REVERSE", 1.9),
+    ((0, 0, 0, 0, 0), 1, "5-SMALL REVERSE", 1.9),
 
     # 2. Alternating
     ((1, 0, 1), 0, "B-S-B => S", 1.6),
@@ -421,9 +449,6 @@ PATTERN_LIBRARY = [
     ((0, 0, 1, 1, 0, 1, 1), 0, "P50", 1.7),
 ]
 
-# ============================================================
-# PATTERN SUPPORT TRACKER
-# ============================================================
 class PatternTracker:
     def __init__(self):
         self.stats: Dict[str, Dict[str, Any]] = {}
@@ -464,56 +489,41 @@ PT = PatternTracker()
 
 
 # ============================================================
-# REAL PATTERN MATCHER
+# PATTERN MATCHER
 # ============================================================
-def pattern_match_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq = [x["size"] for x in history]
-    candidates = []
-
+def lookup_best_pattern(seq: List[int]) -> Optional[Tuple[float, int, str]]:
+    best = None
     for pattern in PATTERN_LIBRARY:
         pat_seq, pred_value, name, weight = pattern
-        if len(seq) < len(pat_seq):
-            continue
-        if tuple(seq[-len(pat_seq):]) == pat_seq:
-            key = str(pat_seq) + "|" + name
-            support = PT.support_score(key)
-            # Strong real signal only if pattern has enough support and recency
-            score = (weight * 10.0) + (support * 20.0)
-            candidates.append({
-                "name": name,
-                "pred": pred_value,
-                "score": score,
-                "support": support,
-                "pattern": pat_seq
-            })
+        if len(seq) >= len(pat_seq):
+            if tuple(seq[-len(pat_seq):]) == pat_seq:
+                score = (len(pat_seq) * 2.2) * weight
+                candidate = (score, pred_value, name)
+                if best is None or score > best[0]:
+                    best = candidate
+    return best
 
-    if not candidates:
-        return {
-            "pred": None,
-            "name": "NO REAL PATTERN",
-            "score": 0.0
-        }
+def pattern_match_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    seq = [x["size"] for x in history]
+    if not seq:
+        return {"pred": None, "name": "NO REAL PATTERN", "score": 0.0}
 
-    # Rank by score and remove fake noisy patterns
-    filtered = []
-    for c in candidates:
-        if c["support"] >= 0.25 or c["score"] >= 16:
-            filtered.append(c)
+    best = lookup_best_pattern(seq)
+    if best is None:
+        return {"pred": None, "name": "NO REAL PATTERN", "score": 0.0}
 
-    if not filtered:
-        return {
-            "pred": None,
-            "name": "NOISY PATTERN",
-            "score": 0.0
-        }
+    score, pred_value, name = best
+    key = str(tuple(seq[-len(seq):])) + "|" + name
+    support = PT.support_score(key)
 
-    best = max(filtered, key=lambda x: x["score"])
-    return {
-        "pred": "BIG" if best["pred"] == 1 else "SMALL",
-        "name": best["name"],
-        "score": best["score"],
-        "support": best["support"]
-    }
+    final_score = score + (support * 20.0)
+
+    # Fake/noisy filter
+    if support < 0.25 and final_score < 18:
+        return {"pred": None, "name": "NOISY PATTERN", "score": 0.0}
+
+    pred = "BIG" if pred_value == 1 else "SMALL"
+    return {"pred": pred, "name": name, "score": final_score, "support": support}
 
 def markov_size_prob(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -547,6 +557,8 @@ def parity_bias(history: List[Dict[str, Any]]) -> float:
 def choose_best_number(size: str, history: List[Dict[str, Any]]) -> int:
     valid = [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
     freq = Counter([x["num"] for x in history[-50:]])
+    if not freq:
+        return random.choice(valid)
     return max(valid, key=lambda x: freq.get(x, 0))
 
 def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -555,7 +567,6 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         return None
 
     recent = seq[-6:]
-    # if 4+ same side or loss streak >=2, reverse
     if STATE.loss_streak >= 2:
         if sum(recent) >= 4:
             return {"size": "SMALL", "logic": "🛡️ RECOVERY REVERSE", "score": 0.82, "stake": "1x"}
@@ -601,7 +612,7 @@ def generate_prediction() -> Dict[str, Any]:
         if match["pred"] is not None:
             final_size = match["pred"]
             logic = f"🎯 {match['name']} | support={match['support']:.2f}"
-            confidence = clamp(match["score"] / 18.0, 0.55, 0.92)
+            confidence = clamp((match["score"] / 22.0), 0.55, 0.92)
             stake = "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
         else:
             markov = markov_size_prob(history)
@@ -616,19 +627,12 @@ def generate_prediction() -> Dict[str, Any]:
     final_num = choose_best_number(final_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
-    if final_size == "BIG":
-        # store pattern support for real pattern tracker
-        for pattern in PATTERN_LIBRARY:
-            pat_seq, pred_value, name, weight = pattern
-            if len(seq) >= len(pat_seq):
-                if tuple(seq[-len(pat_seq):]) == pat_seq:
-                    PT.register_pattern(str(pat_seq) + "|" + name, pred_value)
-    else:
-        for pattern in PATTERN_LIBRARY:
-            pat_seq, pred_value, name, weight = pattern
-            if len(seq) >= len(pat_seq):
-                if tuple(seq[-len(pat_seq):]) == pat_seq:
-                    PT.register_pattern(str(pat_seq) + "|" + name, pred_value)
+    # Track pattern usage for support
+    for pattern in PATTERN_LIBRARY:
+        pat_seq, pred_value, name, weight = pattern
+        if len(seq) >= len(pat_seq):
+            if tuple(seq[-len(pat_seq):]) == pat_seq:
+                PT.register_pattern(str(pat_seq) + "|" + name, pred_value)
 
     PT.purge_stale()
 
@@ -651,13 +655,10 @@ def learn_from_resolution(res: Dict[str, Any]):
     if res["win"]:
         STATE.win_streak += 1
         STATE.loss_streak = 0
+        STATE.recovery_mode = False
     else:
         STATE.loss_streak += 1
         STATE.win_streak = 0
-
-    if res["win"]:
-        STATE.recovery_mode = False
-    else:
         STATE.recovery_mode = STATE.loss_streak >= 2
 
     STATE.save_cache()
@@ -846,6 +847,7 @@ async def start_web_server():
 # ============================================================
 # MAIN
 # ============================================================
+
 async def main():
     CFG.validate()
     STATE.load_cache()
