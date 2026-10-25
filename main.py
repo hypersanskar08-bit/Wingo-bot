@@ -34,7 +34,7 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM"
+    telegram_token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
     chat_id_raw: str = "1264164655"
     source_api_urls: str = os.environ.get(
         "API_URLS",
