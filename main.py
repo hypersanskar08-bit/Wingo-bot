@@ -1,10 +1,9 @@
 """
-V910 PERFECT EITHER/OR LOGIC
-=========================================
-- Predicts EITHER Size OR Color, NEVER both.
-- Calculates the strength of Size vs Color and picks the most confident one.
-- If Size is stronger -> Shows only Size + Number.
-- If Color is stronger -> Shows only Color + Number.
+V911 SUPER SMART (Deep Color Analysis + Recent Outcomes Fix)
+============================================================
+- Either predicts Size OR Color (The strongest signal).
+- Advanced Color Analysis: Uses streak breaking and recent frequency.
+- Recent Outcomes: Now shows history even if the database is fresh.
 - Render-safe, SQLite WAL, Local Cache.
 """
 
@@ -32,18 +31,18 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = os.environ.get("TG_TOKEN", "8611789455:AAGIFSfpOd4b-Vl2QVHzhotq4uVmyrTuiNU")
+    telegram_token: str = os.environ.get("TG_TOKEN", "8611789455:AGIFSfpOd4b-Vl2QVHzhotq4uVmyrTuiNUA")
     chat_id_raw: str = os.environ.get("TG_CHAT", "1264164655")
     source_api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v910_either_or.db")
+    db_path: str = os.environ.get("DB_PATH", "v911_super_smart.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V910 FINAL"
+    bot_name: str = "V911 SMART"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -74,18 +73,18 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
     
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v910.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v911.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v910")
+log = logging.getLogger("v911")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 async def health_check(request):
-    return web.Response(text="V910 Bot is Running!")
+    return web.Response(text="V911 Bot is Running!")
 
 async def start_web_server():
     app = web.Application()
@@ -288,7 +287,6 @@ class Storage:
             act_size = "BIG" if act["size"] == 1 else "SMALL"
             act_color = get_color_from_num(act["num"])
             
-            # Win check: if size matches OR color matches (whichever was predicted)
             win_size = (p_size == act_size) if p_size else True
             win_color = (p_color in act_color) if p_color else True
             win = win_size and win_color
@@ -314,6 +312,16 @@ class Storage:
     def recent_outcomes(self, limit: int = 12):
         with self._conn() as c:
             rows = c.execute("SELECT issue, actual_size, actual_num, actual_color, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
+        
+        # FIX: If database is new and empty, pull from history cache instead of showing blank
+        if not rows and STATE.history:
+            fallback = []
+            for x in STATE.history[-limit:]:
+                sz = "BIG" if x["size"] == 1 else "SMALL"
+                col = get_color_from_num(x["num"])
+                fallback.append((x["issue"], sz, x["num"], col, "PAST"))
+            return fallback
+            
         return rows[::-1]
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
@@ -398,22 +406,52 @@ def ensemble_probability(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"p_big": clamp(final, 0.05, 0.95)}
 
 def calculate_color_probs(history: List[Dict[str, Any]]) -> Dict[str, float]:
-    recent_nums = [x["num"] for x in history[-50:]]
-    red_c, green_c, violet_c = 0, 0, 0
-    for n in recent_nums:
-        if n == 0: red_c += 1; violet_c += 1
-        elif n in (1, 3, 7, 9): green_c += 1
-        elif n in (2, 4, 6, 8): red_c += 1
-        elif n == 5: green_c += 1; violet_c += 1
+    recent_colors = []
+    for x in history[-20:]:
+        n = x["num"]
+        if n == 0: recent_colors.append("RED") 
+        elif n == 5: recent_colors.append("GREEN") 
+        elif n in (1, 3, 7, 9): recent_colors.append("GREEN")
+        else: recent_colors.append("RED")
 
-    total = red_c + green_c + violet_c
-    if total == 0: return {"RED": 0.33, "GREEN": 0.33, "VIOLET": 0.33}
-    
-    return {
-        "RED": red_c / total,
-        "GREEN": green_c / total,
-        "VIOLET": violet_c / total
-    }
+    if not recent_colors:
+        return {"RED": 0.5, "GREEN": 0.5, "VIOLET": 0.01}
+
+    # 1. Streak Analysis
+    last_c = recent_colors[-1]
+    streak = 1
+    for c in reversed(recent_colors[:-1]):
+        if c == last_c: streak += 1
+        else: break
+
+    # 2. Recent Frequency (last 10)
+    last_10 = recent_colors[-10:]
+    red_freq = last_10.count("RED") / 10.0
+    green_freq = last_10.count("GREEN") / 10.0
+
+    p_red, p_green = 0.5, 0.5
+
+    # Break long streaks
+    if streak >= 3:
+        if last_c == "RED": p_green += 0.20
+        else: p_red += 0.20
+
+    # Regress to mean if highly frequent
+    if red_freq > 0.7: p_green += 0.15
+    elif green_freq > 0.7: p_red += 0.15
+
+    total = p_red + p_green
+    p_red /= total
+    p_green /= total
+
+    # Violet logic
+    violet_count = sum(1 for n in [x["num"] for x in history[-15:]] if n in (0, 5))
+    p_violet = 0.10 if violet_count > 2 else 0.03
+
+    p_red *= (1.0 - p_violet)
+    p_green *= (1.0 - p_violet)
+
+    return {"RED": p_red, "GREEN": p_green, "VIOLET": p_violet}
 
 def pick_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> int:
     if not valid_nums: return random.randint(0, 9)
@@ -457,7 +495,6 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     color_conf = color_probs[best_color]
 
     # --- 3. Compare Strengths (Delta) ---
-    # Size baseline is 50%, Color baseline is 33.3%
     size_strength = size_conf - 0.50
     color_strength = color_conf - 0.3333
 
@@ -466,10 +503,10 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     # We ONLY predict one of them. The one with higher strength.
     if size_strength >= color_strength:
         final_size = size_pred
-        final_color = "" # Empty color
+        final_color = "" 
         valid_nums = [n for n in range(10) if ("BIG" if n >= 5 else "SMALL") == final_size]
     else:
-        final_size = "" # Empty size
+        final_size = "" 
         final_color = best_color
         valid_nums = [n for n in range(10) if final_color in get_num_colors_list(n)]
 
@@ -577,7 +614,6 @@ def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
     stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
 
-    # Dynamic Format: Either Size OR Color
     info_lines = []
     if p.get('size'):
         info_lines.append(f"📊 <b>Size</b>: <b>{h(p['size'])}</b> ({p['size_conf']*100:.1f}%)")
