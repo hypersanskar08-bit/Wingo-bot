@@ -32,8 +32,8 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "YOUR_NEW_BOT_TOKEN_HERE")
-    chat_id_raw: str = os.environ.get("CHAT_ID", "-1001234567890")
+    telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
+    chat_id_raw: str = os.environ.get("CHAT_ID", "-1004485961768")
     source_api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
