@@ -1,9 +1,10 @@
 """
-V911 SUPER SMART (Deep Color Analysis + Recent Outcomes Fix)
+V912 FINAL CLEAN (Smart Recent Outcomes + Either Size/Color)
 ============================================================
+- Recent Outcomes now reflects exactly what was predicted (Size or Color).
+- Clean formatting for Prediction and Result messages.
+- Advanced Color Analysis (Streak Break + Regress to Mean).
 - Either predicts Size OR Color (The strongest signal).
-- Advanced Color Analysis: Uses streak breaking and recent frequency.
-- Recent Outcomes: Now shows history even if the database is fresh.
 - Render-safe, SQLite WAL, Local Cache.
 """
 
@@ -37,12 +38,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v911_super_smart.db")
+    db_path: str = os.environ.get("DB_PATH", "v912_final.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V911 SMART"
+    bot_name: str = "V912 ULTIMATE"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -73,18 +74,18 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
     
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v911.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v912.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v911")
+log = logging.getLogger("v912")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 async def health_check(request):
-    return web.Response(text="V911 Bot is Running!")
+    return web.Response(text="V912 Bot is Running!")
 
 async def start_web_server():
     app = web.Application()
@@ -185,17 +186,6 @@ def detect_regime(sizes: List[int]) -> str:
     if run >= 5: return "TREND"
     if abs(ratio - 0.5) <= 0.12: return "CHOPPY"
     return "CYCLE"
-
-def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
-    if len(history) < window + 4: return 0.0
-    current = tuple(x["size"] for x in history[-window:])
-    repeats = 0
-    for i in range(len(history) - window - 1, 0, -1):
-        prev = tuple(x["size"] for x in history[i:i + window])
-        if prev == current:
-            repeats += 1
-            if repeats >= 2: break
-    return min(0.45, repeats * 0.14)
 
 # ============================================================
 # STATE & CACHE
@@ -311,15 +301,23 @@ class Storage:
 
     def recent_outcomes(self, limit: int = 12):
         with self._conn() as c:
-            rows = c.execute("SELECT issue, actual_size, actual_num, actual_color, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
+            # Fetch what was predicted (Size or Color) and the final status
+            rows = c.execute("""
+                SELECT issue, size, color, status 
+                FROM predictions 
+                WHERE status!='PENDING' 
+                ORDER BY CAST(issue AS INTEGER) DESC 
+                LIMIT ?
+            """, (limit,)).fetchall()
         
-        # FIX: If database is new and empty, pull from history cache instead of showing blank
+        # Fallback if DB is empty (e.g., new deployment)
         if not rows and STATE.history:
             fallback = []
             for x in STATE.history[-limit:]:
                 sz = "BIG" if x["size"] == 1 else "SMALL"
                 col = get_color_from_num(x["num"])
-                fallback.append((x["issue"], sz, x["num"], col, "PAST"))
+                # Mark as PAST so we know it wasn't a real prediction
+                fallback.append((x["issue"], sz, col, "PAST"))
             return fallback
             
         return rows[::-1]
@@ -417,26 +415,22 @@ def calculate_color_probs(history: List[Dict[str, Any]]) -> Dict[str, float]:
     if not recent_colors:
         return {"RED": 0.5, "GREEN": 0.5, "VIOLET": 0.01}
 
-    # 1. Streak Analysis
     last_c = recent_colors[-1]
     streak = 1
     for c in reversed(recent_colors[:-1]):
         if c == last_c: streak += 1
         else: break
 
-    # 2. Recent Frequency (last 10)
     last_10 = recent_colors[-10:]
     red_freq = last_10.count("RED") / 10.0
     green_freq = last_10.count("GREEN") / 10.0
 
     p_red, p_green = 0.5, 0.5
 
-    # Break long streaks
     if streak >= 3:
         if last_c == "RED": p_green += 0.20
         else: p_red += 0.20
 
-    # Regress to mean if highly frequent
     if red_freq > 0.7: p_green += 0.15
     elif green_freq > 0.7: p_red += 0.15
 
@@ -444,7 +438,6 @@ def calculate_color_probs(history: List[Dict[str, Any]]) -> Dict[str, float]:
     p_red /= total
     p_green /= total
 
-    # Violet logic
     violet_count = sum(1 for n in [x["num"] for x in history[-15:]] if n in (0, 5))
     p_violet = 0.10 if violet_count > 2 else 0.03
 
@@ -472,7 +465,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         issue = str(int(STATE.history[-1]["issue"]) + 1) if STATE.history else "1"
         num = random.randint(0, 9)
         return {
-            "issue": issue, "size": "BIG" if num >=5 else "SMALL", "num": num, "color": get_color_from_num(num),
+            "issue": issue, "size": "BIG" if num >=5 else "SMALL", "num": num, "color": "",
             "p_big": 0.5, "size_conf": 0.5, "color_conf": 0.33,
             "confidence": 55, "raw_conf": 55, "consensus": 0.5,
             "mode": "FALLBACK", "regime": "COLD", "logic": "Fallback",
@@ -483,24 +476,20 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     history = STATE.history[-2000:]
     sizes = [x["size"] for x in history]
     
-    # --- 1. Size Analysis ---
     p_big = ensemble_probability(history)["p_big"]
     p_small = 1.0 - p_big
     size_pred = "BIG" if p_big >= 0.5 else "SMALL"
     size_conf = max(p_big, p_small)
     
-    # --- 2. Color Analysis ---
     color_probs = calculate_color_probs(history)
     best_color = max(color_probs, key=color_probs.get)
     color_conf = color_probs[best_color]
 
-    # --- 3. Compare Strengths (Delta) ---
     size_strength = size_conf - 0.50
     color_strength = color_conf - 0.3333
 
     valid_nums = []
     
-    # We ONLY predict one of them. The one with higher strength.
     if size_strength >= color_strength:
         final_size = size_pred
         final_color = "" 
@@ -510,10 +499,8 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         final_color = best_color
         valid_nums = [n for n in range(10) if final_color in get_num_colors_list(n)]
 
-    # --- 4. Pick Number ---
     best_num = pick_best_number(valid_nums, history)
 
-    # Confidence & Stake (Dynamic)
     combined_conf = max(size_conf, color_conf)
     if combined_conf > 0.65:
         confidence, stake = 75, "1x"
@@ -611,7 +598,19 @@ async def fetch_data(session):
     return False
 
 def format_prediction(p, recent_rows):
-    recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
+    recent_lines = []
+    for r in recent_rows:
+        issue, p_size, p_color, status = r
+        
+        # Display ONLY what was predicted
+        if p_size:
+            recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> <b>{h(p_size)}</b> → <b>{h(status)}</b>")
+        elif p_color:
+            recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> <b>{h(p_color)}</b> → <b>{h(status)}</b>")
+        else:
+            recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> <b>{h(status)}</b>")
+
+    recent_text = "\n".join(recent_lines) + "\n" if recent_lines else "No past outcomes\n"
     stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
 
     info_lines = []
@@ -637,12 +636,15 @@ def format_prediction(p, recent_rows):
 """
 
 def format_result(res):
-    pred_str = ""
-    if res['size']: pred_str += f"{res['size']} "
-    if res['color']: pred_str += f"({res['color']}) "
-    pred_str += f"Num {res['num']}"
-    
-    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(pred_str)}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
+    # Clean result display
+    if res['size']: 
+        pred_str = f"{res['size']} {res['num']}"
+    elif res['color']: 
+        pred_str = f"{res['color']} {res['num']}"
+    else:
+        pred_str = f"Num {res['num']}"
+        
+    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: <b>{h(pred_str)}</b>\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
 
 async def send_msg(app, text, retries=3):
     for attempt in range(retries):
