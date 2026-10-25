@@ -1,16 +1,15 @@
 """
-FTW V15 DEEP ADAPTIVE PREDICTOR + NUMBER EXHAUSTION ENGINE
-================================================================
-- Long trend / dragon exhaustion detection
-- Deep number-family repeat analysis
-- Exact number transition mining
-- Anti-bias guard to stop weak same-side locking
-- Exact sequence mining 4..14
-- Adaptive ensemble weights
-- Trend-shift logic
-- Recovery only on real danger
-- Recent results: 12
-- No skip logic
+FTW FINAL FIXED VERSION
+=======================
+- Fully working version
+- fixes: Counter.most_common on defaultdict
+- deep number pattern + family logic
+- trend exhaustion / dragon fatigue
+- size prediction + number prediction improved
+- anti-bias guard
+- 12 recent results
+- no skip
+- Telegram ready
 """
 
 import asyncio
@@ -44,12 +43,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v15_deep.db")
-    cache_file: str = "ftw_v15_history_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_final_fixed.db")
+    cache_file: str = "ftw_final_fixed_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V15 DEEP ADAPTIVE"
+    bot_name: str = "FTW FINAL FIXED"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -83,7 +82,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v15_deep.log",
+        Path(CFG.log_dir) / "ftw_final_fixed.log",
         maxBytes=1_000_000,
         backupCount=2
     )
@@ -91,7 +90,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v15")
+log = logging.getLogger("ftw_final_fixed")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -483,7 +482,7 @@ ADAPTIVE = AdaptiveWeights()
 
 
 # ============================================================
-# TREND EXHAUSTION
+# LONG TREND / DRAGON EXHAUSTION
 # ============================================================
 def long_trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(history) < 8:
@@ -493,7 +492,6 @@ def long_trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
     run = trailing_run(seq)
     current_side = seq[-1]
     recent = seq[-12:]
-
     big_share = sum(1 for v in recent if v == 1) / len(recent)
     small_share = sum(1 for v in recent if v == 0) / len(recent)
 
@@ -533,7 +531,7 @@ def long_trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
 
 
 # ============================================================
-# PATTERN LONG RUNS / EXACT PATTERNS
+# PATTERN LIBRARY
 # ============================================================
 PATTERN_LIBRARY = [
     ((1, 1, 1), 1, "3-BIG DRAGON", 1.8),
@@ -730,8 +728,8 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         return None
 
     recent = seq[-6:]
-
     trend_exhaust = long_trend_exhaustion(history)
+
     if trend_exhaust:
         return {
             "size": trend_exhaust["size"],
@@ -751,12 +749,7 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
 
     if trailing_run(seq) >= 4:
         last = seq[-1]
-        return {
-            "size": "SMALL" if last == 1 else "BIG",
-            "logic": "DRAGON PROTECTION",
-            "confidence": 0.88,
-            "stake": "1x"
-        }
+        return {"size": "SMALL" if last == 1 else "BIG", "logic": "DRAGON PROTECTION", "confidence": 0.88, "stake": "1x"}
 
     if len(recent) >= 4:
         recent_small = sum(1 for v in recent if v == 0)
@@ -813,12 +806,14 @@ def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 def number_transition_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     nums = [x["num"] for x in history]
     candidates = []
+
     for window in range(2, 8):
         if len(nums) < window + 1:
             continue
 
         suffix = tuple(nums[-window:])
         next_counts = defaultdict(int)
+
         for i in range(len(nums) - window):
             key = tuple(nums[i:i + window])
             if key == suffix:
@@ -827,9 +822,10 @@ def number_transition_candidates(history: List[Dict[str, Any]]) -> List[Dict[str
         if not next_counts:
             continue
 
-        best_num, best_freq = next_counts.most_common(1)[0]
-        support = sum(next_counts.values()) / max(1, len(nums) - window)
-        confidence = (best_freq / sum(next_counts.values())) * 100.0
+        best_num, best_freq = Counter(next_counts).most_common(1)[0]
+        total_follow = sum(next_counts.values())
+        support = total_follow / max(1, len(nums) - window)
+        confidence = (best_freq / total_follow) * 100.0
 
         if support < 0.03 and confidence < 20:
             continue
@@ -849,7 +845,6 @@ def number_transition_candidates(history: List[Dict[str, Any]]) -> List[Dict[str
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
 
-    # same-family exact transitions
     same_family_hist = [x for x in history if is_same_family(x["num"], size)]
     if len(same_family_hist) >= 4:
         candidates = number_transition_candidates(same_family_hist)
@@ -875,7 +870,6 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
         if best_num in valid:
             return best_num
 
-    # parity family
     if family_nums:
         even_count = sum(1 for n in family_nums if n % 2 == 0)
         odd_count = sum(1 for n in family_nums if n % 2 != 0)
@@ -909,7 +903,6 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     exact_conf = exact["confidence"] if exact else 0.55
 
     trend_shift = trend_shift_score(history)
-    trend_pred = trend_shift["pred"]
     trend_conf = 0.65 + min(0.30, abs(trend_shift["score"]) * 2.0)
 
     final_size = exact_size
@@ -952,7 +945,10 @@ def generate_prediction() -> Dict[str, Any]:
             "raw_conf": 50,
             "logic": "WARMING UP",
             "stake": "0.5x",
-            "details": {"recovery_mode": False, "regime": "COLD"}
+            "details": {
+                "recovery_mode": False,
+                "regime": "COLD"
+            }
         }
 
     history = STATE.history[-2000:]
@@ -988,7 +984,8 @@ def generate_prediction() -> Dict[str, Any]:
             "signal_strength": signal_strength(history),
             "regime": detect_regime(seq),
             "side_balance": round(side_balance(history, 20), 4),
-            "trend_shift": trend_shift_score(history)
+            "trend_shift": trend_shift_score(history),
+            "trend_exhaustion": long_trend_exhaustion(history)
         }
     }
 
@@ -1009,9 +1006,7 @@ def learn_from_resolution(res: Dict[str, Any]):
 # BACKTEST
 # ============================================================
 def generate_prediction_from_history(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
-    seq = [x["size"] for x in history]
     override = recovery_override(history)
-
     if override:
         pred_size = override["size"]
         pred_logic = override["logic"]
@@ -1271,7 +1266,7 @@ async def worker_loop(app, session):
 # HEALTH CHECK
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V15 Deep Adaptive Predictor is Running")
+    return web.Response(text="FTW Final Fixed is Running")
 
 async def start_web_server():
     app = web.Application()
