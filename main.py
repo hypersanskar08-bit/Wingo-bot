@@ -1,12 +1,11 @@
 """
-V916 ADVANCED MAX PROBABILITY
-============================
-- Highest probability among: BIG / SMALL / RED / GREEN
-- Deep pattern-wise + trend-wise + memory-wise analysis
-- Pattern memory + alternation + block + parity + ratio + volatility
-- Red/Green only
-- Final single prediction only
-- Render health safe
+V916 SUPER ADAPTIVE WINNER-ONLY
+================================
+- Final winner selected from: BIG / SMALL / RED / GREEN
+- Advanced pattern, trend shift, parity, block, trap, alternation logic
+- Deep adaptive weighting
+- Render-safe / Telegram-safe
+- Single final prediction only
 """
 
 import asyncio
@@ -40,12 +39,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v916_advanced_maxprob.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_super_adaptive.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V916 ADV MAX"
+    bot_name: str = "V916 ADAPTIVE WINNER"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -66,7 +65,7 @@ CFG = Config()
 
 
 # ============================================================
-# LOGGING + HEALTH
+# LOGGING + RENDER HEALTH
 # ============================================================
 def setup_logging():
     Path(CFG.log_dir).mkdir(parents=True, exist_ok=True)
@@ -78,7 +77,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_advanced_maxprob.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_super_adaptive.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -92,7 +91,7 @@ def h(x: Any) -> str:
 
 
 async def health_check(request):
-    return web.Response(text="V916 Advanced Max Probability Bot is Running!")
+    return web.Response(text="V916 Super Adaptive Winner Bot is Running!")
 
 
 async def start_web_server():
@@ -107,7 +106,7 @@ async def start_web_server():
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ============================================================
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
@@ -147,7 +146,7 @@ def get_color_from_num(num: int) -> str:
 
 
 # ============================================================
-# TREND / PATTERN BASE
+# TREND + PATTERN FUNCTIONS
 # ============================================================
 def trailing_run(values: List[int], target: Optional[int] = None) -> int:
     if not values:
@@ -268,12 +267,38 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
         s += 0.15
     if alt >= 0.6:
         s += 0.15
-
     return min(1.0, s)
 
 
+def detect_trend_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(history) < 20:
+        return {"direction": "NONE", "confidence": 0.0}
+
+    recent = [x["size"] for x in history[-12:]]
+    prev = [x["size"] for x in history[-24:-12]]
+
+    recent_ratio = ratio_big(recent, 12)
+    prev_ratio = ratio_big(prev, 12)
+
+    diff = recent_ratio - prev_ratio
+    if diff > 0.22:
+        direction = "SHIFT_TO_BIG"
+    elif diff < -0.22:
+        direction = "SHIFT_TO_SMALL"
+    else:
+        direction = "NONE"
+
+    confidence = clamp(abs(diff) * 2.5, 0.0, 1.0)
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "recent_ratio": recent_ratio,
+        "prev_ratio": prev_ratio,
+    }
+
+
 # ============================================================
-# STATE + CACHE
+# BOT STATE
 # ============================================================
 class BotState:
     def __init__(self):
@@ -286,7 +311,7 @@ class BotState:
             with open(CFG.cache_file, "w", encoding="utf-8") as f:
                 json.dump(self.history[-2000:], f)
         except Exception as e:
-            log.warning(f"Failed to save cache: {e}")
+            log.warning(f"Cache save failed: {e}")
 
     def load_cache(self):
         try:
@@ -459,7 +484,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# PREDICTION MODELS
+# ADVANCED PROBABILITY MODELS
 # ============================================================
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -486,6 +511,15 @@ def model_block(history: List[Dict[str, Any]]) -> float:
     return 0.5
 
 
+def model_run(history: List[Dict[str, Any]]) -> float:
+    sizes = [x["size"] for x in history]
+    last = sizes[-1]
+    run = trailing_run(sizes)
+    if run >= 3:
+        return 1.0 if last == 1 else 0.0
+    return 0.5
+
+
 def model_volatility(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     if volatility(sizes, 20) > 0.5:
@@ -498,15 +532,6 @@ def model_bias(history: List[Dict[str, Any]]) -> float:
     ratio = ratio_big(sizes, 20)
     if abs(ratio - 0.5) > 0.18:
         return 1.0 if ratio >= 0.5 else 0.0
-    return 0.5
-
-
-def model_run(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    last = sizes[-1]
-    run = trailing_run(sizes)
-    if run >= 3:
-        return 1.0 if last == 1 else 0.0
     return 0.5
 
 
@@ -554,14 +579,16 @@ def color_streak_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
 def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     exact = STORE.get_exact_pattern_probability(sizes)
+    shift = detect_trend_shift(history)
+
     models = [
         ("Exact", exact),
         ("Trend", model_trend(history)),
         ("Alternation", model_alternation(history)),
         ("Block", model_block(history)),
+        ("Run", model_run(history)),
         ("Volatility", model_volatility(history)),
         ("Bias", model_bias(history)),
-        ("Run", model_run(history)),
         ("Parity", model_parity(history)),
     ]
 
@@ -570,9 +597,9 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
         "Trend": 0.14,
         "Alternation": 0.12,
         "Block": 0.12,
+        "Run": 0.10,
         "Volatility": 0.10,
-        "Bias": 0.10,
-        "Run": 0.08,
+        "Bias": 0.08,
         "Parity": 0.06,
     }
 
@@ -581,24 +608,46 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
         weights["Alternation"] += 0.08
         weights["Run"] += 0.08
     if regime == "TREND":
-        weights["Trend"] += 0.15
+        weights["Trend"] += 0.12
     if regime == "ALTERNATING":
-        weights["Alternation"] += 0.15
+        weights["Alternation"] += 0.12
+    if shift["direction"] == "SHIFT_TO_BIG":
+        weights["Trend"] += 0.10
+        weights["Bias"] += 0.05
+    elif shift["direction"] == "SHIFT_TO_SMALL":
+        weights["Trend"] -= 0.08
+        weights["Bias"] += 0.05
 
     total = sum(weights.values())
     weighted = 0.0
     for name, val in models:
         weighted += val * weights.get(name, 0.10)
 
-    return clamp(weighted / total, 0.05, 0.95)
+    final = weighted / total
+    if shift["direction"] == "SHIFT_TO_BIG":
+        final = clamp(final + 0.10, 0.05, 0.95)
+    elif shift["direction"] == "SHIFT_TO_SMALL":
+        final = clamp(final - 0.10, 0.05, 0.95)
+
+    stale = stale_pattern_penalty(history, 12)
+    if stale > 0.12:
+        final = clamp(final * 0.93, 0.05, 0.95)
+
+    return clamp(final, 0.05, 0.95)
 
 
 def ensemble_color_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
     col_prob = color_probability(history)
     streak_prob = color_streak_probability(history)
+    shift = detect_trend_shift(history)
 
-    red = (col_prob["RED"] * 0.6) + (streak_prob["RED"] * 0.4)
-    green = (col_prob["GREEN"] * 0.6) + (streak_prob["GREEN"] * 0.4)
+    red = (col_prob["RED"] * 0.62) + (streak_prob["RED"] * 0.38)
+    green = (col_prob["GREEN"] * 0.62) + (streak_prob["GREEN"] * 0.38)
+
+    if shift["direction"] == "SHIFT_TO_BIG":
+        red = red + 0.06
+    elif shift["direction"] == "SHIFT_TO_SMALL":
+        green = green + 0.06
 
     total = red + green
     if total == 0:
@@ -606,7 +655,7 @@ def ensemble_color_probability(history: List[Dict[str, Any]]) -> Dict[str, float
     return {"RED": red / total, "GREEN": green / total}
 
 
-def pick_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> int:
+def choose_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> int:
     if not valid_nums:
         return random.randint(0, 9)
 
@@ -617,29 +666,43 @@ def pick_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> in
     for n in valid_nums:
         s = freq.get(n, 0) * 3.0
         if nums and nums[-1] == n:
-            s *= 0.6
+            s *= 0.7
         if n in (1, 3, 7, 9):
             s += 1.2
         if n in (2, 4, 6, 8):
             s += 1.0
         if n % 2 == 0 and get_color_from_num(n) == "RED":
-            s += 1.1
+            s += 1.2
         if n % 2 != 0 and get_color_from_num(n) == "GREEN":
-            s += 1.1
+            s += 1.2
         score[n] = s
 
     return max(score, key=score.get)
 
 
+def score_winner(p_big: float, p_small: float, p_red: float, p_green: float) -> Dict[str, float]:
+    candidates = {
+        "BIG": p_big,
+        "SMALL": p_small,
+        "RED": p_red,
+        "GREEN": p_green,
+    }
+    return candidates
+
+
+# ============================================================
+# WINNER-ONLY PREDICTION
+# ============================================================
 def generate_prediction() -> Optional[Dict[str, Any]]:
     if len(STATE.history) < CFG.min_history:
         issue = str(int(STATE.history[-1]["issue"]) + 1) if STATE.history else "1"
         num = random.randint(0, 9)
+        base = "BIG" if num >= 5 else "SMALL"
         return {
             "issue": issue,
-            "size": "BIG" if num >= 5 else "SMALL",
+            "size": base if base == "BIG" else "SMALL",
             "num": num,
-            "color": get_color_from_num(num),
+            "color": "",
             "p_big": 0.5,
             "size_conf": 0.5,
             "color_conf": 0.5,
@@ -659,20 +722,13 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
 
     p_big = ensemble_size_probability(history)
     p_small = 1.0 - p_big
-
     color_probs = ensemble_color_probability(history)
     p_red = color_probs["RED"]
     p_green = color_probs["GREEN"]
 
-    candidates = {
-        "BIG": p_big,
-        "SMALL": p_small,
-        "RED": p_red,
-        "GREEN": p_green,
-    }
-
-    best_choice = max(candidates, key=candidates.get)
-    best_conf = candidates[best_choice]
+    all_scores = score_winner(p_big, p_small, p_red, p_green)
+    best_choice = max(all_scores, key=all_scores.get)
+    best_conf = all_scores[best_choice]
 
     if best_choice == "BIG":
         final_size = "BIG"
@@ -691,7 +747,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         final_color = "GREEN"
         valid_nums = [n for n in range(10) if get_color_from_num(n) == "GREEN"]
 
-    best_num = pick_best_number(valid_nums, history)
+    best_num = choose_best_number(valid_nums, history)
 
     if best_conf > 0.70:
         confidence, stake = 78, "1x"
@@ -707,25 +763,27 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         "size": final_size,
         "num": best_num,
         "color": final_color,
+        "winner": best_choice,
         "p_big": round(p_big, 4),
         "size_conf": round(max(p_big, p_small), 4),
         "color_conf": round(max(p_red, p_green), 4),
         "confidence": confidence,
         "raw_conf": confidence,
         "consensus": best_conf,
-        "mode": "ULTRA-DEEP",
+        "mode": "SUPER-ADAPTIVE",
         "regime": detect_regime(sizes),
-        "logic": f"Highest probability winner: {best_choice}",
-        "sigs": [{"name": "Ultra Deep Pattern", "dir": 1 if best_choice in ("BIG", "RED") else 0}],
+        "logic": f"Winner selected: {best_choice}",
+        "sigs": [{"name": "Adaptive Winner", "dir": 1 if best_choice in ("BIG", "RED") else 0}],
         "stake": stake,
         "details": {
-            "best_choice": best_choice,
+            "winner": best_choice,
             "best_conf": best_conf,
             "p_big": p_big,
             "p_small": p_small,
             "p_red": p_red,
             "p_green": p_green,
             "regime": detect_regime(sizes),
+            "trend_shift": detect_trend_shift(history),
             "loss_streak": STATE.loss_streak,
         },
     }
@@ -747,7 +805,7 @@ def learn_from_resolution(res: dict):
 
 
 # ============================================================
-# PARSE API RESPONSE
+# API PARSING
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -896,6 +954,7 @@ def format_prediction(p, recent_rows):
 
     return f"""
 📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
+🎯 <b>Winner</b>: <b>{h(p['winner'])}</b>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
 {info_str}
 
