@@ -1,13 +1,13 @@
 """
 V916 HYPER PRO PREDICTOR (FINAL ADVANCED RECOVERY MODE)
 ======================================================
-- Fixed database sync issues
-- Fixed color logic
+- Fixed: self.conn() -> self._conn()
+- Fixed: missing logic key
+- Fixed: color logic confusion
 - One final prediction per period only
 - Recovery mode after losses
 - Chooses SIZE or COLOR dynamically
-- Predicts BIG / SMALL / RED / GREEN per strongest edge
-- Hardcoded token applied as requested
+- Predicts BIG / SMALL / RED / GREEN by strongest edge
 """
 
 import asyncio
@@ -143,7 +143,7 @@ def get_color_for_logic(num: int) -> str:
     return "GREEN"
 
 def get_display_color(num: int) -> str:
-    """Display only, to avoid weird violet confusion."""
+    """Display only, to avoid weird confusion."""
     if num in (0, 5):
         return "VIOLET"
     if num in (2, 4, 6, 8):
@@ -206,9 +206,56 @@ def detect_regime(seq: List[int]) -> str:
         return "CHOPPY"
     return "CYCLE"
 
+def signal_strength(history: List[Dict[str, Any]]) -> float:
+    if len(history) < 8:
+        return 0.2
+    seq = [x["size"] for x in history]
+    regime = detect_regime(seq)
+    run = trailing_run(seq)
+    alt = alternating_score(seq, 12)
+    bp = block_pattern(seq, 10)
+    ratio = ratio_big(seq, 20)
+
+    s = 0.0
+    if regime == "TRAP":
+        s += 0.35
+    if regime == "TREND":
+        s += 0.25
+    if regime == "ALTERNATING":
+        s += 0.30
+    if bp:
+        s += 0.20
+    if run >= 3:
+        s += 0.25
+    if abs(ratio - 0.5) > 0.18:
+        s += 0.15
+    if alt >= 0.6:
+        s += 0.15
+    return min(1.0, s)
+
+def detect_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(history) < 20:
+        return {"direction": "NONE", "confidence": 0.0}
+
+    recent = [x["size"] for x in history[-12:]]
+    prev = [x["size"] for x in history[-24:-12]]
+    recent_ratio = ratio_big(recent, 12)
+    prev_ratio = ratio_big(prev, 12)
+    diff = recent_ratio - prev_ratio
+
+    if diff > 0.22:
+        direction = "SHIFT_TO_BIG"
+    elif diff < -0.22:
+        direction = "SHIFT_TO_SMALL"
+    else:
+        direction = "NONE"
+
+    confidence = clamp(abs(diff) * 2.4, 0.0, 1.0)
+    return {"direction": direction, "confidence": confidence}
+
 
 # ============================================================
-# STATE
+# WEIGHTS & STATE
 # ============================================================
 class BayesianWeights:
     def __init__(self):
@@ -279,7 +326,6 @@ class BotState:
         except Exception:
             pass
 
-
 STATE = BotState()
 
 
@@ -315,7 +361,6 @@ class Storage:
                     created_at REAL
                 )
             """)
-            # Safe migration for older DBs
             try:
                 c.execute("ALTER TABLE predictions ADD COLUMN pred_type TEXT")
             except sqlite3.OperationalError:
@@ -488,7 +533,7 @@ class Storage:
                 continue
             suffix = tuple(seq[-w:])
             key = f"{w}:{json.dumps(list(suffix))}"
-            with self.conn() as c:
+            with self._conn() as c:
                 row = c.execute(
                     "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
                     (key,)
@@ -508,7 +553,7 @@ class Storage:
                 continue
             suffix = tuple(colors[-w:])
             key = f"{w}:{json.dumps(list(suffix))}"
-            with self.conn() as c:
+            with self._conn() as c:
                 row = c.execute(
                     "SELECT red_count, green_count, total_count FROM color_stats WHERE color=?",
                     (key,)
@@ -629,9 +674,13 @@ def model_color_freq(history: List[Dict[str, Any]]) -> float:
 
 def model_color_alternation(history: List[Dict[str, Any]]) -> float:
     colors = [get_color_for_logic(x["num"]) for x in history]
-    return 1.0 if alternating_score([1 if c == "RED" else 0 for c in colors], 12) >= 0.6 and colors[-1] == "GREEN" else 0.0 if alternating_score([1 if c == "RED" else 0 for c in colors], 12) >= 0.6 else 0.5
+    arr = [1 if c == "RED" else 0 for c in colors]
+    alt = alternating_score(arr, 12)
+    if alt >= 0.6:
+        return 1.0 if colors[-1] == "GREEN" else 0.0
+    return 0.5
 
-def compute_size_score(history: List[Dict[str, Any]]) -> Dict[str, float]:
+def compute_size_score(history: List[Dict[str, Any]]) -> float:
     seq = [x["size"] for x in history]
     regime = detect_regime(seq)
     exact = STORE.get_pattern_prob(seq)
@@ -652,7 +701,6 @@ def compute_size_score(history: List[Dict[str, Any]]) -> Dict[str, float]:
         "Exact": exact
     }
 
-    # Recovery mode boosts opposite side after loss streak
     if STATE.recovery_mode:
         for k in base:
             if base[k] > 0.5:
@@ -672,7 +720,6 @@ def compute_size_score(history: List[Dict[str, Any]]) -> Dict[str, float]:
         "Exact": STATE.weights.size.get("ReverseTrap", 1.0)
     }
 
-    # regime adjustments
     if regime == "TREND":
         base["Trend"] = clamp(base["Trend"] + 0.12, 0.05, 0.95)
     if regime == "TRAP":
@@ -714,7 +761,6 @@ def compute_color_score(history: List[Dict[str, Any]]) -> Dict[str, float]:
         "ExactGreen": STATE.weights.color.get("ReverseTrap", 1.0)
     }
 
-    # recovery mode reduces current dominant side and encourages opposite
     if STATE.recovery_mode:
         if colors[-1] == "RED":
             base["ExactGreen"] = clamp(base["ExactGreen"] + 0.12, 0.05, 0.95)
@@ -723,12 +769,32 @@ def compute_color_score(history: List[Dict[str, Any]]) -> Dict[str, float]:
             base["ExactRed"] = clamp(base["ExactRed"] + 0.12, 0.05, 0.95)
             base["ExactGreen"] = clamp(base["ExactGreen"] - 0.12, 0.05, 0.95)
 
-    red_score = (base["ColorMarkov"] * weights["ColorMarkov"] + base["ColorStreak"] * weights["ColorStreak"] + base["ColorFreq"] * weights["ColorFreq"] + base["ColorAlternation"] * weights["ColorAlternation"] + base["ExactRed"] * weights["ExactRed"]) / (
-        weights["ColorMarkov"] + weights["ColorStreak"] + weights["ColorFreq"] + weights["ColorAlternation"] + weights["ExactRed"]
+    red_score = (
+        base["ColorMarkov"] * weights["ColorMarkov"] +
+        base["ColorStreak"] * weights["ColorStreak"] +
+        base["ColorFreq"] * weights["ColorFreq"] +
+        base["ColorAlternation"] * weights["ColorAlternation"] +
+        base["ExactRed"] * weights["ExactRed"]
+    ) / (
+        weights["ColorMarkov"] +
+        weights["ColorStreak"] +
+        weights["ColorFreq"] +
+        weights["ColorAlternation"] +
+        weights["ExactRed"]
     )
 
-    green_score = (base["ColorMarkov"] * weights["ColorMarkov"] + base["ColorStreak"] * weights["ColorStreak"] + (1.0 - base["ColorFreq"]) * weights["ColorFreq"] + (1.0 - base["ColorAlternation"]) * weights["ColorAlternation"] + base["ExactGreen"] * weights["ExactGreen"]) / (
-        weights["ColorMarkov"] + weights["ColorStreak"] + weights["ColorFreq"] + weights["ColorAlternation"] + weights["ExactGreen"]
+    green_score = (
+        base["ColorMarkov"] * weights["ColorMarkov"] +
+        base["ColorStreak"] * weights["ColorStreak"] +
+        (1.0 - base["ColorFreq"]) * weights["ColorFreq"] +
+        (1.0 - base["ColorAlternation"]) * weights["ColorAlternation"] +
+        base["ExactGreen"] * weights["ExactGreen"]
+    ) / (
+        weights["ColorMarkov"] +
+        weights["ColorStreak"] +
+        weights["ColorFreq"] +
+        weights["ColorAlternation"] +
+        weights["ExactGreen"]
     )
 
     return {"RED": clamp(red_score, 0.05, 0.95), "GREEN": clamp(green_score, 0.05, 0.95)}
@@ -740,7 +806,6 @@ def choose_final_winner(history: List[Dict[str, Any]]):
     size_p = compute_size_score(history)
     color_p = compute_color_score(history)
 
-    # Strong anti-repeat behavior
     if trailing_run(seq) >= 4:
         if seq[-1] == 1:
             size_p = clamp(size_p - 0.18, 0.05, 0.95)
@@ -750,9 +815,9 @@ def choose_final_winner(history: List[Dict[str, Any]]):
     if regime == "ALTERNATING":
         size_p = clamp(1.0 - seq[-1], 0.05, 0.95)
 
-    # Dynamic choice between SIZE and COLOR
     size_edge = abs(size_p - 0.5)
     color_edge = abs(max(color_p["RED"], color_p["GREEN"]) - 0.5)
+
     if color_edge > size_edge + 0.04:
         pred_type = "COLOR"
         if color_p["RED"] >= color_p["GREEN"]:
@@ -858,7 +923,6 @@ def generate_prediction() -> Dict[str, Any]:
 # LEARN RESULT
 # ============================================================
 def learn_from_resolution(res: Dict[str, Any]):
-    # update memory
     if STATE.history:
         seq = [x["size"] for x in STATE.history]
         STORE.update_pattern_memory(seq, 1 if res["actual_size"] == "BIG" else 0)
