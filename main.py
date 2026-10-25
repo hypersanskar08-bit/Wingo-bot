@@ -1,11 +1,12 @@
 """
-V916 SUPER ADAPTIVE WINNER-ONLY
-================================
+V916 ULTIMATE WINNER-ONLY PREDICTOR
+===================================
 - Final winner selected from: BIG / SMALL / RED / GREEN
-- Advanced pattern, trend shift, parity, block, trap, alternation logic
-- Deep adaptive weighting
-- Render-safe / Telegram-safe
-- Single final prediction only
+- Best practical adaptive pattern engine
+- Trend shift + anti-trap + phase detection
+- Strong recency weighting + exact sequence memory
+- Render-safe + Telegram-safe
+- One final prediction only
 """
 
 import asyncio
@@ -39,12 +40,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v916_super_adaptive.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_ultimate_winner.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V916 ADAPTIVE WINNER"
+    bot_name: str = "V916 ULTIMATE WINNER"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -65,7 +66,7 @@ CFG = Config()
 
 
 # ============================================================
-# LOGGING + RENDER HEALTH
+# LOGGING + HEALTH
 # ============================================================
 def setup_logging():
     Path(CFG.log_dir).mkdir(parents=True, exist_ok=True)
@@ -73,11 +74,11 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_super_adaptive.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_ultimate_winner.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -91,7 +92,7 @@ def h(x: Any) -> str:
 
 
 async def health_check(request):
-    return web.Response(text="V916 Super Adaptive Winner Bot is Running!")
+    return web.Response(text="V916 Ultimate Winner Bot is Running!")
 
 
 async def start_web_server():
@@ -146,7 +147,7 @@ def get_color_from_num(num: int) -> str:
 
 
 # ============================================================
-# TREND + PATTERN FUNCTIONS
+# PATTERN / TREND METRICS
 # ============================================================
 def trailing_run(values: List[int], target: Optional[int] = None) -> int:
     if not values:
@@ -227,20 +228,6 @@ def detect_regime(sizes: List[int]) -> str:
     return "CYCLE"
 
 
-def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
-    if len(history) < window + 4:
-        return 0.0
-    current = tuple(x["size"] for x in history[-window:])
-    repeats = 0
-    for i in range(len(history) - window - 1, 0, -1):
-        prev = tuple(x["size"] for x in history[i:i + window])
-        if prev == current:
-            repeats += 1
-            if repeats >= 2:
-                break
-    return min(0.45, repeats * 0.14)
-
-
 def signal_strength(history: List[Dict[str, Any]]) -> float:
     if len(history) < 8:
         return 0.2
@@ -270,17 +257,31 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     return min(1.0, s)
 
 
+def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
+    if len(history) < window + 4:
+        return 0.0
+    current = tuple(x["size"] for x in history[-window:])
+    repeats = 0
+    for i in range(len(history) - window - 1, 0, -1):
+        prev = tuple(x["size"] for x in history[i:i + window])
+        if prev == current:
+            repeats += 1
+            if repeats >= 2:
+                break
+    return min(0.45, repeats * 0.14)
+
+
 def detect_trend_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(history) < 20:
-        return {"direction": "NONE", "confidence": 0.0}
+        return {"direction": "NONE", "confidence": 0.0, "recent_ratio": 0.5, "prev_ratio": 0.5}
 
     recent = [x["size"] for x in history[-12:]]
     prev = [x["size"] for x in history[-24:-12]]
 
     recent_ratio = ratio_big(recent, 12)
     prev_ratio = ratio_big(prev, 12)
-
     diff = recent_ratio - prev_ratio
+
     if diff > 0.22:
         direction = "SHIFT_TO_BIG"
     elif diff < -0.22:
@@ -298,7 +299,7 @@ def detect_trend_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================
-# BOT STATE
+# STATE + CACHE
 # ============================================================
 class BotState:
     def __init__(self):
@@ -484,7 +485,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# ADVANCED PROBABILITY MODELS
+# ADVANCED MODEL ENGINE
 # ============================================================
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -522,9 +523,7 @@ def model_run(history: List[Dict[str, Any]]) -> float:
 
 def model_volatility(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
-    if volatility(sizes, 20) > 0.5:
-        return 1.0 - sizes[-1]
-    return 0.5
+    return 1.0 - sizes[-1] if volatility(sizes, 20) > 0.5 else 0.5
 
 
 def model_bias(history: List[Dict[str, Any]]) -> float:
@@ -681,17 +680,16 @@ def choose_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> 
 
 
 def score_winner(p_big: float, p_small: float, p_red: float, p_green: float) -> Dict[str, float]:
-    candidates = {
+    return {
         "BIG": p_big,
         "SMALL": p_small,
         "RED": p_red,
         "GREEN": p_green,
     }
-    return candidates
 
 
 # ============================================================
-# WINNER-ONLY PREDICTION
+# WINNER ONLY FINAL PREDICTION
 # ============================================================
 def generate_prediction() -> Optional[Dict[str, Any]]:
     if len(STATE.history) < CFG.min_history:
@@ -700,7 +698,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         base = "BIG" if num >= 5 else "SMALL"
         return {
             "issue": issue,
-            "size": base if base == "BIG" else "SMALL",
+            "size": base,
             "num": num,
             "color": "",
             "p_big": 0.5,
@@ -805,7 +803,7 @@ def learn_from_resolution(res: dict):
 
 
 # ============================================================
-# API PARSING
+# PARSE API RESPONSE
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -930,7 +928,7 @@ async def fetch_data(session):
         log.warning("Using last known good history because all endpoints failed.")
         return True
 
-    log.warning("All endpoints failed and no last-good history exists.")
+    log.warning("All endpoints failed and last good history absent.")
     return False
 
 
