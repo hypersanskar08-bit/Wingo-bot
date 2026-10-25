@@ -1,12 +1,13 @@
 """
-FTW V8 REAL PATTERN MASTER (FIXED)
-==================================
-- Fixed: tuple index out of range in format_prediction
-- Fixed: recent_outcomes() mismatch with DB schema
-- Exact pattern mining 4..14
-- Real pattern support + recency
-- Recovery + dragon protection
-- No skip
+FTW V9 DEEP PATTERN ENGINE (4..14 EXACT SEQUENCE MINER)
+=========================================================
+- Recent results: 12 entries
+- Exact sequence mining from lengths 4..14
+- Real pattern vs fake/noisy pattern filtering
+- Strong pattern support, recency, confidence
+- Recovery only when danger is real
+- Dragon protection against hard streaks
+- No skip / always predicts
 """
 
 import asyncio
@@ -22,7 +23,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -40,13 +41,14 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v8_real_pattern.db")
-    cache_file: str = "ftw_v8_history_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v9_deep_pattern.db")
+    cache_file: str = "ftw_v9_history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V8 PATTERN MASTER"
+    bot_name: str = "FTW V9 DEEP PATTERN"
     min_history: int = 8
+    recent_limit: int = 12
 
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
@@ -78,7 +80,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v8_pattern_master.log",
+        Path(CFG.log_dir) / "ftw_v9_deep_pattern.log",
         maxBytes=1_000_000,
         backupCount=2
     )
@@ -86,7 +88,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v8")
+log = logging.getLogger("ftw_v9")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -295,7 +297,9 @@ class Storage:
     def resolve_pending(self, history_by_issue):
         resolved = []
         with self._conn() as c:
-            rows = c.execute("SELECT issue, pred_type, size, num, details, stake FROM predictions WHERE status='PENDING'").fetchall()
+            rows = c.execute(
+                "SELECT issue, pred_type, size, num, details, stake FROM predictions WHERE status='PENDING'"
+            ).fetchall()
 
         for row in rows:
             issue, pred_type, p_size, p_num, details_json, stake = row
@@ -334,7 +338,7 @@ class Storage:
 
         return resolved
 
-    def recent_outcomes(self, limit: int = 6):
+    def recent_outcomes(self, limit: int = 12):
         with self._conn() as c:
             rows = c.execute(
                 "SELECT issue, size, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
@@ -346,7 +350,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# REAL PATTERN TRACKER
+# PATTERN TRACKER
 # ============================================================
 class PatternTracker:
     def __init__(self):
@@ -390,10 +394,10 @@ PT = PatternTracker()
 
 
 # ============================================================
-# EXACT PATTERN MINER (4..14)
+# EXACT SEQUENCE MINER
 # ============================================================
 PATTERN_LIBRARY = [
-    # Streaks
+    # streaks
     ((1, 1, 1), 1, "3-BIG DRAGON", 1.8),
     ((0, 0, 0), 0, "3-SMALL DRAGON", 1.8),
     ((1, 1, 1, 1), 1, "4-BIG DRAGON", 2.2),
@@ -401,7 +405,7 @@ PATTERN_LIBRARY = [
     ((1, 1, 1, 1, 1), 0, "5-BIG REVERSE", 1.9),
     ((0, 0, 0, 0, 0), 1, "5-SMALL REVERSE", 1.9),
 
-    # Alternating
+    # zigzag
     ((1, 0, 1), 0, "B-S-B => S", 1.6),
     ((0, 1, 0), 1, "S-B-S => B", 1.6),
     ((1, 0, 1, 0), 1, "B-S-B-S => B", 1.7),
@@ -409,13 +413,13 @@ PATTERN_LIBRARY = [
     ((1, 0, 1, 0, 1), 0, "B-S-B-S-B => S", 1.8),
     ((0, 1, 0, 1, 0), 1, "S-B-S-B-S => B", 1.8),
 
-    # Symmetry
+    # symmetry
     ((1, 1, 0, 0), 1, "2B-2S => B", 1.5),
     ((0, 0, 1, 1), 0, "2S-2B => S", 1.5),
     ((1, 1, 1, 0, 0, 0), 1, "3B-3S => B", 1.8),
     ((0, 0, 0, 1, 1, 1), 0, "3S-3B => S", 1.8),
 
-    # Skips
+    # skips
     ((1, 0, 0, 0, 1), 0, "B-S-S-S-B => S", 1.5),
     ((0, 1, 1, 1, 0), 1, "S-B-B-B-S => B", 1.5),
     ((1, 0, 1, 1), 0, "B-S-B-B => S", 1.4),
@@ -423,19 +427,19 @@ PATTERN_LIBRARY = [
     ((1, 0, 0, 1), 0, "B-S-S-B => S", 1.3),
     ((0, 1, 1, 0), 1, "S-B-B-S => B", 1.3),
 
-    # Block / trap
+    # block & trap
     ((1, 1, 0, 1, 0), 1, "B-B-S-B-S => B", 1.5),
     ((0, 0, 1, 0, 1), 0, "S-S-B-S-B => S", 1.5),
     ((1, 0, 0, 1, 0), 0, "B-S-S-B-S => S", 1.5),
     ((0, 1, 1, 0, 1), 1, "S-B-B-S-B => B", 1.5),
 
-    # X and mirror
+    # x / mirror
     ((1, 0, 1), 1, "X-B-S-B => B", 1.5),
     ((0, 1, 0), 0, "X-S-B-S => S", 1.5),
     ((1, 0, 0, 1), 0, "V-B-S-S-B => S", 1.4),
     ((0, 1, 1, 0), 1, "V-S-B-B-S => B", 1.4),
 
-    # Extra patterns
+    # extra
     ((1, 0, 0, 0, 1, 0), 0, "P1", 1.4),
     ((0, 1, 1, 1, 0, 1), 1, "P2", 1.4),
     ((1, 1, 0, 1, 1, 0), 0, "P3", 1.4),
@@ -520,6 +524,8 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
     pred = best["pred"]
     confidence = clamp(best["confidence"] / 100.0, 0.55, 0.92)
     key = best["key"]
+
+    # pattern support capture
     PT.register_pattern(key, 1 if pred == "BIG" else 0)
 
     return {
@@ -578,6 +584,7 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         return None
 
     recent = seq[-6:]
+
     if STATE.loss_streak >= 3:
         if sum(recent) >= 4:
             return {"size": "SMALL", "logic": "RECOVERY REVERSE", "confidence": 0.82, "stake": "1x"}
@@ -707,6 +714,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     for item in items:
         if not isinstance(item, dict):
             continue
+
         issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
         if issue is None:
             issue = normalize_issue(item.get("issue"))
@@ -753,15 +761,15 @@ async def fetch_data(session):
 
 
 # ============================================================
-# FORMAT PREDICTION
+# FORMATTERS
 # ============================================================
 def normalize_recent_row(row: Any):
     if not isinstance(row, (tuple, list)):
         return "", "", "", ""
 
     if len(row) >= 4:
-        issue, size, status, state_flag = row[:4]
-        return str(issue), str(size), str(status), str(state_flag)
+        issue, size, status, _extra = row[:4]
+        return str(issue), str(size), str(status), ""
     if len(row) >= 3:
         issue, size, status = row[:3]
         return str(issue), str(size), str(status), ""
@@ -772,10 +780,11 @@ def normalize_recent_row(row: Any):
 
 def format_prediction(pred: Dict[str, Any], recent_rows):
     recent_lines = []
-    for r in recent_rows[-6:]:
-        issue, size, status, extra = normalize_recent_row(r)
+    for r in recent_rows[-CFG.recent_limit:]:
+        issue, size, status, _extra = normalize_recent_row(r)
         if not issue:
             continue
+
         if status:
             recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> {h(size)} → <b>{h(status)}</b>")
         else:
@@ -855,7 +864,7 @@ async def worker_loop(app, session):
                     pred = generate_prediction()
                     if pred:
                         STORE.save_prediction(pred)
-                        await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(6)))
+                        await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
                     last_processed_issue = latest_issue
 
             gc.collect()
@@ -869,7 +878,7 @@ async def worker_loop(app, session):
 # HEALTH CHECK
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V8 Pattern Master is Running")
+    return web.Response(text="FTW V9 Deep Pattern Engine is Running")
 
 async def start_web_server():
     app = web.Application()
