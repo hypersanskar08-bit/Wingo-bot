@@ -1,5 +1,5 @@
 """
-V1000 HYPER PRO PREDICTOR (FIXED: TIMEOUT + RECOVERY + ONE PREDICTION)
+V916 HYPER PRO PREDICTOR (FIXED: TIMEOUT + RECOVERY + ONE PREDICTION)
 ======================================================================
 - Fixed: Telegram send timeout
 - Fixed: HTTP timeout on API fetch
