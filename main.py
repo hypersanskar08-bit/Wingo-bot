@@ -1,10 +1,10 @@
 """
-V913 PERFECT BALANCE (Size Priority + Clean Recent Outcomes)
-============================================================
-- Fixed the math bug where Color was always winning over Size.
-- Now compares raw Size % vs Color % (Size will win more often).
-- Recent Outcomes shows exactly what was predicted (Size or Color).
-- Clean formatting for Prediction and Result messages.
+V916 MAX PROBABILITY (Pick Highest of 4)
+========================================
+- Calculates absolute probability for BIG, SMALL, RED, and GREEN.
+- Directly picks the option with the highest probability among these 4.
+- Only RED and GREEN are considered (No Violet).
+- Recent Outcomes shows exactly what was predicted.
 """
 
 import asyncio
@@ -37,12 +37,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v913_balance.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_maxprob.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V913 BALANCE"
+    bot_name: str = "V916 MAX PROB"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -73,18 +73,18 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
     
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v913.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v913")
+log = logging.getLogger("v916")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 async def health_check(request):
-    return web.Response(text="V913 Bot is Running!")
+    return web.Response(text="V916 Bot is Running!")
 
 async def start_web_server():
     app = web.Application()
@@ -97,20 +97,16 @@ async def start_web_server():
     log.info(f"Web Server started on port {port} (Render Health Check OK)")
 
 # ============================================================
-# HELPERS & COLOR LOGIC
+# HELPERS & COLOR LOGIC (RED/GREEN ONLY)
 # ============================================================
 def get_color_from_num(num: int) -> str:
-    if num == 0: return "RED & VIOLET"
-    if num in (1, 3, 7, 9): return "GREEN"
-    if num in (2, 4, 6, 8): return "RED"
-    if num == 5: return "GREEN & VIOLET"
+    if num in (0, 2, 4, 6, 8): return "RED"
+    if num in (1, 3, 5, 7, 9): return "GREEN"
     return "UNKNOWN"
 
 def get_num_colors_list(num: int) -> List[str]:
-    if num == 0: return ["RED", "VIOLET"]
-    if num in (1, 3, 7, 9): return ["GREEN"]
-    if num in (2, 4, 6, 8): return ["RED"]
-    if num == 5: return ["GREEN", "VIOLET"]
+    if num in (0, 2, 4, 6, 8): return ["RED"]
+    if num in (1, 3, 5, 7, 9): return ["GREEN"]
     return []
 
 def clamp(v: float, low: float, high: float) -> float:
@@ -277,7 +273,7 @@ class Storage:
             act_color = get_color_from_num(act["num"])
             
             win_size = (p_size == act_size) if p_size else True
-            win_color = (p_color in act_color) if p_color else True
+            win_color = (p_color == act_color) if p_color else True
             win = win_size and win_color
 
             if win and p_num == act["num"]: status = "JACK 🏆"
@@ -300,7 +296,6 @@ class Storage:
 
     def recent_outcomes(self, limit: int = 12):
         with self._conn() as c:
-            # Fetch what was predicted (Size or Color) and the final status
             rows = c.execute("""
                 SELECT issue, size, color, status 
                 FROM predictions 
@@ -309,7 +304,6 @@ class Storage:
                 LIMIT ?
             """, (limit,)).fetchall()
         
-        # Fallback if DB is empty (e.g., new deployment)
         if not rows and STATE.history:
             fallback = []
             for x in STATE.history[-limit:]:
@@ -405,13 +399,11 @@ def calculate_color_probs(history: List[Dict[str, Any]]) -> Dict[str, float]:
     recent_colors = []
     for x in history[-20:]:
         n = x["num"]
-        if n == 0: recent_colors.append("RED") 
-        elif n == 5: recent_colors.append("GREEN") 
-        elif n in (1, 3, 7, 9): recent_colors.append("GREEN")
-        else: recent_colors.append("RED")
+        if n in (0, 2, 4, 6, 8): recent_colors.append("RED")
+        else: recent_colors.append("GREEN")
 
     if not recent_colors:
-        return {"RED": 0.5, "GREEN": 0.5, "VIOLET": 0.01}
+        return {"RED": 0.5, "GREEN": 0.5}
 
     last_c = recent_colors[-1]
     streak = 1
@@ -436,13 +428,7 @@ def calculate_color_probs(history: List[Dict[str, Any]]) -> Dict[str, float]:
     p_red /= total
     p_green /= total
 
-    violet_count = sum(1 for n in [x["num"] for x in history[-15:]] if n in (0, 5))
-    p_violet = 0.10 if violet_count > 2 else 0.03
-
-    p_red *= (1.0 - p_violet)
-    p_green *= (1.0 - p_violet)
-
-    return {"RED": p_red, "GREEN": p_green, "VIOLET": p_violet}
+    return {"RED": p_red, "GREEN": p_green}
 
 def pick_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> int:
     if not valid_nums: return random.randint(0, 9)
@@ -464,7 +450,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         num = random.randint(0, 9)
         return {
             "issue": issue, "size": "BIG" if num >=5 else "SMALL", "num": num, "color": "",
-            "p_big": 0.5, "size_conf": 0.5, "color_conf": 0.33,
+            "p_big": 0.5, "size_conf": 0.5, "color_conf": 0.5,
             "confidence": 55, "raw_conf": 55, "consensus": 0.5,
             "mode": "FALLBACK", "regime": "COLD", "logic": "Fallback",
             "sigs": [{"name": "Fallback", "dir": 1 if num>=5 else 0}], "stake": "0.25x",
@@ -477,36 +463,46 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     # 1. Analyze Size
     p_big = ensemble_probability(history)["p_big"]
     p_small = 1.0 - p_big
-    size_pred = "BIG" if p_big >= 0.5 else "SMALL"
-    size_conf = max(p_big, p_small)
     
     # 2. Analyze Color
     color_probs = calculate_color_probs(history)
-    best_color = max(color_probs, key=color_probs.get)
-    color_conf = color_probs[best_color]
+    p_red = color_probs["RED"]
+    p_green = color_probs["GREEN"]
 
-    # 3. Choose the BEST (Highest raw confidence)
-    # Since size has 2 options (50%) and color has 3 (33%), size_conf will usually be higher.
-    # We only pick Color if its confidence is strictly higher.
+    # 3. Find the ABSOLUTE HIGHEST probability among all 4
+    candidates = {
+        "BIG": p_big,
+        "SMALL": p_small,
+        "RED": p_red,
+        "GREEN": p_green
+    }
     
+    best_choice = max(candidates, key=candidates.get)
+    final_conf = candidates[best_choice]
+
     valid_nums = []
     
-    if size_conf >= color_conf:
-        final_size = size_pred
+    # 4. Setup Final Prediction based on Winner
+    if best_choice in ("BIG", "SMALL"):
+        final_size = best_choice
         final_color = "" 
         valid_nums = [n for n in range(10) if ("BIG" if n >= 5 else "SMALL") == final_size]
+        size_pred = final_size
+        color_pred = ""
     else:
         final_size = "" 
-        final_color = best_color
-        valid_nums = [n for n in range(10) if final_color in get_num_colors_list(n)]
+        final_color = best_choice
+        valid_nums = [n for n in range(10) if get_color_from_num(n) == final_color]
+        size_pred = ""
+        color_pred = final_color
 
+    # 5. Pick Number
     best_num = pick_best_number(valid_nums, history)
 
     # Confidence & Stake
-    combined_conf = max(size_conf, color_conf)
-    if combined_conf > 0.65:
+    if final_conf > 0.65:
         confidence, stake = 75, "1x"
-    elif combined_conf > 0.55:
+    elif final_conf > 0.55:
         confidence, stake = 65, "0.5x"
     else:
         confidence, stake = 55, "0.25x"
@@ -515,19 +511,19 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     
     return {
         "issue": issue, 
-        "size": final_size, 
+        "size": size_pred, 
         "num": best_num, 
-        "color": final_color,
+        "color": color_pred,
         "p_big": round(p_big, 4), 
-        "size_conf": round(size_conf, 4),
-        "color_conf": round(color_conf, 4),
+        "size_conf": round(max(p_big, p_small), 4),
+        "color_conf": round(max(p_red, p_green), 4),
         "confidence": confidence, 
         "raw_conf": confidence, 
         "consensus": max(p_big, 1 - p_big), 
         "mode": "NORMAL", 
         "regime": detect_regime(sizes), 
-        "logic": "Best Analysis", 
-        "sigs": [{"name": "Smart Logic", "dir": 1 if (final_size == "BIG" or best_num>=5) else 0}],
+        "logic": "Max Prob", 
+        "sigs": [{"name": "Max Logic", "dir": 1 if (size_pred == "BIG" or best_num>=5) else 0}],
         "stake": stake, 
         "details": {"loss_streak": STATE.loss_streak}
     }
@@ -604,7 +600,6 @@ def format_prediction(p, recent_rows):
     for r in recent_rows:
         issue, p_size, p_color, status = r
         
-        # Display ONLY what was predicted
         if p_size and p_size != "":
             recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> <b>{h(p_size)}</b> → <b>{h(status)}</b>")
         elif p_color and p_color != "":
