@@ -1,12 +1,11 @@
 """
-V916 ULTIMATE WINNER-ONLY PREDICTOR
-===================================
-- Final winner selected from: BIG / SMALL / RED / GREEN
-- Best practical adaptive pattern engine
-- Trend shift + anti-trap + phase detection
-- Strong recency weighting + exact sequence memory
+V916 DEEP PATTERN ANALYZER (5-12 WINDOW ONLY)
+===========================================
+- Pattern tracking only from length 5 to 12
+- Deep size and color pattern extraction
+- Winner selected among BIG / SMALL / RED / GREEN
+- Strong adaptive logic
 - Render-safe + Telegram-safe
-- One final prediction only
 """
 
 import asyncio
@@ -40,12 +39,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v916_ultimate_winner.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_deep_5_12.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V916 ULTIMATE WINNER"
+    bot_name: str = "V916 DEEP 5-12"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -78,7 +77,7 @@ def setup_logging():
     stream.setFormatter(fmt)
     root.addHandler(stream)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_ultimate_winner.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_deep_5_12.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -92,7 +91,7 @@ def h(x: Any) -> str:
 
 
 async def health_check(request):
-    return web.Response(text="V916 Ultimate Winner Bot is Running!")
+    return web.Response(text="V916 Deep 5-12 Bot is Running!")
 
 
 async def start_web_server():
@@ -146,8 +145,12 @@ def get_color_from_num(num: int) -> str:
     return "UNKNOWN"
 
 
+def num_to_size(num: int) -> int:
+    return 1 if num >= 5 else 0
+
+
 # ============================================================
-# PATTERN / TREND METRICS
+# PATTERN / TREND FUNCTIONS
 # ============================================================
 def trailing_run(values: List[int], target: Optional[int] = None) -> int:
     if not values:
@@ -167,13 +170,6 @@ def ratio_big(values: List[int], window: int = 20) -> float:
         return 0.5
     arr = values[-window:]
     return sum(arr) / len(arr)
-
-
-def majority_dir(values: List[int], window: int = 6) -> int:
-    if not values:
-        return 1
-    arr = values[-window:]
-    return 1 if sum(arr) >= (len(arr) / 2) else 0
 
 
 def alternating_score(values: List[int], window: int = 12) -> float:
@@ -228,6 +224,20 @@ def detect_regime(sizes: List[int]) -> str:
     return "CYCLE"
 
 
+def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
+    if len(history) < window + 4:
+        return 0.0
+    current = tuple(x["size"] for x in history[-window:])
+    repeats = 0
+    for i in range(len(history) - window - 1, 0, -1):
+        prev = tuple(x["size"] for x in history[i:i + window])
+        if prev == current:
+            repeats += 1
+            if repeats >= 2:
+                break
+    return min(0.45, repeats * 0.14)
+
+
 def signal_strength(history: List[Dict[str, Any]]) -> float:
     if len(history) < 8:
         return 0.2
@@ -255,20 +265,6 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     if alt >= 0.6:
         s += 0.15
     return min(1.0, s)
-
-
-def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
-    if len(history) < window + 4:
-        return 0.0
-    current = tuple(x["size"] for x in history[-window:])
-    repeats = 0
-    for i in range(len(history) - window - 1, 0, -1):
-        prev = tuple(x["size"] for x in history[i:i + window])
-        if prev == current:
-            repeats += 1
-            if repeats >= 2:
-                break
-    return min(0.45, repeats * 0.14)
 
 
 def detect_trend_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -362,6 +358,15 @@ class Storage:
                     last_seen REAL DEFAULT 0
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS color_stats (
+                    color TEXT PRIMARY KEY,
+                    red_count INTEGER DEFAULT 0,
+                    green_count INTEGER DEFAULT 0,
+                    total_count INTEGER DEFAULT 0,
+                    last_seen REAL DEFAULT 0
+                )
+            """)
 
     def prediction_exists(self, issue: str) -> bool:
         with self._conn() as c:
@@ -446,15 +451,21 @@ class Storage:
         return rows[::-1]
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
-        for window in [3, 5, 8, 12, 20, 30, 50, 100]:
+        for window in [5, 6, 7, 8, 9, 10, 11, 12]:
             if len(sizes) < window:
                 continue
             seq = tuple(sizes[-window:])
             key = f"{window}:{json.dumps(list(seq))}"
             with self._conn() as c:
-                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+                row = c.execute(
+                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
+                    (key,),
+                ).fetchone()
                 if row is None:
-                    c.execute("INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, 0, 0, 0, ?)", (key, window, time.time()))
+                    c.execute(
+                        "INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, 0, 0, 0, ?)",
+                        (key, window, time.time()),
+                    )
                     row = (0, 0, 0)
                 big_count, small_count, total_count = row
                 if actual_size == 1:
@@ -462,17 +473,51 @@ class Storage:
                 else:
                     small_count += 1
                 total_count += 1
-                c.execute("UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?", (big_count, small_count, total_count, time.time(), key))
+                c.execute(
+                    "UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?",
+                    (big_count, small_count, total_count, time.time(), key),
+                )
+
+    def update_color_memory(self, colors: List[str], actual_color: str):
+        for window in [5, 6, 7, 8, 9, 10, 11, 12]:
+            if len(colors) < window:
+                continue
+            seq = tuple(colors[-window:])
+            key = f"{window}:{json.dumps(list(seq))}"
+            with self._conn() as c:
+                row = c.execute(
+                    "SELECT red_count, green_count, total_count FROM color_stats WHERE color=?",
+                    (key,),
+                ).fetchone()
+                if row is None:
+                    c.execute(
+                        "INSERT INTO color_stats (color, red_count, green_count, total_count, last_seen) VALUES (?, 0, 0, 0, ?)",
+                        (key, time.time()),
+                    )
+                    row = (0, 0, 0)
+                red_count, green_count, total_count = row
+                if actual_color == "RED":
+                    red_count += 1
+                else:
+                    green_count += 1
+                total_count += 1
+                c.execute(
+                    "UPDATE color_stats SET red_count=?, green_count=?, total_count=?, last_seen=? WHERE color=?",
+                    (red_count, green_count, total_count, time.time(), key),
+                )
 
     def get_exact_pattern_probability(self, sizes: List[int]) -> float:
         matches = []
-        for window in [3, 5, 8, 12, 20, 30, 50, 100]:
+        for window in [5, 6, 7, 8, 9, 10, 11, 12]:
             if len(sizes) < window:
                 continue
             seq = tuple(sizes[-window:])
             key = f"{window}:{json.dumps(list(seq))}"
             with self._conn() as c:
-                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+                row = c.execute(
+                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
+                    (key,),
+                ).fetchone()
             if row and row[2] > 0:
                 matches.append({"p_big": row[0] / row[2], "count": int(row[2])})
         if not matches:
@@ -485,7 +530,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# ADVANCED MODEL ENGINE
+# MODELS
 # ============================================================
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -523,7 +568,9 @@ def model_run(history: List[Dict[str, Any]]) -> float:
 
 def model_volatility(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
-    return 1.0 - sizes[-1] if volatility(sizes, 20) > 0.5 else 0.5
+    if volatility(sizes, 20) > 0.5:
+        return 1.0 - sizes[-1]
+    return 0.5
 
 
 def model_bias(history: List[Dict[str, Any]]) -> float:
@@ -575,10 +622,49 @@ def color_streak_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
     return {"RED": red_prob, "GREEN": green_prob}
 
 
+def size_sequence_similarity(history: List[Dict[str, Any]]) -> float:
+    if len(history) < 12:
+        return 0.5
+
+    sizes = [x["size"] for x in history]
+    windows = [5, 6, 7, 8, 9, 10, 11, 12]
+    scores = []
+    for w in windows:
+        if len(sizes) < w:
+            continue
+        seq = tuple(sizes[-w:])
+        for i in range(len(sizes) - w - 1, max(0, len(sizes) - w - 20), -1):
+            if tuple(sizes[i:i + w]) == seq:
+                scores.append(1.0 / (len(sizes) - i))
+    if not scores:
+        return 0.5
+    return sum(scores) / len(scores)
+
+
+def color_sequence_similarity(history: List[Dict[str, Any]]) -> float:
+    if len(history) < 12:
+        return 0.5
+
+    colors = [get_color_from_num(x["num"]) for x in history]
+    windows = [5, 6, 7, 8, 9, 10, 11, 12]
+    scores = []
+    for w in windows:
+        if len(colors) < w:
+            continue
+        seq = tuple(colors[-w:])
+        for i in range(len(colors) - w - 1, max(0, len(colors) - w - 20), -1):
+            if tuple(colors[i:i + w]) == seq:
+                scores.append(1.0 / (len(colors) - i))
+    if not scores:
+        return 0.5
+    return sum(scores) / len(scores)
+
+
 def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     exact = STORE.get_exact_pattern_probability(sizes)
     shift = detect_trend_shift(history)
+    seq_sim = size_sequence_similarity(history)
 
     models = [
         ("Exact", exact),
@@ -589,17 +675,19 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
         ("Volatility", model_volatility(history)),
         ("Bias", model_bias(history)),
         ("Parity", model_parity(history)),
+        ("Similarity", seq_sim),
     ]
 
     weights = {
         "Exact": 0.28,
-        "Trend": 0.14,
-        "Alternation": 0.12,
-        "Block": 0.12,
+        "Trend": 0.12,
+        "Alternation": 0.10,
+        "Block": 0.10,
         "Run": 0.10,
-        "Volatility": 0.10,
+        "Volatility": 0.08,
         "Bias": 0.08,
         "Parity": 0.06,
+        "Similarity": 0.08,
     }
 
     regime = detect_regime(sizes)
@@ -619,18 +707,18 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
 
     total = sum(weights.values())
     weighted = 0.0
-    for name, val in models:
-        weighted += val * weights.get(name, 0.10)
+    for name, value in models:
+        weighted += value * weights.get(name, 0.10)
 
     final = weighted / total
     if shift["direction"] == "SHIFT_TO_BIG":
-        final = clamp(final + 0.10, 0.05, 0.95)
+        final = clamp(final + 0.12, 0.05, 0.95)
     elif shift["direction"] == "SHIFT_TO_SMALL":
-        final = clamp(final - 0.10, 0.05, 0.95)
+        final = clamp(final - 0.12, 0.05, 0.95)
 
     stale = stale_pattern_penalty(history, 12)
     if stale > 0.12:
-        final = clamp(final * 0.93, 0.05, 0.95)
+        final = clamp(final * 0.92, 0.05, 0.95)
 
     return clamp(final, 0.05, 0.95)
 
@@ -638,15 +726,16 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
 def ensemble_color_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
     col_prob = color_probability(history)
     streak_prob = color_streak_probability(history)
+    sim = color_sequence_similarity(history)
     shift = detect_trend_shift(history)
 
-    red = (col_prob["RED"] * 0.62) + (streak_prob["RED"] * 0.38)
-    green = (col_prob["GREEN"] * 0.62) + (streak_prob["GREEN"] * 0.38)
+    red = (col_prob["RED"] * 0.5) + (streak_prob["RED"] * 0.3) + (sim * 0.2)
+    green = (col_prob["GREEN"] * 0.5) + (streak_prob["GREEN"] * 0.3) + ((1.0 - sim) * 0.2)
 
     if shift["direction"] == "SHIFT_TO_BIG":
-        red = red + 0.06
+        red = red + 0.05
     elif shift["direction"] == "SHIFT_TO_SMALL":
-        green = green + 0.06
+        green = green + 0.05
 
     total = red + green
     if total == 0:
@@ -689,16 +778,15 @@ def score_winner(p_big: float, p_small: float, p_red: float, p_green: float) -> 
 
 
 # ============================================================
-# WINNER ONLY FINAL PREDICTION
+# FINAL PREDICTION
 # ============================================================
 def generate_prediction() -> Optional[Dict[str, Any]]:
     if len(STATE.history) < CFG.min_history:
         issue = str(int(STATE.history[-1]["issue"]) + 1) if STATE.history else "1"
         num = random.randint(0, 9)
-        base = "BIG" if num >= 5 else "SMALL"
         return {
             "issue": issue,
-            "size": base,
+            "size": "BIG" if num >= 5 else "SMALL",
             "num": num,
             "color": "",
             "p_big": 0.5,
@@ -768,10 +856,10 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         "confidence": confidence,
         "raw_conf": confidence,
         "consensus": best_conf,
-        "mode": "SUPER-ADAPTIVE",
+        "mode": "SUPER-DEEP",
         "regime": detect_regime(sizes),
         "logic": f"Winner selected: {best_choice}",
-        "sigs": [{"name": "Adaptive Winner", "dir": 1 if best_choice in ("BIG", "RED") else 0}],
+        "sigs": [{"name": "Deep Winner", "dir": 1 if best_choice in ("BIG", "RED") else 0}],
         "stake": stake,
         "details": {
             "winner": best_choice,
@@ -783,6 +871,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
             "regime": detect_regime(sizes),
             "trend_shift": detect_trend_shift(history),
             "loss_streak": STATE.loss_streak,
+            "signal_strength": signal_strength(history),
         },
     }
 
@@ -803,7 +892,7 @@ def learn_from_resolution(res: dict):
 
 
 # ============================================================
-# PARSE API RESPONSE
+# API PARSING
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
