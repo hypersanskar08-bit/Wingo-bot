@@ -1,10 +1,10 @@
 """
-V916 DEEP PATTERN ANALYZER (5-12 WINDOW ONLY)
-===========================================
-- Pattern tracking only from length 5 to 12
-- Deep size and color pattern extraction
-- Winner selected among BIG / SMALL / RED / GREEN
-- Strong adaptive logic
+V916 LIVE TUNING DEEP PREDICTOR
+================================
+- Pattern tracking: 5..12
+- Deep size + color analysis
+- Adaptive live tuning after each result
+- Winner selected among: BIG / SMALL / RED / GREEN
 - Render-safe + Telegram-safe
 """
 
@@ -33,18 +33,18 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = os.environ.get("TG_TOKEN", "8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM")
-    chat_id_raw: str = os.environ.get("TG_CHAT", "1264164655")
+    telegram_token: str = os.environ.get("8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM", "")
+    chat_id_raw: str = os.environ.get("1264164655", "")
     source_api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v916_deep_5_12.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_live_tuning.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V916 DEEP 5-12"
+    bot_name: str = "V916 LIVE TUNING"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -73,11 +73,11 @@ def setup_logging():
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    stream = logging.StreamHandler()
-    stream.setFormatter(fmt)
-    root.addHandler(stream)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_deep_5_12.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_live_tuning.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -91,7 +91,7 @@ def h(x: Any) -> str:
 
 
 async def health_check(request):
-    return web.Response(text="V916 Deep 5-12 Bot is Running!")
+    return web.Response(text="V916 Live Tuning Predictor is Running!")
 
 
 async def start_web_server():
@@ -145,12 +145,8 @@ def get_color_from_num(num: int) -> str:
     return "UNKNOWN"
 
 
-def num_to_size(num: int) -> int:
-    return 1 if num >= 5 else 0
-
-
 # ============================================================
-# PATTERN / TREND FUNCTIONS
+# PATTERN METRICS
 # ============================================================
 def trailing_run(values: List[int], target: Optional[int] = None) -> int:
     if not values:
@@ -295,13 +291,73 @@ def detect_trend_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================
-# STATE + CACHE
+# LIVE TUNING WEIGHTS
+# ============================================================
+class LiveWeights:
+    def __init__(self):
+        self.size = {
+            "Exact": 1.00,
+            "Trend": 1.00,
+            "Alternation": 1.00,
+            "Block": 1.00,
+            "Run": 1.00,
+            "Volatility": 1.00,
+            "Bias": 1.00,
+            "Parity": 1.00,
+            "Similarity": 1.00,
+        }
+        self.color = {
+            "Freq": 1.00,
+            "Streak": 1.00,
+            "Similarity": 1.00,
+            "ShiftBias": 1.00,
+        }
+        self.regime = {
+            "TREND": {"BIG": 1.00, "SMALL": 1.00},
+            "TRAP": {"BIG": 1.00, "SMALL": 1.00},
+            "ALTERNATING": {"RED": 1.00, "GREEN": 1.00},
+            "BLOCK": {"BIG": 1.00, "SMALL": 1.00},
+            "COLD": {"BIG": 1.00, "SMALL": 1.00},
+            "CHOPPY": {"RED": 1.00, "GREEN": 1.00},
+            "CYCLE": {"BIG": 1.00, "SMALL": 1.00},
+        }
+
+    def boost(self, key: str, amount: float = 0.08):
+        self.size[key] = clamp(self.size.get(key, 1.0) + amount, 0.3, 3.0)
+
+    def boost_color(self, key: str, amount: float = 0.08):
+        self.color[key] = clamp(self.color.get(key, 1.0) + amount, 0.3, 3.0)
+
+    def decayed(self, key: str, amount: float = 0.05):
+        self.size[key] = clamp(self.size.get(key, 1.0) - amount, 0.3, 3.0)
+
+    def decayed_color(self, key: str, amount: float = 0.05):
+        self.color[key] = clamp(self.color.get(key, 1.0) - amount, 0.3, 3.0)
+
+    def regime_boost(self, regime: str, winner: str, amount: float = 0.10):
+        if regime not in self.regime:
+            self.regime[regime] = {"BIG": 1.0, "SMALL": 1.0, "RED": 1.0, "GREEN": 1.0}
+        if winner in self.regime[regime]:
+            self.regime[regime][winner] = clamp(self.regime[regime][winner] + amount, 0.3, 3.0)
+
+    def regime_decay(self, regime: str, winner: str, amount: float = 0.08):
+        if regime not in self.regime:
+            self.regime[regime] = {"BIG": 1.0, "SMALL": 1.0, "RED": 1.0, "GREEN": 1.0}
+        if winner in self.regime[regime]:
+            self.regime[regime][winner] = clamp(self.regime[regime][winner] - amount, 0.3, 3.0)
+
+
+# ============================================================
+# STATE
 # ============================================================
 class BotState:
     def __init__(self):
         self.history: List[Dict[str, Any]] = []
         self.loss_streak = 0
         self.win_streak = 0
+        self.weights = LiveWeights()
+        self.regime_stats: Dict[str, Dict[str, int]] = {}
+        self.last_predicted_winner: Optional[str] = None
 
     def save_cache(self):
         try:
@@ -530,7 +586,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# MODELS
+# ANALYSIS MODELS
 # ============================================================
 def model_trend(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -568,9 +624,7 @@ def model_run(history: List[Dict[str, Any]]) -> float:
 
 def model_volatility(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
-    if volatility(sizes, 20) > 0.5:
-        return 1.0 - sizes[-1]
-    return 0.5
+    return 1.0 - sizes[-1] if volatility(sizes, 20) > 0.5 else 0.5
 
 
 def model_bias(history: List[Dict[str, Any]]) -> float:
@@ -660,23 +714,37 @@ def color_sequence_similarity(history: List[Dict[str, Any]]) -> float:
     return sum(scores) / len(scores)
 
 
+def apply_live_size_weights(base: Dict[str, float]) -> Dict[str, float]:
+    out = {}
+    for k, v in base.items():
+        out[k] = v * STATE.weights.size.get(k, 1.0)
+    return out
+
+
+def apply_live_color_weights(base: Dict[str, float]) -> Dict[str, float]:
+    out = {}
+    for k, v in base.items():
+        out[k] = v * STATE.weights.color.get(k, 1.0)
+    return out
+
+
 def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     exact = STORE.get_exact_pattern_probability(sizes)
     shift = detect_trend_shift(history)
     seq_sim = size_sequence_similarity(history)
 
-    models = [
-        ("Exact", exact),
-        ("Trend", model_trend(history)),
-        ("Alternation", model_alternation(history)),
-        ("Block", model_block(history)),
-        ("Run", model_run(history)),
-        ("Volatility", model_volatility(history)),
-        ("Bias", model_bias(history)),
-        ("Parity", model_parity(history)),
-        ("Similarity", seq_sim),
-    ]
+    base = {
+        "Exact": exact,
+        "Trend": model_trend(history),
+        "Alternation": model_alternation(history),
+        "Block": model_block(history),
+        "Run": model_run(history),
+        "Volatility": model_volatility(history),
+        "Bias": model_bias(history),
+        "Parity": model_parity(history),
+        "Similarity": seq_sim,
+    }
 
     weights = {
         "Exact": 0.28,
@@ -705,10 +773,11 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
         weights["Trend"] -= 0.08
         weights["Bias"] += 0.05
 
-    total = sum(weights.values())
+    live = apply_live_size_weights(weights)
+    total = sum(live.values())
     weighted = 0.0
-    for name, value in models:
-        weighted += value * weights.get(name, 0.10)
+    for name, value in base.items():
+        weighted += value * live.get(name, 1.0)
 
     final = weighted / total
     if shift["direction"] == "SHIFT_TO_BIG":
@@ -835,10 +904,10 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
 
     best_num = choose_best_number(valid_nums, history)
 
-    if best_conf > 0.70:
-        confidence, stake = 78, "1x"
-    elif best_conf > 0.58:
-        confidence, stake = 68, "0.5x"
+    if best_conf > 0.72:
+        confidence, stake = 80, "1x"
+    elif best_conf > 0.60:
+        confidence, stake = 70, "0.5x"
     else:
         confidence, stake = 56, "0.25x"
 
@@ -856,10 +925,10 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         "confidence": confidence,
         "raw_conf": confidence,
         "consensus": best_conf,
-        "mode": "SUPER-DEEP",
+        "mode": "LIVE-TUNING",
         "regime": detect_regime(sizes),
         "logic": f"Winner selected: {best_choice}",
-        "sigs": [{"name": "Deep Winner", "dir": 1 if best_choice in ("BIG", "RED") else 0}],
+        "sigs": [{"name": "Adaptive Winner", "dir": 1 if best_choice in ("BIG", "RED") else 0}],
         "stake": stake,
         "details": {
             "winner": best_choice,
@@ -876,6 +945,9 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     }
 
 
+# ============================================================
+# LIVE TUNING AFTER RESULT
+# ============================================================
 def learn_from_resolution(res: dict):
     if res["win"]:
         STATE.loss_streak = 0
@@ -886,7 +958,38 @@ def learn_from_resolution(res: dict):
 
     if STATE.history:
         actual_size = 1 if res["actual_size"] == "BIG" else 0
+        actual_color = get_color_from_num(res["actual_num"])
+
+        # pattern learning
         STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
+        STORE.update_color_memory([get_color_from_num(x["num"]) for x in STATE.history], actual_color)
+
+        regime = detect_regime([x["size"] for x in STATE.history])
+        predicted_winner = res.get("details", {}).get("winner") or res.get("size", "") or res.get("color", "")
+
+        if predicted_winner in ("BIG", "SMALL"):
+            if res["win"]:
+                STATE.weights.boost("Exact", 0.06)
+                STATE.weights.boost("Trend", 0.04)
+                STATE.weights.boost("Run", 0.04)
+            else:
+                STATE.weights.decayed("Exact", 0.05)
+                STATE.weights.decayed("Trend", 0.05)
+                STATE.weights.decayed("Run", 0.05)
+
+        if predicted_winner in ("RED", "GREEN"):
+            if res["win"]:
+                STATE.weights.boost_color("Freq", 0.05)
+                STATE.weights.boost_color("Streak", 0.05)
+            else:
+                STATE.weights.decayed_color("Freq", 0.06)
+                STATE.weights.decayed_color("Streak", 0.06)
+
+        if predicted_winner in ("BIG", "SMALL", "RED", "GREEN") and regime in STATE.weights.regime:
+            if res["win"]:
+                STATE.weights.regime_boost(regime, predicted_winner, 0.10)
+            else:
+                STATE.weights.regime_decay(regime, predicted_winner, 0.08)
 
     STATE.save_cache()
 
@@ -1017,7 +1120,7 @@ async def fetch_data(session):
         log.warning("Using last known good history because all endpoints failed.")
         return True
 
-    log.warning("All endpoints failed and last good history absent.")
+    log.warning("All endpoints failed and no last-good history exists.")
     return False
 
 
@@ -1144,6 +1247,10 @@ async def worker_loop(app, session):
 async def main():
     CFG.validate()
     STATE.load_cache()
+
+    if not CFG.telegram_token or not CFG.chat_id_raw:
+        log.error("Please set TG_TOKEN and TG_CHAT environment variables before starting.")
+        return
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
 
