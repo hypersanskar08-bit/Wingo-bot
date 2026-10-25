@@ -1,5 +1,5 @@
 """
-V1000 STATE-BASED DEEP PREDICTOR
+V916 STATE-BASED DEEP PREDICTOR
 ================================
 - Tracks exact suffix patterns in 5..12 windows
 - Tracks size and color transitions separately
@@ -34,8 +34,8 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    tg_token: str = "8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM"
-    tg_chat: str = "1264164655"
+    tg_token: str = os.environ.get("8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM", "")
+    tg_chat: str = os.environ.get("1264164655", "")
     api_url: str = os.environ.get(
         "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
