@@ -1,8 +1,8 @@
 """
-FTW V16 FULL CODE
+FTW V16 FULL CODE (UPGRADED)
 =================
 Advanced deep predictor with:
-- trend phase detection
+- trend phase detection (DRAGON RIDING FIX APPLIED)
 - exhaustion logic
 - momentum decay
 - dominance check
@@ -10,7 +10,7 @@ Advanced deep predictor with:
 - deep number family analysis
 - exact sequence mining 4..14
 - anti-bias guard
-- Telegram ready
+- Telegram VIP Channel Ready
 """
 
 import asyncio
@@ -38,8 +38,12 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
-    chat_id_raw: str = "1264164655"
+    # ⚠️ यहाँ अपना नया बॉट टोकन डालें
+    telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
+    
+    # ⚠️ यहाँ अपनी VIP Channel की ID डालें (जो -100 से शुरू होती है)
+    chat_id_raw: str = os.environ.get("CHAT_ID", "-1004485961768")
+    
     source_api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
@@ -390,11 +394,7 @@ class Storage:
             ).fetchone()
 
             if row is None:
-                hit = 0
-                miss = 0
-                last_seen = 0.0
-                support = 0.0
-                confidence = 0.0
+                hit, miss, last_seen, support, confidence = 0, 0, 0.0, 0.0, 0.0
             else:
                 hit, miss, last_seen, support, confidence = row
 
@@ -447,42 +447,14 @@ class AdaptiveWeights:
 
     def current(self) -> Dict[str, float]:
         if not self.recent:
-            return {
-                "exact": 0.38,
-                "markov": 0.22,
-                "trend": 0.18,
-                "parity": 0.10,
-                "regime": 0.08,
-                "recovery": 0.04
-            }
+            return {"exact": 0.38, "markov": 0.22, "trend": 0.18, "parity": 0.10, "regime": 0.08, "recovery": 0.04}
 
         recent_rate = sum(self.recent) / len(self.recent)
         if recent_rate >= 0.65:
-            return {
-                "exact": 0.42,
-                "markov": 0.20,
-                "trend": 0.16,
-                "parity": 0.10,
-                "regime": 0.08,
-                "recovery": 0.04
-            }
+            return {"exact": 0.42, "markov": 0.20, "trend": 0.16, "parity": 0.10, "regime": 0.08, "recovery": 0.04}
         if recent_rate >= 0.5:
-            return {
-                "exact": 0.35,
-                "markov": 0.22,
-                "trend": 0.18,
-                "parity": 0.12,
-                "regime": 0.09,
-                "recovery": 0.04
-            }
-        return {
-            "exact": 0.30,
-            "markov": 0.24,
-            "trend": 0.20,
-            "parity": 0.13,
-            "regime": 0.10,
-            "recovery": 0.03
-        }
+            return {"exact": 0.35, "markov": 0.22, "trend": 0.18, "parity": 0.12, "regime": 0.09, "recovery": 0.04}
+        return {"exact": 0.30, "markov": 0.24, "trend": 0.20, "parity": 0.13, "regime": 0.10, "recovery": 0.03}
 
 ADAPTIVE = AdaptiveWeights()
 
@@ -500,14 +472,12 @@ def trend_phase(history: List[Dict[str, Any]]) -> str:
     recent = seq[-10:]
     same_share = sum(1 for v in recent if v == current_side) / len(recent)
 
-    # detect momentum decay
     last3 = seq[-3:]
     prev3 = seq[-6:-3]
     if len(last3) == 3 and len(prev3) == 3:
         last_same = sum(1 for v in last3 if v == current_side)
         prev_same = sum(1 for v in prev3 if v == current_side)
         momentum_decay = (last_same < prev_same)
-
     else:
         momentum_decay = False
 
@@ -532,35 +502,15 @@ def trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
     if phase == "EXHAUSTED":
         if current_side == 1 and big_share >= 0.75:
-            return {
-                "size": "SMALL",
-                "logic": "TREND EXHAUSTION: BIG DOMINANCE + DECAY",
-                "confidence": 0.92,
-                "stake": "1x"
-            }
+            return {"size": "SMALL", "logic": "TREND EXHAUSTION: BIG DOMINANCE + DECAY", "confidence": 0.92, "stake": "1x"}
         if current_side == 0 and small_share >= 0.75:
-            return {
-                "size": "BIG",
-                "logic": "TREND EXHAUSTION: SMALL DOMINANCE + DECAY",
-                "confidence": 0.92,
-                "stake": "1x"
-            }
+            return {"size": "BIG", "logic": "TREND EXHAUSTION: SMALL DOMINANCE + DECAY", "confidence": 0.92, "stake": "1x"}
 
     if phase == "DOMINANT":
         if current_side == 1 and big_share >= 0.68:
-            return {
-                "size": "SMALL",
-                "logic": "TREND FATIGUE: BIG DOMINANCE BUT WEAK CONTINUATION",
-                "confidence": 0.82,
-                "stake": "1x"
-            }
+            return {"size": "SMALL", "logic": "TREND FATIGUE: BIG DOMINANCE BUT WEAK CONTINUATION", "confidence": 0.82, "stake": "1x"}
         if current_side == 0 and small_share >= 0.68:
-            return {
-                "size": "BIG",
-                "logic": "TREND FATIGUE: SMALL DOMINANCE BUT WEAK CONTINUATION",
-                "confidence": 0.82,
-                "stake": "1x"
-            }
+            return {"size": "BIG", "logic": "TREND FATIGUE: SMALL DOMINANCE BUT WEAK CONTINUATION", "confidence": 0.82, "stake": "1x"}
 
     return None
 
@@ -572,7 +522,6 @@ def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
     current_side = seq[-1]
     opposite = "SMALL" if current_side == 1 else "BIG"
 
-    # strong reversal requirement
     phase = trend_phase(history)
     if phase not in ("EXHAUSTED", "DOMINANT"):
         return None
@@ -582,19 +531,13 @@ def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
     if current_share < 0.68:
         return None
 
-    # check if recent continuation is fading
     last3 = seq[-3:]
     prev3 = seq[-6:-3]
     if len(last3) == 3 and len(prev3) == 3:
         last_same = sum(1 for v in last3 if v == current_side)
         prev_same = sum(1 for v in prev3 if v == current_side)
         if last_same <= prev_same:
-            return {
-                "size": opposite,
-                "logic": "REVERSAL PRESSURE: momentum fading",
-                "confidence": 0.85,
-                "stake": "1x"
-            }
+            return {"size": opposite, "logic": "REVERSAL PRESSURE: momentum fading", "confidence": 0.85, "stake": "1x"}
 
     return None
 
@@ -603,26 +546,16 @@ def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
 # PATTERN LIBRARY
 # ============================================================
 PATTERN_LIBRARY = [
-    ((1, 1, 1), 1, "3-BIG DRAGON", 1.8),
-    ((0, 0, 0), 0, "3-SMALL DRAGON", 1.8),
-    ((1, 1, 1, 1), 1, "4-BIG DRAGON", 2.2),
-    ((0, 0, 0, 0), 0, "4-SMALL DRAGON", 2.2),
-    ((1, 1, 1, 1, 1), 0, "5-BIG REVERSE", 1.9),
-    ((0, 0, 0, 0, 0), 1, "5-SMALL REVERSE", 1.9),
-    ((1, 0, 1), 0, "B-S-B => S", 1.6),
-    ((0, 1, 0), 1, "S-B-S => B", 1.6),
-    ((1, 0, 1, 0), 1, "B-S-B-S => B", 1.7),
-    ((0, 1, 0, 1), 0, "S-B-S-B => S", 1.7),
-    ((1, 1, 0, 0), 1, "2B-2S => B", 1.5),
-    ((0, 0, 1, 1), 0, "2S-2B => S", 1.5),
-    ((1, 0, 0, 0, 1), 0, "B-S-S-S-B => S", 1.5),
-    ((0, 1, 1, 1, 0), 1, "S-B-B-B-S => B", 1.5),
-    ((1, 0, 0, 1), 0, "B-S-S-B => S", 1.3),
-    ((0, 1, 1, 0), 1, "S-B-B-S => B", 1.3),
-    ((1, 1, 0, 1, 0), 1, "B-B-S-B-S => B", 1.5),
-    ((0, 0, 1, 0, 1), 0, "S-S-B-S-B => S", 1.5),
-    ((1, 0, 0, 1, 0), 0, "B-S-S-B-S => S", 1.5),
-    ((0, 1, 1, 0, 1), 1, "S-B-B-S-B => B", 1.5),
+    ((1, 1, 1), 1, "3-BIG DRAGON", 1.8), ((0, 0, 0), 0, "3-SMALL DRAGON", 1.8),
+    ((1, 1, 1, 1), 1, "4-BIG DRAGON", 2.2), ((0, 0, 0, 0), 0, "4-SMALL DRAGON", 2.2),
+    ((1, 1, 1, 1, 1), 0, "5-BIG REVERSE", 1.9), ((0, 0, 0, 0, 0), 1, "5-SMALL REVERSE", 1.9),
+    ((1, 0, 1), 0, "B-S-B => S", 1.6), ((0, 1, 0), 1, "S-B-S => B", 1.6),
+    ((1, 0, 1, 0), 1, "B-S-B-S => B", 1.7), ((0, 1, 0, 1), 0, "S-B-S-B => S", 1.7),
+    ((1, 1, 0, 0), 1, "2B-2S => B", 1.5), ((0, 0, 1, 1), 0, "2S-2B => S", 1.5),
+    ((1, 0, 0, 0, 1), 0, "B-S-S-S-B => S", 1.5), ((0, 1, 1, 1, 0), 1, "S-B-B-B-S => B", 1.5),
+    ((1, 0, 0, 1), 0, "B-S-S-B => S", 1.3), ((0, 1, 1, 0), 1, "S-B-B-S => B", 1.3),
+    ((1, 1, 0, 1, 0), 1, "B-B-S-B-S => B", 1.5), ((0, 0, 1, 0, 1), 0, "S-S-B-S-B => S", 1.5),
+    ((1, 0, 0, 1, 0), 0, "B-S-S-B-S => S", 1.5), ((0, 1, 1, 0, 1), 1, "S-B-B-S-B => B", 1.5),
 ]
 
 def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -664,13 +597,8 @@ def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, An
         score = confidence + (support * 100.0) + (window * 2.0) + STORE.get_pattern_score(key) * 25.0
 
         candidates.append({
-            "window": window,
-            "suffix": suffix,
-            "pred": pred,
-            "confidence": confidence,
-            "support": support,
-            "score": score,
-            "key": key
+            "window": window, "suffix": suffix, "pred": pred, "confidence": confidence,
+            "support": support, "score": score, "key": key
         })
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -692,9 +620,7 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
     STORE.update_pattern_stats(key, 1 if pred == "BIG" else 0)
 
     return {
-        "size": pred,
-        "logic": f"EXACT {best['window']}-SEQ PATTERN",
-        "confidence": confidence,
+        "size": pred, "logic": f"EXACT {best['window']}-SEQ PATTERN", "confidence": confidence,
         "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
     }
 
@@ -728,6 +654,7 @@ def result_bias(history: List[Dict[str, Any]]) -> float:
         return 0.5
     return sum(seq) / len(seq)
 
+# 🐉 FIXED: DRAGON RIDING LOGIC
 def trend_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [x["size"] for x in history]
     if len(seq) < 3:
@@ -736,11 +663,18 @@ def trend_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     run = trailing_run(seq)
     last = seq[-1]
 
-    if run >= 4:
-        return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.8}
-
-    if run >= 2 and len(seq) >= 8:
-        return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.7}
+    if run >= 3:
+        last3 = seq[-3:]
+        prev3 = seq[-6:-3]
+        
+        if len(prev3) == 3:
+            last_same = sum(1 for v in last3 if v == last)
+            prev_same = sum(1 for v in prev3 if v == last)
+            
+            if last_same < prev_same: 
+                return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.85}
+                
+        return {"size": "BIG" if last == 1 else "SMALL", "confidence": 0.75}
 
     return {"size": "BIG" if result_bias(history) >= 0.5 else "SMALL", "confidence": 0.6}
 
@@ -753,24 +687,15 @@ def trend_shift_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     recent_6 = seq[-6:]
     recent_8 = seq[-8:]
 
-    def big_share(arr):
-        return sum(1 for v in arr if v == 1) / len(arr)
+    def big_share(arr): return sum(1 for v in arr if v == 1) / len(arr)
 
-    s4 = big_share(recent_4)
-    s6 = big_share(recent_6)
-    s8 = big_share(recent_8)
-
+    s4, s6, s8 = big_share(recent_4), big_share(recent_6), big_share(recent_8)
     score = (s8 - s6) + (s6 - s4)
 
-    if score > 0.18:
-        return {"dir": "BIG_UP", "score": score, "pred": "BIG"}
-    if score < -0.18:
-        return {"dir": "SMALL_UP", "score": abs(score), "pred": "SMALL"}
-
-    if s8 > 0.75 and seq[-1] == 1:
-        return {"dir": "BLOCKED_BIG", "score": 0.25, "pred": "SMALL"}
-    if s8 < 0.25 and seq[-1] == 0:
-        return {"dir": "BLOCKED_SMALL", "score": 0.25, "pred": "BIG"}
+    if score > 0.18: return {"dir": "BIG_UP", "score": score, "pred": "BIG"}
+    if score < -0.18: return {"dir": "SMALL_UP", "score": abs(score), "pred": "SMALL"}
+    if s8 > 0.75 and seq[-1] == 1: return {"dir": "BLOCKED_BIG", "score": 0.25, "pred": "SMALL"}
+    if s8 < 0.25 and seq[-1] == 0: return {"dir": "BLOCKED_SMALL", "score": 0.25, "pred": "BIG"}
 
     return {"dir": "NONE", "score": 0.0, "pred": "BIG" if s8 >= 0.5 else "SMALL"}
 
@@ -784,12 +709,7 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     size = "BIG" if score >= 0.5 else "SMALL"
     confidence = clamp(max(score, 1.0 - score), 0.55, 0.78)
-    return {
-        "size": size,
-        "logic": "HYBRID FALLBACK",
-        "confidence": confidence,
-        "stake": "1x" if confidence >= 0.68 else "0.5x"
-    }
+    return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "1x" if confidence >= 0.68 else "0.5x"}
 
 
 # ============================================================
@@ -803,21 +723,11 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     recent = seq[-6:]
     trend_exhaust = trend_exhaustion(history)
     if trend_exhaust:
-        return {
-            "size": trend_exhaust["size"],
-            "logic": trend_exhaust["logic"],
-            "confidence": trend_exhaust["confidence"],
-            "stake": trend_exhaust["stake"]
-        }
+        return trend_exhaust
 
     reversal = trend_reversal_signal(history)
     if reversal:
-        return {
-            "size": reversal["size"],
-            "logic": reversal["logic"],
-            "confidence": reversal["confidence"],
-            "stake": reversal["stake"]
-        }
+        return reversal
 
     if STATE.loss_streak >= 3:
         small_share = sum(1 for v in recent if v == 0) / len(recent)
@@ -828,15 +738,19 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         if big_share >= 0.75 and small_share <= 0.25:
             return {"size": "SMALL", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
 
-    # keep the normal reverse only when realistic
+    # 🐉 FIXED: DRAGON RIDING / MOMENTUM DECAY LOGIC
     if trailing_run(seq) >= 4:
         last = seq[-1]
-        return {
-            "size": "SMALL" if last == 1 else "BIG",
-            "logic": "DRAGON PROTECTION",
-            "confidence": 0.88,
-            "stake": "1x"
-        }
+        last3 = seq[-3:]
+        prev3 = seq[-6:-3]
+        
+        if len(prev3) == 3:
+            last_same = sum(1 for v in last3 if v == last)
+            prev_same = sum(1 for v in prev3 if v == last)
+            if last_same < prev_same:
+                return {"size": "SMALL" if last == 1 else "BIG", "logic": "TREND DECAY REVERSAL", "confidence": 0.88, "stake": "1x"}
+        
+        return {"size": "BIG" if last == 1 else "SMALL", "logic": "DRAGON RIDING (FOLLOWING TREND)", "confidence": 0.80, "stake": "1x"}
 
     if len(recent) >= 4:
         recent_small = sum(1 for v in recent if v == 0)
@@ -862,11 +776,9 @@ def number_repeat_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     nums = [x["num"] for x in history[-30:]]
     if not nums:
         return {"value": 0, "score": 0.0, "logic": "NONE"}
-
     counts = Counter(nums)
     most_common_num, most_count = counts.most_common(1)[0]
     repeat_ratio = most_count / len(nums)
-
     if repeat_ratio >= 0.2:
         return {"value": most_common_num, "score": repeat_ratio, "logic": "REPEATED_NUMBER"}
     return {"value": 0, "score": 0.0, "logic": "NONE"}
@@ -875,18 +787,13 @@ def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     nums = [x["num"] for x in history[-12:]]
     if len(nums) < 3:
         return {"value": 0, "score": 0.0, "logic": "NONE"}
-
     diffs = [abs(nums[i] - nums[i - 1]) for i in range(1, len(nums))]
     if not diffs:
         return {"value": 0, "score": 0.0, "logic": "NONE"}
-
     avg_gap = sum(diffs) / len(diffs)
     last_gap = abs(nums[-1] - nums[-2])
-
-    if avg_gap < 2:
-        return {"value": nums[-1], "score": 0.7, "logic": "LOW_GAP"}
-    if last_gap >= 3:
-        return {"value": max(0, nums[-1] - 1), "score": 0.6, "logic": "GAP_JUMP"}
+    if avg_gap < 2: return {"value": nums[-1], "score": 0.7, "logic": "LOW_GAP"}
+    if last_gap >= 3: return {"value": max(0, nums[-1] - 1), "score": 0.6, "logic": "GAP_JUMP"}
     return {"value": 0, "score": 0.0, "logic": "NONE"}
 
 def number_transition_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -894,9 +801,7 @@ def number_transition_candidates(history: List[Dict[str, Any]]) -> List[Dict[str
     candidates = []
 
     for window in range(2, 8):
-        if len(nums) < window + 1:
-            continue
-
+        if len(nums) < window + 1: continue
         suffix = tuple(nums[-window:])
         next_counts = defaultdict(int)
 
@@ -905,80 +810,56 @@ def number_transition_candidates(history: List[Dict[str, Any]]) -> List[Dict[str
             if key == suffix:
                 next_counts[nums[i + window]] += 1
 
-        if not next_counts:
-            continue
+        if not next_counts: continue
 
         best_num, best_freq = Counter(next_counts).most_common(1)[0]
         total_follow = sum(next_counts.values())
         support = total_follow / max(1, len(nums) - window)
         confidence = (best_freq / total_follow) * 100.0
 
-        if support < 0.03 and confidence < 20:
-            continue
+        if support < 0.03 and confidence < 20: continue
 
-        candidates.append({
-            "window": window,
-            "suffix": suffix,
-            "num": best_num,
-            "support": support,
-            "confidence": confidence,
-            "score": confidence + (support * 100.0)
-        })
+        candidates.append({"window": window, "suffix": suffix, "num": best_num, "support": support, "confidence": confidence, "score": confidence + (support * 100.0)})
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:10]
 
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
-
     same_family_hist = [x for x in history if is_same_family(x["num"], size)]
     if len(same_family_hist) >= 4:
         candidates = number_transition_candidates(same_family_hist)
         if candidates:
             best = candidates[0]
-            if best["num"] in valid:
-                return best["num"]
+            if best["num"] in valid: return best["num"]
 
     repeat = number_repeat_score(history)
-    if repeat["score"] >= 0.2 and repeat["value"] in valid:
-        return repeat["value"]
+    if repeat["score"] >= 0.2 and repeat["value"] in valid: return repeat["value"]
 
     gap = number_gap_score(history)
     if gap["score"] > 0.0:
-        num = gap["value"]
-        if num in valid:
-            return num
+        if gap["value"] in valid: return gap["value"]
 
     family_nums = [x["num"] for x in history if is_same_family(x["num"], size)]
     if family_nums:
         freq = Counter(family_nums)
         best_num, _ = freq.most_common(1)[0]
-        if best_num in valid:
-            return best_num
+        if best_num in valid: return best_num
 
     if family_nums:
         even_count = sum(1 for n in family_nums if n % 2 == 0)
         odd_count = sum(1 for n in family_nums if n % 2 != 0)
-
-        if even_count > odd_count:
-            pool = [n for n in valid if n % 2 == 0]
-        else:
-            pool = [n for n in valid if n % 2 != 0]
-
-        if pool:
-            return random.choice(pool)
+        pool = [n for n in valid if n % 2 == (0 if even_count > odd_count else 1)]
+        if pool: return random.choice(pool)
 
     last_nums = [x["num"] for x in history[-15:]]
-    if last_nums:
-        last_num = last_nums[-1]
-        if last_num in valid:
-            return last_num
+    if last_nums and last_nums[-1] in valid: return last_nums[-1]
 
     return random.choice(valid)
 
 
 # ============================================================
-# ENSEMBLE
+# ENSEMBLE & PREDICTION
 # ============================================================
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     exact = choose_exact_prediction(history)
@@ -995,12 +876,8 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     final_score = exact_conf
 
     if trend_shift["dir"] != "NONE":
-        if trend_shift["pred"] == "BIG":
-            final_size = "BIG"
-            final_score = max(final_score, trend_conf)
-        else:
-            final_size = "SMALL"
-            final_score = max(final_score, trend_conf)
+        final_size = trend_shift["pred"]
+        final_score = max(final_score, trend_conf)
 
     reversal = trend_reversal_signal(history)
     if reversal:
@@ -1013,69 +890,35 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     final_size = bias_guard(final_size, history)
     final_conf = clamp(final_score, 0.55, 0.94)
-
-    logic = "ENSEMBLE: EXACT + TREND SHIFT + HYBRID"
-    if exact:
-        logic = exact["logic"]
+    logic = exact["logic"] if exact else "ENSEMBLE: EXACT + TREND SHIFT + HYBRID"
 
     return {
-        "size": final_size,
-        "logic": logic,
-        "confidence": final_conf,
+        "size": final_size, "logic": logic, "confidence": final_conf,
         "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.68 else "0.5x"
     }
 
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
         n = random.randint(0, 9)
-        return {
-            "issue": "1",
-            "type": "SIZE",
-            "size": "BIG" if n >= 5 else "SMALL",
-            "num": n,
-            "raw_conf": 50,
-            "logic": "WARMING UP",
-            "stake": "0.5x",
-            "details": {"recovery_mode": False, "regime": "COLD"}
-        }
+        return {"issue": "1", "type": "SIZE", "size": "BIG" if n >= 5 else "SMALL", "num": n, "raw_conf": 50, "logic": "WARMING UP", "stake": "0.5x", "details": {"recovery_mode": False, "regime": "COLD"}}
 
     history = STATE.history[-2000:]
     seq = [x["size"] for x in history]
 
     override = recovery_override(history)
     if override:
-        pred_size = override["size"]
-        pred_logic = override["logic"]
-        pred_conf = override["confidence"]
-        pred_stake = override["stake"]
+        pred_size, pred_logic, pred_conf, pred_stake = override["size"], override["logic"], override["confidence"], override["stake"]
     else:
         ensemble = weighted_ensemble(history)
-        pred_size = ensemble["size"]
-        pred_logic = ensemble["logic"]
-        pred_conf = ensemble["confidence"]
-        pred_stake = ensemble["stake"]
+        pred_size, pred_logic, pred_conf, pred_stake = ensemble["size"], ensemble["logic"], ensemble["confidence"], ensemble["stake"]
 
     pred_size = bias_guard(pred_size, history)
     final_num = choose_number_for_size(pred_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
     return {
-        "issue": issue,
-        "type": "SIZE",
-        "size": pred_size,
-        "num": final_num,
-        "raw_conf": int(pred_conf * 100),
-        "logic": pred_logic,
-        "stake": pred_stake,
-        "details": {
-            "recovery_mode": STATE.recovery_mode,
-            "signal_strength": signal_strength(history),
-            "regime": detect_regime(seq),
-            "side_balance": round(side_balance(history, 20), 4),
-            "trend_phase": trend_phase(history),
-            "trend_shift": trend_shift_score(history),
-            "trend_exhaustion": trend_exhaustion(history)
-        }
+        "issue": issue, "type": "SIZE", "size": pred_size, "num": final_num, "raw_conf": int(pred_conf * 100), "logic": pred_logic, "stake": pred_stake,
+        "details": {"recovery_mode": STATE.recovery_mode, "signal_strength": signal_strength(history), "regime": detect_regime(seq), "side_balance": round(side_balance(history, 20), 4), "trend_phase": trend_phase(history), "trend_shift": trend_shift_score(history), "trend_exhaustion": trend_exhaustion(history)}
     }
 
 def learn_from_resolution(res: Dict[str, Any]):
@@ -1093,117 +936,54 @@ def learn_from_resolution(res: Dict[str, Any]):
 
 
 # ============================================================
-# BACKTEST
+# BACKTEST & API FETCHING
 # ============================================================
 def generate_prediction_from_history(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
     override = recovery_override(history)
     if override:
-        pred_size = override["size"]
-        pred_logic = override["logic"]
-        pred_conf = override["confidence"]
-        pred_stake = override["stake"]
+        pred_size, pred_logic, pred_conf, pred_stake = override["size"], override["logic"], override["confidence"], override["stake"]
     else:
         exact = choose_exact_prediction(history)
         if exact:
-            pred_size = exact["size"]
-            pred_logic = exact["logic"]
-            pred_conf = exact["confidence"]
-            pred_stake = exact["stake"]
+            pred_size, pred_logic, pred_conf, pred_stake = exact["size"], exact["logic"], exact["confidence"], exact["stake"]
         else:
             hybrid = hybrid_prediction(history)
-            pred_size = hybrid["size"]
-            pred_logic = hybrid["logic"]
-            pred_conf = hybrid["confidence"]
-            pred_stake = hybrid["stake"]
+            pred_size, pred_logic, pred_conf, pred_stake = hybrid["size"], hybrid["logic"], hybrid["confidence"], hybrid["stake"]
 
     pred_size = bias_guard(pred_size, history)
-    return {
-        "issue": str(issue),
-        "size": pred_size,
-        "num": choose_number_for_size(pred_size, history),
-        "logic": pred_logic,
-        "raw_conf": int(pred_conf * 100),
-        "stake": pred_stake
-    }
+    return {"issue": str(issue), "size": pred_size, "num": choose_number_for_size(pred_size, history), "logic": pred_logic, "raw_conf": int(pred_conf * 100), "stake": pred_stake}
 
 def run_backtest(history: List[Dict[str, Any]], window_size: int = 50) -> Dict[str, Any]:
-    total = 0
-    wins = 0
-    data_points = []
-
+    total, wins, data_points = 0, 0, []
     for i in range(window_size, len(history)):
         scan = history[:i]
-        if len(scan) < CFG.min_history:
-            continue
-
+        if len(scan) < CFG.min_history: continue
         pred = generate_prediction_from_history(scan, history[i]["issue"])
         actual = history[i]
         actual_size = "BIG" if actual["size"] == 1 else "SMALL"
-
         ok = pred["size"] == actual_size
         total += 1
-        if ok:
-            wins += 1
-        data_points.append({
-            "issue": actual["issue"],
-            "pred": pred["size"],
-            "actual": actual_size,
-            "win": ok
-        })
+        if ok: wins += 1
+        data_points.append({"issue": actual["issue"], "pred": pred["size"], "actual": actual_size, "win": ok})
+    return {"total": total, "wins": wins, "hit_rate": (wins / total) if total else 0.0, "data_points": data_points[-20:]}
 
-    return {
-        "total": total,
-        "wins": wins,
-        "hit_rate": (wins / total) if total else 0.0,
-        "data_points": data_points[-20:]
-    }
-
-
-# ============================================================
-# API PARSING & FETCHING
-# ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
-    if payload is None:
-        return []
-
-    if isinstance(payload, list):
-        items = payload
+    if payload is None: return []
+    if isinstance(payload, list): items = payload
     elif isinstance(payload, dict):
         if "data" in payload and isinstance(payload["data"], dict):
             d = payload["data"]
-            if "list" in d and isinstance(d["list"], list):
-                items = d["list"]
-            elif isinstance(d, list):
-                items = d
-            else:
-                items = []
-        elif "result" in payload and isinstance(payload["result"], list):
-            items = payload["result"]
-        elif "items" in payload and isinstance(payload["items"], list):
-            items = payload["items"]
-        elif "history" in payload and isinstance(payload["history"], list):
-            items = payload["history"]
-        else:
-            items = []
-    else:
-        items = []
+            items = d.get("list", []) if isinstance(d.get("list"), list) else d if isinstance(d, list) else []
+        else: items = payload.get("result", payload.get("items", payload.get("history", [])))
+    else: items = []
 
-    out = []
-    seen = set()
-
+    out, seen = [], set()
     for item in items:
-        if not isinstance(item, dict):
-            continue
-
+        if not isinstance(item, dict): continue
         issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
-        if issue is None:
-            issue = normalize_issue(item.get("issue"))
-        if issue is None:
-            continue
-        if str(issue) in seen:
-            continue
+        if issue is None: continue
+        if str(issue) in seen: continue
         seen.add(str(issue))
-
         num = safe_int(item.get("number", item.get("value", 0)), 0)
         if 0 <= num <= 9:
             out.append({"issue": str(issue), "num": num, "size": 1 if num >= 5 else 0})
@@ -1212,14 +992,10 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     return out
 
 async def fetch_data(session):
-    urls = CFG.api_urls()
-    last_good = list(STATE.history)
-
-    for url in urls:
+    for url in CFG.api_urls():
         try:
             async with session.get(url, timeout=CFG.request_timeout) as response:
-                if response.status != 200:
-                    continue
+                if response.status != 200: continue
                 payload = await response.json(content_type=None)
                 parsed = parse_history_payload(payload)
                 if parsed:
@@ -1228,48 +1004,27 @@ async def fetch_data(session):
                     return True
         except asyncio.TimeoutError:
             log.warning("Timeout while fetching %s", url)
-            continue
         except Exception as exc:
             log.warning("Fetch exception for %s: %s", url, exc)
-            continue
-
-    if last_good:
-        STATE.history = last_good
-        STATE.save_cache()
-        return True
     return False
 
 
 # ============================================================
-# FORMATTERS
+# FORMATTERS & TELEGRAM SEND
 # ============================================================
 def normalize_recent_row(row: Any):
-    if not isinstance(row, (tuple, list)):
-        return "", "", "", ""
-
-    if len(row) >= 4:
-        issue, size, status, _extra = row[:4]
-        return str(issue), str(size), str(status), ""
-    if len(row) >= 3:
-        issue, size, status = row[:3]
-        return str(issue), str(size), str(status), ""
-    if len(row) >= 2:
-        issue, size = row[:2]
-        return str(issue), str(size), "", ""
+    if not isinstance(row, (tuple, list)): return "", "", "", ""
+    if len(row) >= 4: return str(row[0]), str(row[1]), str(row[2]), ""
+    if len(row) >= 3: return str(row[0]), str(row[1]), str(row[2]), ""
+    if len(row) >= 2: return str(row[0]), str(row[1]), "", ""
     return "", "", "", ""
 
 def format_prediction(pred: Dict[str, Any], recent_rows):
     recent_lines = []
     for r in recent_rows[-CFG.recent_limit:]:
         issue, size, status, _extra = normalize_recent_row(r)
-        if not issue:
-            continue
-        if status:
-            recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> {h(size)} → <b>{h(status)}</b>")
-        else:
-            recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> {h(size)}")
-
-    recent_text = "\n".join(recent_lines)
+        if not issue: continue
+        recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> {h(size)} → <b>{h(status)}</b>" if status else f"➜ <code>{h(issue[-4:])}</code> {h(size)}")
 
     return f"""
 📌 <b>Period</b>: <code>{h(pred['issue'])}</code>
@@ -1282,31 +1037,18 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent</b>:
-{recent_text}
+{chr(10).join(recent_lines)}
 ━━━━━━━━━━━━━━━━━━
 ⚡ <i>{h(CFG.bot_name)}</i>
 """
 
 def format_result(res: Dict[str, Any]):
-    pred_str = f"{res['size']} {res['num']}"
-    return (
-        f"🎯 <b>Result</b>\n"
-        f"Period: <code>{h(res['issue'])}</code>\n"
-        f"Pred: <b>{h(pred_str)}</b>\n"
-        f"Act: {h(res['actual_size'])} {h(res['actual_num'])}\n"
-        f"<b>{h(res['status'])}</b>"
-    )
+    return (f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'])}</code>\nPred: <b>{h(res['size'])} {h(res['num'])}</b>\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>")
 
-# ============================================================
-# TELEGRAM SEND
-# ============================================================
 async def send_msg(bot, text: str, retries: int = 3):
     for attempt in range(retries):
         try:
-            await asyncio.wait_for(
-                bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML"),
-                timeout=CFG.request_timeout
-            )
+            await asyncio.wait_for(bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML"), timeout=CFG.request_timeout)
             return True
         except Exception:
             await asyncio.sleep(1)
@@ -1321,7 +1063,6 @@ async def worker_loop(app, session):
         try:
             if await fetch_data(session):
                 history_by_issue = {str(x["issue"]): x for x in STATE.history}
-
                 for res in STORE.resolve_pending(history_by_issue):
                     learn_from_resolution(res)
                     await send_msg(app.bot, format_result(res))
@@ -1331,12 +1072,7 @@ async def worker_loop(app, session):
                     continue
 
                 latest_issue = STATE.history[-1]["issue"]
-                next_issue = str(
-                    max(
-                        [normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None],
-                        default=0
-                    ) + 1
-                )
+                next_issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
                 if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
                     pred = generate_prediction()
@@ -1347,13 +1083,12 @@ async def worker_loop(app, session):
 
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
-
         except Exception as e:
             log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
 
 # ============================================================
-# HEALTH CHECK
+# MAIN
 # ============================================================
 async def health_check(request):
     return web.Response(text="FTW V16 FULL is Running")
@@ -1363,14 +1098,10 @@ async def start_web_server():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
     await site.start()
-    log.info(f"Web server started on port {port}")
+    log.info(f"Web server started on port {os.environ.get('PORT', 8080)}")
 
-# ============================================================
-# MAIN
-# ============================================================
 async def main():
     CFG.validate()
     STATE.load_cache()
