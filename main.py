@@ -1,11 +1,10 @@
 """
-V916 HYPER PRO PREDICTOR (SIZE + COLOR DYNAMIC)
-===============================================
-- Predicts ONLY ONE: Either Size (BIG/SMALL) or Color (RED/GREEN) based on highest Edge.
-- Advanced Color Models (Markov, Streak, Freq) added.
-- Fixed SMALL bias by dynamic edge comparison.
+V916 HYPER PRO PREDICTOR (FIXED VIOLET BUG)
+===========================================
+- Fixed KeyError: 'VIOLET' crash.
+- Handles 0 as RED and 5 as GREEN internally for models.
+- Dynamic Choice: Predicts only ONE (Size or Color) based on highest edge.
 - Bayesian Weights for both Size and Color.
-- Kelly Criterion Stake Sizing for both.
 """
 
 import asyncio
@@ -105,11 +104,16 @@ def normalize_issue(value: Any) -> Optional[int]:
     try: return int(value)
     except: return None
 
-def get_color_from_num(num: int) -> str:
+def get_wingo_color(num: int) -> str:
+    """For logic: 0 is Red, 5 is Green. Returns pure RED or GREEN."""
+    if num in (0, 2, 4, 6, 8): return "RED"
+    return "GREEN"
+
+def get_display_color(num: int) -> str:
+    """For display in Telegram: 0 and 5 are Violet"""
     if num in (0, 5): return "VIOLET"
     if num in (2, 4, 6, 8): return "RED"
-    if num in (1, 3, 7, 9): return "GREEN"
-    return "UNKNOWN"
+    return "GREEN"
 
 def trailing_run(values: List[Any]) -> int:
     if not values: return 0
@@ -208,6 +212,11 @@ class Storage:
                     actual_num INTEGER, actual_size TEXT, actual_color TEXT, logic TEXT, details TEXT, stake TEXT, created_at REAL
                 )
             """)
+            # Migration: Add pred_type if upgrading from old DB
+            try:
+                c.execute("ALTER TABLE predictions ADD COLUMN pred_type TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     def prediction_exists(self, issue: str) -> bool:
         with self._conn() as c: return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
@@ -230,7 +239,7 @@ class Storage:
             if not act: continue
 
             act_size = "BIG" if act["size"] == 1 else "SMALL"
-            act_color = get_color_from_num(act["num"])
+            act_color = get_wingo_color(act["num"]) # Gets pure RED or GREEN
             
             win_size = (p_size == act_size) if p_size else True
             win_color = (p_color == act_color) if p_color else True
@@ -299,12 +308,11 @@ def model_bias(history):
     return (1.0 if ratio >= 0.5 else 0.0) if abs(ratio - 0.5) > 0.18 else 0.5
 
 # ============================================================
-# COLOR MODELS (NEW ADVANCED LOGIC)
+# COLOR MODELS (FIXED FOR VIOLET)
 # ============================================================
-def get_colors(history): return [get_color_from_num(x["num"]) for x in history]
+def get_colors(history): return [get_wingo_color(x["num"]) for x in history]
 
 def model_color_markov(history):
-    """Predicts RED/GREEN based on last 2 colors (Returns Prob of RED)"""
     colors = get_colors(history)
     if len(colors) < 4: return 0.5
     seq, transitions = tuple(colors[-2:]), {"RED": 0, "GREEN": 0}
@@ -314,7 +322,6 @@ def model_color_markov(history):
     return transitions["RED"] / total if total > 0 else 0.5
 
 def model_color_streak(history):
-    """Momentum for Colors"""
     colors = get_colors(history)
     streak = trailing_run(colors)
     current = colors[-1]
@@ -322,54 +329,41 @@ def model_color_streak(history):
     return 0.5, "None"
 
 def model_color_freq(history):
-    """Basic frequency of colors in last 20 rounds"""
     colors = get_colors(history[-20:])
     if not colors: return 0.5
     return colors.count("RED") / len(colors)
 
 def model_color_alternation(history):
-    """If RED/GREEN are alternating, predict the other"""
     colors = get_colors(history)
     if alternating_score(colors, 12) >= 0.6:
-        return 1.0 if colors[-1] == "GREEN" else 0.0 # Prob of RED
+        return 1.0 if colors[-1] == "GREEN" else 0.0 
     return 0.5
 
 # ============================================================
 # ENSEMBLES
 # ============================================================
 def ensemble_size_probability(history):
-    sizes = [x["size"] for x in history]
     streak_p, streak_name = model_streak(history)
-    
-    base = {
-        "Markov": model_markov(history), "EMA": model_ema(history), "DragonStreak": streak_p,
-        "Trend": model_trend(history), "Alternation": model_alternation(history), "Bias": model_bias(history)
-    }
+    base = {"Markov": model_markov(history), "EMA": model_ema(history), "DragonStreak": streak_p, "Trend": model_trend(history), "Alternation": model_alternation(history), "Bias": model_bias(history)}
     votes = {k: ("BIG" if v > 0.5 else "SMALL") for k, v in base.items()}
     
     weighted_sum = sum(prob * STATE.weights.size.get(name, 1.0) for name, prob in base.items())
     total_weight = sum(STATE.weights.size.get(name, 1.0) for name in base)
     final_p_big = weighted_sum / total_weight
-
     return clamp(final_p_big, 0.05, 0.95), votes, streak_name
 
 def ensemble_color_probability(history):
     streak_p, streak_name = model_color_streak(history)
-    
-    base = {
-        "ColorMarkov": model_color_markov(history), "ColorStreak": streak_p,
-        "ColorFreq": model_color_freq(history), "ColorAlternation": model_color_alternation(history)
-    }
+    base = {"ColorMarkov": model_color_markov(history), "ColorStreak": streak_p, "ColorFreq": model_color_freq(history), "ColorAlternation": model_color_alternation(history)}
     votes = {k: ("RED" if v > 0.5 else "GREEN") for k, v in base.items()}
     
     weighted_sum = sum(prob * STATE.weights.color.get(name, 1.0) for name, prob in base.items())
     total_weight = sum(STATE.weights.color.get(name, 1.0) for name in base)
     final_p_red = weighted_sum / total_weight
-
     return clamp(final_p_red, 0.05, 0.95), votes, streak_name
 
 # ============================================================
-# FINAL PREDICTION (DYNAMIC CHOICE)
+# FINAL PREDICTION
 # ============================================================
 def generate_prediction() -> Optional[Dict[str, Any]]:
     if len(STATE.history) < CFG.min_history: return None 
@@ -377,35 +371,27 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     history = STATE.history[-2000:]
     sizes = [x["size"] for x in history]
 
-    # 1. Calculate Probabilities
     p_big, size_votes, size_pattern = ensemble_size_probability(history)
     p_red, color_votes, color_pattern = ensemble_color_probability(history)
 
-    # 2. Calculate Edges (Confidence)
-    # Edge = how far from 0.5 (random chance)
     size_edge = abs(p_big - 0.5)
     color_edge = abs(p_red - 0.5)
 
-    # 3. Dynamic Selection
-    # If color edge is higher, bet on color. Else bet on size.
     if color_edge > size_edge and color_edge > 0.05:
         pred_type = "COLOR"
         final_color = "RED" if p_red > 0.5 else "GREEN"
         final_size = ""
         best_conf = 0.5 + color_edge
         pattern = color_pattern if color_pattern != "None" else "Color Ensemble"
-        
-        valid_nums = [n for n in range(10) if get_color_from_num(n) == final_color]
+        valid_nums = [n for n in range(10) if get_wingo_color(n) == final_color]
     else:
         pred_type = "SIZE"
         final_size = "BIG" if p_big > 0.5 else "SMALL"
         final_color = ""
         best_conf = 0.5 + size_edge
         pattern = size_pattern if size_pattern != "None" else "Size Ensemble"
-        
         valid_nums = [n for n in range(10) if (n >= 5) == (final_size == "BIG")]
 
-    # 4. Choose Best Number
     nums = [x["num"] for x in history[-250:]]
     freq = Counter(nums)
     score = {}
@@ -415,7 +401,6 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         score[n] = s
     best_num = max(score, key=score.get) if score else random.choice(valid_nums)
 
-    # 5. Kelly Stake
     edge = (best_conf * 2) - 1
     if edge > 0.35: stake, confidence = "3x", 95
     elif edge > 0.25: stake, confidence = "2x", 85
@@ -429,10 +414,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         "issue": issue, "type": pred_type, "size": final_size, "color": final_color, "num": best_num,
         "p_big": round(p_big, 4), "p_red": round(p_red, 4), "confidence": confidence, "stake": stake,
         "regime": detect_regime(sizes), "pattern": pattern,
-        "details": {
-            "size_votes": size_votes, "color_votes": color_votes, 
-            "size_edge": size_edge, "color_edge": color_edge
-        }
+        "details": {"size_votes": size_votes, "color_votes": color_votes, "size_edge": size_edge, "color_edge": color_edge}
     }
 
 # ============================================================
@@ -445,7 +427,7 @@ def learn_from_resolution(res: dict):
             details.get("size_votes", {}), 
             details.get("color_votes", {}), 
             res["actual_size"], 
-            res["actual_color"]
+            res["actual_color"] # This is now pure RED or GREEN
         )
     STATE.save_cache()
 
@@ -484,7 +466,6 @@ def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1] or '')} {h(r[2] or '')} → <b>{h(r[3])}</b>\n" for r in recent_rows[-8:])
     stake_emoji = {"3x": "🚀 3x", "2x": "🔥 2x", "1.5x": "🟢 1.5x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x"}.get(p["stake"], "1x")
     
-    # Condition based output
     if p["type"] == "SIZE":
         target_text = f"📊 <b>Target Size</b>: <b>{h(p['size'])}</b>"
     else:
@@ -507,8 +488,9 @@ def format_prediction(p, recent_rows):
 """
 
 def format_result(res):
+    actual_display_color = get_display_color(res["actual_num"])
     pred_str = f"{res['size']} {res['num']}" if res['type'] == "SIZE" else f"{res['color']} {res['num']}"
-    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: <b>{h(pred_str)}</b>\nAct: {h(res['actual_size'])} {h(res['actual_num'])} ({h(res['actual_color'])})\n<b>{h(res['status'])}</b>"
+    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: <b>{h(pred_str)}</b>\nAct: {h(res['actual_size'])} {h(res['actual_num'])} ({h(actual_display_color)})\n<b>{h(res['status'])}</b>"
 
 async def send_msg(app, text, retries=3):
     for _ in range(retries):
