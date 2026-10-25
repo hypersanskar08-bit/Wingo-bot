@@ -1,12 +1,12 @@
 """
-V916 ULTRA DEEP MAX PROBABILITY
-================================
-- Computes highest probability among BIG, SMALL, RED, GREEN
-- Deep trend + pattern + memory analysis
-- Multi-model weighted probability
-- Safe bad-response handling
-- Render health endpoint
-- Telegram bot ready
+V916 ADVANCED MAX PROBABILITY
+============================
+- Highest probability among: BIG / SMALL / RED / GREEN
+- Deep pattern-wise + trend-wise + memory-wise analysis
+- Pattern memory + alternation + block + parity + ratio + volatility
+- Red/Green only
+- Final single prediction only
+- Render health safe
 """
 
 import asyncio
@@ -18,7 +18,7 @@ import os
 import random
 import sqlite3
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -40,12 +40,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v916_ultra_deep.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_advanced_maxprob.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V916 ULTRA DEEP"
+    bot_name: str = "V916 ADV MAX"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -78,7 +78,7 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_ultra_deep.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_advanced_maxprob.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -92,7 +92,7 @@ def h(x: Any) -> str:
 
 
 async def health_check(request):
-    return web.Response(text="V916 Ultra Deep Bot is Running!")
+    return web.Response(text="V916 Advanced Max Probability Bot is Running!")
 
 
 async def start_web_server():
@@ -107,24 +107,8 @@ async def start_web_server():
 
 
 # ============================================================
-# HEX/NUMBER HELPERS
+# HELPER FUNCTIONS
 # ============================================================
-def get_color_from_num(num: int) -> str:
-    if num in (0, 2, 4, 6, 8):
-        return "RED"
-    if num in (1, 3, 5, 7, 9):
-        return "GREEN"
-    return "UNKNOWN"
-
-
-def get_num_colors_list(num: int) -> List[str]:
-    if num in (0, 2, 4, 6, 8):
-        return ["RED"]
-    if num in (1, 3, 5, 7, 9):
-        return ["GREEN"]
-    return []
-
-
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
 
@@ -152,6 +136,14 @@ def normalize_issue(value: Any) -> Optional[int]:
         return int(value)
     except Exception:
         return None
+
+
+def get_color_from_num(num: int) -> str:
+    if num in (0, 2, 4, 6, 8):
+        return "RED"
+    if num in (1, 3, 5, 7, 9):
+        return "GREEN"
+    return "UNKNOWN"
 
 
 # ============================================================
@@ -425,9 +417,7 @@ class Storage:
                 ORDER BY CAST(issue AS INTEGER) DESC
                 LIMIT ?
             """, (limit,)).fetchall()
-        if rows:
-            return rows[::-1]
-        return []
+        return rows[::-1]
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
         for window in [3, 5, 8, 12, 20, 30, 50, 100]:
@@ -438,8 +428,7 @@ class Storage:
             with self._conn() as c:
                 row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
                 if row is None:
-                    c.execute("INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, 0, 0, 0, ?)",
-                              (key, window, time.time()))
+                    c.execute("INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, 0, 0, 0, ?)", (key, window, time.time()))
                     row = (0, 0, 0)
                 big_count, small_count, total_count = row
                 if actual_size == 1:
@@ -447,8 +436,7 @@ class Storage:
                 else:
                     small_count += 1
                 total_count += 1
-                c.execute("UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?",
-                          (big_count, small_count, total_count, time.time(), key))
+                c.execute("UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?", (big_count, small_count, total_count, time.time(), key))
 
     def get_exact_pattern_probability(self, sizes: List[int]) -> float:
         matches = []
@@ -558,8 +546,7 @@ def color_streak_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
     if streak >= 3:
         if last == "RED":
             return {"RED": 0.7, "GREEN": 0.3}
-        else:
-            return {"RED": 0.3, "GREEN": 0.7}
+        return {"RED": 0.3, "GREEN": 0.7}
 
     return {"RED": red_prob, "GREEN": green_prob}
 
@@ -575,16 +562,18 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
         ("Volatility", model_volatility(history)),
         ("Bias", model_bias(history)),
         ("Run", model_run(history)),
+        ("Parity", model_parity(history)),
     ]
 
     weights = {
-        "Exact": 0.30,
-        "Trend": 0.15,
+        "Exact": 0.28,
+        "Trend": 0.14,
         "Alternation": 0.12,
         "Block": 0.12,
         "Volatility": 0.10,
         "Bias": 0.10,
-        "Run": 0.11,
+        "Run": 0.08,
+        "Parity": 0.06,
     }
 
     regime = detect_regime(sizes)
@@ -754,12 +743,11 @@ def learn_from_resolution(res: dict):
         actual_size = 1 if res["actual_size"] == "BIG" else 0
         STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
 
-    # save cache
     STATE.save_cache()
 
 
 # ============================================================
-# API PARSING
+# PARSE API RESPONSE
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -800,6 +788,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
                 issue = normalize_issue(item.get("issue"))
             if issue is None:
                 continue
+
             if str(issue) in seen:
                 continue
             seen.add(str(issue))
