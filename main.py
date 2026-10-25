@@ -1,11 +1,11 @@
 """
-V907 ULTIMATE FINAL (Single Best Prediction + Color)
-====================================================
-- Calculates the absolute best number (0-9) based on Size, Color, and Frequency combined.
-- The chosen number dictates the final Size and Color (No contradictions).
-- Shows P(Size) and P(Color) for the final chosen number.
-- Render Health Check Web Server Added
-- SQLite WAL Mode & Local Cache
+V909 PERFECT LOGIC (No Skip, Always Best)
+=========================================
+- Always predicts the highest probability for Size (BIG/SMALL).
+- Always predicts the highest probability for Color (RED/GREEN/VIOLET).
+- Combines both to find the perfect Number.
+- No thresholds, no periods skipped.
+- Render-safe, SQLite WAL, Local Cache.
 """
 
 import asyncio
@@ -38,12 +38,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v907_ultimate.db")
+    db_path: str = os.environ.get("DB_PATH", "v909_perfect.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V907 ULTIMATE"
+    bot_name: str = "V909 PERFECT"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -74,18 +74,18 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
     
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v907.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v909.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v907")
+log = logging.getLogger("v909")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 async def health_check(request):
-    return web.Response(text="V907 Bot is Running!")
+    return web.Response(text="V909 Bot is Running!")
 
 async def start_web_server():
     app = web.Application()
@@ -263,8 +263,8 @@ class Storage:
         with self._conn() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
-                    issue TEXT PRIMARY KEY, size TEXT, num INTEGER, status TEXT DEFAULT 'PENDING',
-                    actual_num INTEGER, actual_size TEXT, mode TEXT, logic TEXT, sigs TEXT,
+                    issue TEXT PRIMARY KEY, size TEXT, num INTEGER, color TEXT, status TEXT DEFAULT 'PENDING',
+                    actual_num INTEGER, actual_size TEXT, actual_color TEXT, mode TEXT, logic TEXT, sigs TEXT,
                     raw_conf INTEGER, regime TEXT, details TEXT, p_big REAL, calibrated_conf INTEGER,
                     consensus REAL, stake TEXT, created_at REAL
                 )
@@ -283,10 +283,10 @@ class Storage:
         with self._conn() as c:
             c.execute("""
                 INSERT OR IGNORE INTO predictions
-                (issue, size, num, mode, logic, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (issue, size, num, color, mode, logic, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                p["issue"], p["size"], p["num"], p["mode"], p["logic"], json.dumps(p.get("sigs", [])),
+                p["issue"], p["size"], p["num"], p["color"], p["mode"], p["logic"], json.dumps(p.get("sigs", [])),
                 p.get("raw_conf", 50), p.get("regime", "UNKNOWN"), json.dumps(p.get("details", {})),
                 p.get("p_big", 0.5), p.get("confidence", 50), p.get("consensus", 0.5), p.get("stake", "1x"), time.time()
             ))
@@ -295,28 +295,33 @@ class Storage:
         resolved = []
         with self._conn() as c:
             rows = c.execute("""
-                SELECT issue, size, num, mode, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake
+                SELECT issue, size, num, color, mode, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake
                 FROM predictions WHERE status='PENDING'
             """).fetchall()
 
         for row in rows:
-            issue, p_size, p_num, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake = row
+            issue, p_size, p_num, p_color, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake = row
             act = history_dict.get(str(issue)) or history_dict.get(issue)
             if act is None: continue
 
             act_size = "BIG" if act["size"] == 1 else "SMALL"
-            win = (p_size == act_size)
+            act_color = get_color_from_num(act["num"])
+            
+            # Win check: if size matches OR color matches (whichever was predicted)
+            win_size = (p_size == act_size) if p_size else True
+            win_color = (p_color in act_color) if p_color else True
+            win = win_size and win_color
 
             if win and p_num == act["num"]: status = "JACK 🏆"
             elif win: status = "WIN ✅"
             else: status = "LOSS ❌"
 
             with self._conn() as c:
-                c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?", (status, act["num"], act_size, issue))
+                c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=?, actual_color=? WHERE issue=?", (status, act["num"], act_size, act_color, issue))
 
             resolved.append({
-                "issue": issue, "size": p_size, "num": p_num, "actual_num": act["num"],
-                "actual_size": act_size, "status": status, "mode": mode, "win": win,
+                "issue": issue, "size": p_size, "num": p_num, "color": p_color, "actual_num": act["num"],
+                "actual_size": act_size, "actual_color": act_color, "status": status, "mode": mode, "win": win,
                 "raw_conf": raw_conf, "regime": regime,
                 "details": json.loads(details_json) if details_json else {},
                 "sigs": json.loads(sigs_json) if sigs_json else [],
@@ -327,7 +332,7 @@ class Storage:
 
     def recent_outcomes(self, limit: int = 12):
         with self._conn() as c:
-            rows = c.execute("SELECT issue, actual_size, actual_num, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
+            rows = c.execute("SELECT issue, actual_size, actual_num, actual_color, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
         return rows[::-1]
 
     def update_pattern_memory(self, sizes: List[int], actual_size: int):
@@ -429,107 +434,90 @@ def calculate_color_probs(history: List[Dict[str, Any]]) -> Dict[str, float]:
         "VIOLET": violet_c / total
     }
 
-def generate_prediction() -> Dict[str, Any]:
+def pick_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> int:
+    if not valid_nums: return random.randint(0, 9)
+    nums = [x["num"] for x in history[-250:]]
+    freq = Counter(nums)
+    score = {}
+    
+    for n in valid_nums:
+        s = freq.get(n, 0) * 2.5
+        if nums and nums[-1] == n: s *= 0.5
+        if n in (1, 3, 7, 9, 2, 6, 8): s += 1.0
+        score[n] = s
+        
+    return max(score, key=score.get)
+
+def generate_prediction() -> Optional[Dict[str, Any]]:
     if len(STATE.history) < CFG.min_history:
-        fallback_dir = 1 if random.random() >= 0.5 else 0
         issue = str(int(STATE.history[-1]["issue"]) + 1) if STATE.history else "1"
-        num = random.choice([5, 6, 7, 8, 9]) if fallback_dir == 1 else random.choice([0, 1, 2, 3, 4])
+        num = random.randint(0, 9)
         return {
-            "issue": issue, "size": "BIG" if fallback_dir == 1 else "SMALL",
-            "num": num, "color": get_color_from_num(num),
-            "p_big": 0.5, "confidence": 55, "raw_conf": 55, "consensus": 0.5,
+            "issue": issue, "size": "BIG" if num >=5 else "SMALL", "num": num, "color": get_color_from_num(num),
+            "p_big": 0.5, "size_conf": 0.5, "color_conf": 0.33,
+            "confidence": 55, "raw_conf": 55, "consensus": 0.5,
             "mode": "FALLBACK", "regime": "COLD", "logic": "Fallback",
-            "sigs": [{"name": "Fallback", "dir": fallback_dir}], "stake": "0.25x",
+            "sigs": [{"name": "Fallback", "dir": 1 if num>=5 else 0}], "stake": "0.25x",
             "details": {"fallback": True},
         }
 
     history = STATE.history[-2000:]
     sizes = [x["size"] for x in history]
-    regime = detect_regime(sizes)
     
+    # --- 1. Size Analysis (Highest chance) ---
     p_big = ensemble_probability(history)["p_big"]
-    strength = signal_strength(history)
-
-    # Recovery Logic Flips
-    if STATE.loss_streak >= 1:
-        p_big = 1.0 - p_big
-        if regime in ["TRAP", "ALTERNATING", "BLOCK"]: p_big = 1.0 - sizes[-1]
-    if STATE.loss_streak >= 2:
-        p_big = 1.0 - majority_dir(sizes, 6)
-        
-    stale = stale_pattern_penalty(history, 12)
-    if stale > 0:
-        p_big = p_big * (1.0 - stale)
-        p_big = 1.0 - p_big
-
-    if regime in ["TRAP", "ALTERNATING", "BLOCK"]: p_big = 1.0 - sizes[-1]
-    elif regime == "TREND": p_big = sizes[-1]
-
-    p_big = clamp(p_big, 0.05, 0.95)
-    if strength < 0.45: p_big = 0.5
-
     p_small = 1.0 - p_big
+    
+    if p_big >= p_small:
+        size_pred = "BIG"
+        size_conf = p_big
+    else:
+        size_pred = "SMALL"
+        size_conf = p_small
+        
+    # --- 2. Color Analysis (Highest chance) ---
     color_probs = calculate_color_probs(history)
-    recent_nums = [x["num"] for x in history[-100:]]
-    freq = Counter(recent_nums)
-    
-    # --- FIND THE SINGLE BEST NUMBER ---
-    best_num = 0
-    best_combined_score = -1
-    
+    best_color = max(color_probs, key=color_probs.get)
+    color_conf = color_probs[best_color]
+
+    # --- 3. Filter Valid Numbers (Intersection) ---
+    valid_nums = []
     for n in range(10):
-        # 1. Size Prob
-        n_size_prob = p_big if n >= 5 else p_small
-        
-        # 2. Color Prob
-        n_colors = get_num_colors_list(n)
-        n_color_prob = sum(color_probs.get(c, 0) for c in n_colors)
-        # Normalize color prob (max possible is ~1.0 if both red+violet hit)
-        n_color_prob = min(1.0, n_color_prob)
-        
-        # 3. Recent Frequency
-        n_freq_prob = freq.get(n, 0) / max(1, len(recent_nums))
-        # Boost if it hasn't appeared recently, reduce if spammed
-        if n_freq_prob == 0: n_freq_prob += 0.15
-        elif n_freq_prob > 0.2: n_freq_prob *= 0.5
+        n_size = "BIG" if n >= 5 else "SMALL"
+        if n_size == size_pred and best_color in get_num_colors_list(n):
+            valid_nums.append(n)
 
-        # Combine (Weights: Size=40%, Color=30%, Freq=30%)
-        combined = (n_size_prob * 0.4) + (n_color_prob * 0.3) + (n_freq_prob * 0.3)
-        
-        # Penalty if it was the exact last number
-        if recent_nums and recent_nums[-1] == n:
-            combined *= 0.8
+    # --- 4. Pick Best Number ---
+    best_num = pick_best_number(valid_nums, history)
 
-        if combined > best_combined_score:
-            best_combined_score = combined
-            best_num = n
-
-    # Derive final stats from the Best Number
-    final_size = "BIG" if best_num >= 5 else "SMALL"
-    final_color = get_color_from_num(best_num)
-    final_p_big = p_big if final_size == "BIG" else p_small
-    final_color_confidence = sum(color_probs.get(c, 0) for c in get_num_colors_list(best_num))
-    final_color_confidence = min(1.0, final_color_confidence)
-
-    # Confidence & Stake
-    if STATE.loss_streak >= 1: confidence, stake = 60, "0.25x"
-    elif strength < 0.45: confidence, stake = 58, "0.25x"
-    elif strength < 0.65: confidence, stake = 62, "0.5x"
-    else: confidence, stake = 72, "1x"
-    if STATE.loss_streak >= 2: confidence, stake = 55, "0.25x"
+    # Confidence & Stake (Dynamic)
+    combined_conf = (size_conf + color_conf) / 2
+    if combined_conf > 0.65:
+        confidence, stake = 75, "1x"
+    elif combined_conf > 0.55:
+        confidence, stake = 65, "0.5x"
+    else:
+        confidence, stake = 55, "0.25x"
 
     issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-    sigs = [{"name": regime, "dir": 1 if final_size == "BIG" else 0}] if regime in ["TRAP", "TREND", "ALTERNATING", "BLOCK"] else [{"name": "Baseline", "dir": 1 if final_size == "BIG" else 0}]
-    mode = "SUPER-RECOVERY" if STATE.loss_streak >= 2 else ("RECOVERY" if STATE.loss_streak >= 1 else "NORMAL")
-
+    
     return {
-        "issue": issue, "size": final_size, "num": best_num, "color": final_color,
-        "p_big": round(clamp(p_big, 0.05, 0.95), 4), 
-        "size_conf": round(final_p_big, 4),
-        "color_conf": round(final_color_confidence, 4),
-        "confidence": confidence, "raw_conf": confidence, "consensus": max(p_big, 1 - p_big), 
-        "mode": mode, "regime": regime, "logic": ", ".join(s["name"] for s in sigs), "sigs": sigs,
-        "stake": stake, "details": {"strength": strength, "loss_streak": STATE.loss_streak, "regime": regime}
+        "issue": issue, 
+        "size": size_pred, 
+        "num": best_num, 
+        "color": best_color,
+        "p_big": round(p_big, 4), 
+        "size_conf": round(size_conf, 4),
+        "color_conf": round(color_conf, 4),
+        "confidence": confidence, 
+        "raw_conf": confidence, 
+        "consensus": max(p_big, 1 - p_big), 
+        "mode": "NORMAL", 
+        "regime": detect_regime(sizes), 
+        "logic": "Best Analysis", 
+        "sigs": [{"name": "Smart Logic", "dir": 1 if size_pred == "BIG" else 0}],
+        "stake": stake, 
+        "details": {"loss_streak": STATE.loss_streak}
     }
 
 def learn_from_resolution(res: dict):
@@ -601,23 +589,16 @@ async def fetch_data(session):
 
 def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
-    sig_text = "\n".join(f"  🕵️ {h(s['name'])}" for s in p["sigs"])
     stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
-
-    size_percent = p['size_conf'] * 100
-    color_percent = p['color_conf'] * 100
 
     return f"""
 📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
-📊 <b>Size</b>: <b>{h(p['size'])}</b> ({size_percent:.1f}%)
-🎨 <b>Color</b>: <b>{h(p['color'])}</b> ({color_percent:.1f}%)
+📊 <b>Size</b>: <b>{h(p['size'])}</b> ({p['size_conf']*100:.1f}%)
+🎨 <b>Color</b>: <b>{h(p['color'])}</b> ({p['color_conf']*100:.1f}%)
 
 🧠 <b>Mode</b>: <b>{h(p['mode'])}</b>
 💰 <b>Risk Stake</b>: <b>{stake_emoji}</b>
-
-🔎 <b>Active Agents</b>:
-{sig_text}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent Outcomes</b>:
@@ -626,7 +607,8 @@ def format_prediction(p, recent_rows):
 """
 
 def format_result(res):
-    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(res['size'])} {h(res['num'])}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
+    pred_str = f"{res['size']} ({res['color']}) Num {res['num']}"
+    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(pred_str)}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
 
 async def send_msg(app, text, retries=3):
     for attempt in range(retries):
@@ -660,7 +642,8 @@ async def worker_loop(app, session):
                     if p:
                         STORE.save_prediction(p)
                         await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
-                        last_processed_issue = latest_issue
+                    last_processed_issue = latest_issue
+                    
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
         except Exception as e:
