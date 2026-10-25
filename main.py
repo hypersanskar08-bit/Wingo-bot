@@ -1,10 +1,11 @@
 """
 FTW V7 REAL PATTERN TRACKER (FIXED)
 ===================================
-- Fixed: NameError: signal_strength is not defined
-- Added real pattern tracking and noise filtering
-- Recovery + dragon protection
-- No skip
+- Fixed missing helper functions
+- Fixed SyntaxError in volatility()
+- Real pattern tracking vs noisy pattern filter
+- Recovery mode + dragon protection
+- No skip logic
 """
 
 import asyncio
@@ -75,7 +76,11 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v7_real_pattern.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(
+        Path(CFG.log_dir) / "ftw_v7_real_pattern.log",
+        maxBytes=1_000_000,
+        backupCount=2
+    )
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
@@ -139,7 +144,7 @@ def volatility(seq: List[int], window: int = 20) -> float:
     if len(seq) < 2:
         return 0.0
     arr = seq[-window:]
-    diffs = [abs(arr[i] - arr[i - 1)] for i in range(1, len(arr))]
+    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 def ratio_big(seq: List[int], window: int = 20) -> float:
@@ -297,7 +302,9 @@ class Storage:
     def resolve_pending(self, history_by_issue):
         resolved = []
         with self._conn() as c:
-            rows = c.execute("SELECT issue, pred_type, size, num, color, details, stake FROM predictions WHERE status='PENDING'").fetchall()
+            rows = c.execute(
+                "SELECT issue, pred_type, size, num, color, details, stake FROM predictions WHERE status='PENDING'"
+            ).fetchall()
 
         for row in rows:
             issue, pred_type, p_size, p_num, p_color, details_json, stake = row
@@ -306,6 +313,7 @@ class Storage:
                 continue
 
             actual_size = "BIG" if act["size"] == 1 else "SMALL"
+
             win = (p_size == actual_size) if p_size else True
 
             if win and p_num == act["num"]:
@@ -316,7 +324,10 @@ class Storage:
                 status = "LOSS ❌"
 
             with self._conn() as c:
-                c.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?", (status, act["num"], actual_size, issue))
+                c.execute(
+                    "UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?",
+                    (status, act["num"], actual_size, issue)
+                )
 
             resolved.append({
                 "issue": issue,
@@ -330,21 +341,25 @@ class Storage:
                 "win": win,
                 "details": json.loads(details_json) if details_json else {}
             })
+
         return resolved
 
     def recent_outcomes(self, limit: int = 6):
         with self._conn() as c:
-            rows = c.execute("SELECT issue, size, color, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (limit,)).fetchall()
+            rows = c.execute(
+                "SELECT issue, size, color, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
         return rows[::-1]
 
 STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# PATTERN TRACKER (REAL vs NOISE)
+# PATTERN LIBRARY
 # ============================================================
 PATTERN_LIBRARY = [
-    # 1. Streaks
+    # Streaks
     ((1, 1, 1), 1, "3-BIG DRAGON", 1.8),
     ((0, 0, 0), 0, "3-SMALL DRAGON", 1.8),
     ((1, 1, 1, 1), 1, "4-BIG DRAGON", 2.2),
@@ -352,7 +367,7 @@ PATTERN_LIBRARY = [
     ((1, 1, 1, 1, 1), 0, "5-BIG REVERSE", 1.9),
     ((0, 0, 0, 0, 0), 1, "5-SMALL REVERSE", 1.9),
 
-    # 2. Alternating
+    # Alternating
     ((1, 0, 1), 0, "B-S-B => S", 1.6),
     ((0, 1, 0), 1, "S-B-S => B", 1.6),
     ((1, 0, 1, 0), 1, "B-S-B-S => B", 1.7),
@@ -360,13 +375,13 @@ PATTERN_LIBRARY = [
     ((1, 0, 1, 0, 1), 0, "B-S-B-S-B => S", 1.8),
     ((0, 1, 0, 1, 0), 1, "S-B-S-B-S => B", 1.8),
 
-    # 3. Symmetry
+    # Symmetry
     ((1, 1, 0, 0), 1, "2B-2S => B", 1.5),
     ((0, 0, 1, 1), 0, "2S-2B => S", 1.5),
     ((1, 1, 1, 0, 0, 0), 1, "3B-3S => B", 1.8),
     ((0, 0, 0, 1, 1, 1), 0, "3S-3B => S", 1.8),
 
-    # 4. Skips
+    # Skips
     ((1, 0, 0, 0, 1), 0, "B-S-S-S-B => S", 1.5),
     ((0, 1, 1, 1, 0), 1, "S-B-B-B-S => B", 1.5),
     ((1, 0, 1, 1), 0, "B-S-B-B => S", 1.4),
@@ -374,29 +389,29 @@ PATTERN_LIBRARY = [
     ((1, 0, 0, 1), 0, "B-S-S-B => S", 1.3),
     ((0, 1, 1, 0), 1, "S-B-B-S => B", 1.3),
 
-    # 5. Block / Trap
+    # Block / trap
     ((1, 1, 0, 1, 0), 1, "B-B-S-B-S => B", 1.5),
     ((0, 0, 1, 0, 1), 0, "S-S-B-S-B => S", 1.5),
     ((1, 0, 0, 1, 0), 0, "B-S-S-B-S => S", 1.5),
     ((0, 1, 1, 0, 1), 1, "S-B-B-S-B => B", 1.5),
 
-    # 6. X and Mirror
+    # X and mirror
     ((1, 0, 1), 1, "X-B-S-B => B", 1.5),
     ((0, 1, 0), 0, "X-S-B-S => S", 1.5),
     ((1, 0, 0, 1), 0, "V-B-S-S-B => S", 1.4),
     ((0, 1, 1, 0), 1, "V-S-B-B-S => B", 1.4),
 
-    # 7. Edge continuations
+    # Edge continuations
     ((1, 1, 1, 1, 0), 1, "4B-1S => B", 1.4),
     ((0, 0, 0, 0, 1), 0, "4S-1B => S", 1.4),
     ((1, 0, 0, 0, 0), 1, "1B-4S => B", 1.4),
     ((0, 1, 1, 1, 1), 0, "1S-4B => S", 1.4),
 
-    # 8. Reversal / Break patterns
+    # Reversal break patterns
     ((1, 0, 0, 0), 1, "SMALL BREAK => B", 1.3),
     ((0, 1, 1, 1), 0, "BIG BREAK => S", 1.3),
 
-    # 9. Additional 50+ patterns
+    # Extra patterns 50+
     ((1, 0, 0, 0, 1, 0), 0, "P1", 1.4),
     ((0, 1, 1, 1, 0, 1), 1, "P2", 1.4),
     ((1, 1, 0, 1, 1, 0), 0, "P3", 1.4),
@@ -449,6 +464,7 @@ PATTERN_LIBRARY = [
     ((0, 0, 1, 1, 0, 1, 1), 0, "P50", 1.7),
 ]
 
+
 class PatternTracker:
     def __init__(self):
         self.stats: Dict[str, Dict[str, Any]] = {}
@@ -456,9 +472,11 @@ class PatternTracker:
     def register_pattern(self, key: str, value: int):
         if key not in self.stats:
             self.stats[key] = {"hits": 0, "misses": 0, "last_seen": 0, "last_result": None}
+
         entry = self.stats[key]
         entry["last_seen"] = time.time()
         entry["last_result"] = value
+
         if value == 1:
             entry["hits"] += 1
         else:
@@ -468,9 +486,11 @@ class PatternTracker:
         entry = self.stats.get(key)
         if not entry:
             return 0.0
+
         total = entry["hits"] + entry["misses"]
         if total == 0:
             return 0.0
+
         hit_rate = entry["hits"] / total
         recency = max(0.0, 1.0 - (time.time() - entry["last_seen"]) / 500.0)
         return hit_rate * 0.7 + recency * 0.3
@@ -518,7 +538,6 @@ def pattern_match_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     final_score = score + (support * 20.0)
 
-    # Fake/noisy filter
     if support < 0.25 and final_score < 18:
         return {"pred": None, "name": "NOISY PATTERN", "score": 0.0}
 
@@ -532,9 +551,9 @@ def markov_size_prob(history: List[Dict[str, Any]]) -> float:
     seq = tuple(sizes[-2:])
     count, big = 0, 0
     for i in range(len(sizes) - 2):
-        if tuple(sizes[i:i+2]) == seq:
+        if tuple(sizes[i:i + 2]) == seq:
             count += 1
-            if sizes[i+2] == 1:
+            if sizes[i + 2] == 1:
                 big += 1
     return (big / count) if count > 0 else 0.5
 
@@ -627,7 +646,7 @@ def generate_prediction() -> Dict[str, Any]:
     final_num = choose_best_number(final_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
-    # Track pattern usage for support
+    # Track pattern usage for support and filtering
     for pattern in PATTERN_LIBRARY:
         pat_seq, pred_value, name, weight = pattern
         if len(seq) >= len(pat_seq):
@@ -740,7 +759,6 @@ async def fetch_data(session):
         return True
     return False
 
-
 # ============================================================
 # FORMATTERS
 # ============================================================
@@ -812,7 +830,12 @@ async def worker_loop(app, session):
                     continue
 
                 latest_issue = STATE.history[-1]["issue"]
-                next_issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
+                next_issue = str(
+                    max(
+                        [normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None],
+                        default=0
+                    ) + 1
+                )
 
                 if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
                     pred = generate_prediction()
@@ -847,7 +870,6 @@ async def start_web_server():
 # ============================================================
 # MAIN
 # ============================================================
-
 async def main():
     CFG.validate()
     STATE.load_cache()
