@@ -1,13 +1,11 @@
 """
-V916 ULTRA ADVANCED PREDICTOR
-=============================
+V916 ULTRA ADVANCED PREDICTOR (HARDCODED TOKEN VERSION)
+=======================================================
 - Original Ensemble Logic (Intact)
 - HTML Dragon Streak (Blended as a model)
-- Markov Chain Transition Analysis (NEW)
-- Bayesian Weight Updating (NEW)
-- Kelly Criterion Stake Sizing (NEW)
-- Dynamic Confidence Calibration (NEW)
-- Render-safe + Telegram-safe
+- Markov Chain Transition Analysis
+- Bayesian Weight Updating
+- Kelly Criterion Stake Sizing
 """
 
 import asyncio
@@ -32,12 +30,14 @@ from telegram.ext import Application
 
 
 # ============================================================
-# CONFIG
+# CONFIG (TOKEN DIRECTLY APPLIED HERE)
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = os.environ.get("8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM", "")
-    chat_id_raw: str = os.environ.get("1264164655", "")
+    # Maine aapka token yahan direct daal diya hai
+    telegram_token: str = "8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM"
+    chat_id_raw: str = "1264164655"
+    
     source_api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
@@ -146,7 +146,6 @@ def ratio_big(values: List[int], window: int = 20) -> float:
     return sum(arr) / len(arr)
 
 def exponential_moving_average(values: List[int], alpha: float = 0.3) -> float:
-    """EMA gives more weight to recent results"""
     if not values: return 0.5
     ema = values[0]
     for val in values[1:]:
@@ -199,9 +198,7 @@ def detect_trend_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 # STATE & BAYESIAN WEIGHTS
 # ============================================================
 class BayesianWeights:
-    """Advanced weights that learn from predictions using Bayesian-like updates"""
     def __init__(self):
-        # Starting weights (Priors)
         self.size = {
             "Markov": 1.0, "EMA": 1.0, "DragonStreak": 1.0, "Exact": 1.0, 
             "Trend": 1.0, "Alternation": 1.0, "Block": 1.0, 
@@ -210,14 +207,11 @@ class BayesianWeights:
         self.color = {"Freq": 1.0, "Streak": 1.0, "Similarity": 1.0}
         
     def update(self, model_votes: Dict[str, str], actual_size: str, actual_color: str):
-        """Update weights based on which models were right/wrong"""
         for model, vote in model_votes.items():
             if model in self.size and vote in ("BIG", "SMALL"):
                 if vote == actual_size:
-                    # Increase weight (but with diminishing returns)
                     self.size[model] = clamp(self.size[model] * 1.05, 0.5, 3.0)
                 else:
-                    # Decrease weight
                     self.size[model] = clamp(self.size[model] * 0.92, 0.2, 2.0)
 
 class BotState:
@@ -226,8 +220,6 @@ class BotState:
         self.loss_streak = 0
         self.win_streak = 0
         self.weights = BayesianWeights()
-        
-        # For Confidence Calibration
         self.conf_bins = defaultdict(lambda: {"wins": 0, "total": 0})
         
     def save_cache(self):
@@ -372,34 +364,28 @@ STORE = Storage(CFG.db_path)
 # INDIVIDUAL MODELS
 # ============================================================
 def model_markov(history: List[Dict[str, Any]]) -> float:
-    """Advanced: Predicts based on transition probabilities of the last 2 outcomes"""
     sizes = [x["size"] for x in history]
     if len(sizes) < 4: return 0.5
-    seq = tuple(sizes[-2:]) # e.g., (1, 0) means last was BIG, before was SMALL
-    
+    seq = tuple(sizes[-2:]) 
     transitions = {0: 0, 1: 0}
     for i in range(len(sizes) - 3, -1, -1):
         if tuple(sizes[i:i+2]) == seq:
             transitions[sizes[i+2]] += 1
-            
     total = transitions[0] + transitions[1]
     if total == 0: return 0.5
-    return transitions[1] / total # Prob of BIG
+    return transitions[1] / total 
 
 def model_ema(history: List[Dict[str, Any]]) -> float:
-    """Predicts using Exponential Moving Average of recent momentum"""
     sizes = [x["size"] for x in history[-15:]]
     ema = exponential_moving_average(sizes, alpha=0.4)
-    if ema > 0.55: return 0.85 # Strong BIG momentum
-    if ema < 0.45: return 0.15 # Strong SMALL momentum
+    if ema > 0.55: return 0.85 
+    if ema < 0.45: return 0.15 
     return ema
 
 def model_dragon_streak(history: List[Dict[str, Any]]) -> Tuple[float, str]:
-    """HTML Logic: Dragon Streak & Double Repeat"""
     sizes = [x["size"] for x in history]
     current = sizes[-1]
     streak = trailing_run(sizes)
-    
     if streak >= 3: return (0.95 if current == 1 else 0.05), f"Dragon Streak (x{streak})"
     if streak == 2: return (0.80 if current == 1 else 0.20), "Double Repeat (x2)"
     return 0.5, "None"
@@ -443,9 +429,8 @@ def model_parity(history: List[Dict[str, Any]]) -> float:
 # ============================================================
 def ensemble_size_probability(history: List[Dict[str, Any]]) -> Tuple[float, Dict[str, str]]:
     sizes = [x["size"] for x in history]
-    
-    # Get raw predictions
     streak_p, streak_name = model_dragon_streak(history)
+    
     base = {
         "Markov": model_markov(history),
         "EMA": model_ema(history),
@@ -460,10 +445,8 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> Tuple[float, Dic
         "Parity": model_parity(history)
     }
 
-    # Record what each model voted for
     votes = {k: ("BIG" if v > 0.5 else "SMALL") for k, v in base.items()}
 
-    # Apply Bayesian Weights
     weighted_sum = 0.0
     total_weight = 0.0
     for name, prob in base.items():
@@ -473,7 +456,6 @@ def ensemble_size_probability(history: List[Dict[str, Any]]) -> Tuple[float, Dic
 
     final_p_big = weighted_sum / total_weight
 
-    # Trend Shift adjustments
     shift = detect_trend_shift(history)
     if shift["direction"] == "SHIFT_TO_BIG": final_p_big = clamp(final_p_big + 0.08, 0.05, 0.95)
     elif shift["direction"] == "SHIFT_TO_SMALL": final_p_big = clamp(final_p_big - 0.08, 0.05, 0.95)
@@ -499,11 +481,8 @@ def choose_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> 
     return max(score, key=score.get)
 
 def calculate_kelly_stake(prob: float, odds: float = 1.0) -> Tuple[str, int]:
-    """Advanced: Uses Kelly Criterion to determine optimal stake size"""
     if prob <= 0.5: return "0.25x", 56
-    # f* = (p * (b + 1) - 1) / b. For binary options b=1, so f* = 2p - 1
     edge = (prob * 2) - 1
-    
     if edge > 0.35: return "3x", 95
     if edge > 0.25: return "2x", 85
     if edge > 0.15: return "1.5x", 75
@@ -515,17 +494,15 @@ def calculate_kelly_stake(prob: float, odds: float = 1.0) -> Tuple[str, int]:
 # ============================================================
 def generate_prediction() -> Optional[Dict[str, Any]]:
     if len(STATE.history) < CFG.min_history:
-        return None # Let it wait for enough data
+        return None 
 
     history = STATE.history[-2000:]
     sizes = [x["size"] for x in history]
 
-    # 1. Advanced Ensemble
     p_big, votes = ensemble_size_probability(history)
     p_small = 1.0 - p_big
     color_probs = ensemble_color_probability(history)
 
-    # 2. Select Winner
     if p_big > p_small:
         final_size, final_color = "BIG", ""
         valid_nums = [n for n in range(10) if n >= 5]
@@ -535,7 +512,6 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         valid_nums = [n for n in range(10) if n < 5]
         best_conf = p_small
 
-    # Override if HTML Dragon Streak is overwhelmingly strong
     if votes["DragonStreak"] == "BIG" and p_big < 0.6:
         final_size, best_conf = "BIG", 0.75
         valid_nums = [n for n in range(10) if n >= 5]
@@ -545,7 +521,6 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
 
     best_num = choose_best_number(valid_nums, history)
 
-    # 3. Kelly Stake & Confidence
     stake, confidence = calculate_kelly_stake(best_conf)
 
     pattern = "ULTRA ENSEMBLE (Markov+EMA+Bayes)"
@@ -576,11 +551,9 @@ def learn_from_resolution(res: dict):
     if res["win"]: STATE.loss_streak = 0
     else: STATE.loss_streak += 1
 
-    # Update Bayesian Weights using the votes stored in details
     if "votes" in res.get("details", {}):
         STATE.weights.update(res["details"]["votes"], res["actual_size"], res["actual_color"])
 
-    # Update DB Memory
     actual_size = 1 if res["actual_size"] == "BIG" else 0
     STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
 
@@ -691,14 +664,12 @@ async def worker_loop(app, session):
 async def main():
     CFG.validate()
     STATE.load_cache()
-    if not CFG.telegram_token or not CFG.chat_id_raw:
-        log.error("Missing TG_TOKEN or TG_CHAT env variables."); return
     
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
     async with app:
         await app.start()
         me = await app.bot.get_me()
-        log.info("Bot verified: %s", me.username)
+        log.info("Bot verified successfully: %s", me.username)
         
         await start_web_server()
         async with aiohttp.ClientSession() as session:
