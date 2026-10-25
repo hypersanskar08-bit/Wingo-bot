@@ -1,14 +1,15 @@
 """
-FTW V10 DEEP ADAPTIVE PREDICTOR
-================================
-- Exact sequence mining windows 4..14
-- Adaptive weighted ensemble
+FTW V11 DEEP ADAPTIVE PREDICTOR + BACKTEST ENGINE
+==================================================
+- Exact sequence mining: 4..14
+- Adaptive ensemble weights
 - Real pattern support + recency + confidence
-- Noise rejection for fake patterns
-- Recovery only on actual danger
+- Fake/noisy pattern rejection
+- Recovery only in real danger
 - Dragon protection against hard streaks
-- Backtesting module for validation
-- Recent results: 12 entries
+- Live backtesting runner
+- Recent results: 12
+- Telegram-ready
 """
 
 import asyncio
@@ -42,12 +43,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v10_deep.db")
-    cache_file: str = "ftw_v10_history_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v11_deep.db")
+    cache_file: str = "ftw_v11_history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V10 DEEP ADAPTIVE"
+    bot_name: str = "FTW V11 DEEP ADAPTIVE"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -81,7 +82,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v10_deep.log",
+        Path(CFG.log_dir) / "ftw_v11_deep.log",
         maxBytes=1_000_000,
         backupCount=2
     )
@@ -89,7 +90,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v10")
+log = logging.getLogger("ftw_v11")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -368,7 +369,7 @@ class Storage:
             if row is None:
                 hit = 0
                 miss = 0
-                last_seen = 0
+                last_seen = 0.0
                 support = 0.0
                 confidence = 0.0
             else:
@@ -467,7 +468,7 @@ ADAPTIVE = AdaptiveWeights()
 
 
 # ============================================================
-# EXACT SEQUENCE MINING
+# PATTERN LIBRARY
 # ============================================================
 PATTERN_LIBRARY = [
     ((1, 1, 1), 1, "3-BIG DRAGON", 1.8),
@@ -484,8 +485,18 @@ PATTERN_LIBRARY = [
     ((0, 0, 1, 1), 0, "2S-2B => S", 1.5),
     ((1, 0, 0, 0, 1), 0, "B-S-S-S-B => S", 1.5),
     ((0, 1, 1, 1, 0), 1, "S-B-B-B-S => B", 1.5),
+    ((1, 0, 1, 1), 0, "B-S-B-B => S", 1.4),
+    ((0, 1, 0, 0), 1, "S-B-S-S => B", 1.4),
     ((1, 0, 0, 1), 0, "B-S-S-B => S", 1.3),
     ((0, 1, 1, 0), 1, "S-B-B-S => B", 1.3),
+    ((1, 1, 0, 1, 0), 1, "B-B-S-B-S => B", 1.5),
+    ((0, 0, 1, 0, 1), 0, "S-S-B-S-B => S", 1.5),
+    ((1, 0, 0, 1, 0), 0, "B-S-S-B-S => S", 1.5),
+    ((0, 1, 1, 0, 1), 1, "S-B-B-S-B => B", 1.5),
+    ((1, 0, 1), 1, "X-B-S-B => B", 1.5),
+    ((0, 1, 0), 0, "X-S-B-S => S", 1.5),
+    ((1, 0, 0, 1), 0, "V-B-S-S-B => S", 1.4),
+    ((0, 1, 1, 0), 1, "V-S-B-B-S => B", 1.4),
 ]
 
 def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -561,10 +572,6 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
         "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
     }
 
-
-# ============================================================
-# STATISTICAL MODELS
-# ============================================================
 def markov_prob(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     if len(sizes) < 3:
@@ -633,16 +640,13 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "stake": "1x" if confidence >= 0.68 else "0.5x"
     }
 
-
-# ============================================================
-# RECOVERY + DRAGON RULES
-# ============================================================
 def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     seq = [x["size"] for x in history]
     if not seq:
         return None
 
     recent = seq[-6:]
+
     if STATE.loss_streak >= 3:
         if sum(recent) >= 4:
             return {"size": "SMALL", "logic": "RECOVERY REVERSE", "confidence": 0.82, "stake": "1x"}
@@ -665,10 +669,6 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
 
     return None
 
-
-# ============================================================
-# ENSEMBLE PREDICTOR
-# ============================================================
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
     freq = Counter([x["num"] for x in history[-80:]])
@@ -688,7 +688,6 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         ("hybrid", fallback["size"], fallback["confidence"])
     ]
 
-    # adaptive weights
     weights = ADAPTIVE.current()
 
     total_weight = 0.0
@@ -702,7 +701,7 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif name == "trend":
             w = weights["trend"]
         else:
-            w = weights["hybrid"] if "hybrid" in weights else 0.2
+            w = weights["exact"] * 0.6
 
         total_weight += w
         signal_value = 1.0 if size == "BIG" else 0.0
@@ -790,6 +789,85 @@ def learn_from_resolution(res: Dict[str, Any]):
 
     ADAPTIVE.update(res["win"])
     STATE.save_cache()
+
+
+# ============================================================
+# LIVE BACKTEST SYSTEM
+# ============================================================
+def run_backtest(history: List[Dict[str, Any]], window_size: int = 50) -> Dict[str, Any]:
+    total = 0
+    wins = 0
+    losses = 0
+    correct_size = 0
+    data_points = []
+
+    for i in range(window_size, len(history)):
+        slice_hist = history[:i]
+        if len(slice_hist) < CFG.min_history:
+            continue
+
+        # generate prediction based on earlier history
+        issue = str(i + 1)
+        pred = generate_prediction_from_history(slice_hist, issue)
+
+        actual = history[i]
+        actual_size = "BIG" if actual["size"] == 1 else "SMALL"
+
+        predicted_size = pred["size"]
+        size_ok = (predicted_size == actual_size)
+
+        total += 1
+        if size_ok:
+            wins += 1
+            correct_size += 1
+        else:
+            losses += 1
+
+        data_points.append({
+            "issue": actual["issue"], "pred": predicted_size, "actual": actual_size, "win": size_ok
+        })
+
+    hit_rate = (wins / total) if total else 0.0
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "hit_rate": hit_rate,
+        "correct_size": correct_size,
+        "data_points": data_points[-20:]
+    }
+
+def generate_prediction_from_history(history: List[Dict[str, Any]], issue: str) -> Dict[str, Any]:
+    seq = [x["size"] for x in history]
+    override = recovery_override(history)
+    if override:
+        pred_size = override["size"]
+        conf = override["confidence"]
+        logic = override["logic"]
+        stake = override["stake"]
+    else:
+        exact = choose_exact_prediction(history)
+        if exact:
+            pred_size = exact["size"]
+            conf = exact["confidence"]
+            logic = exact["logic"]
+            stake = exact["stake"]
+        else:
+            hybrid = hybrid_prediction(history)
+            pred_size = hybrid["size"]
+            conf = hybrid["confidence"]
+            logic = hybrid["logic"]
+            stake = hybrid["stake"]
+
+    return {
+        "issue": issue,
+        "size": pred_size,
+        "num": choose_number_for_size(pred_size, history),
+        "logic": logic,
+        "raw_conf": int(conf * 100),
+        "stake": stake
+    }
+
 
 # ============================================================
 # API PARSING & FETCHING
@@ -989,7 +1067,7 @@ async def worker_loop(app, session):
 # HEALTH CHECK
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V10 Deep Adaptive Predictor is Running")
+    return web.Response(text="FTW V11 Deep Adaptive Predictor is Running")
 
 async def start_web_server():
     app = web.Application()
@@ -1014,6 +1092,11 @@ async def main():
     log.info("Bot started: %s", (await app.bot.get_me()).username)
 
     await start_web_server()
+
+    # Optional: run a quick backtest on startup if enough data exists
+    if len(STATE.history) >= 40:
+        bt = run_backtest(STATE.history, window_size=30)
+        log.info("Backtest hit rate: %.2f%% total=%s", bt["hit_rate"] * 100, bt["total"])
 
     async with aiohttp.ClientSession() as session:
         asyncio.create_task(worker_loop(app, session))
