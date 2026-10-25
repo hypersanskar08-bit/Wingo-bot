@@ -1,5 +1,5 @@
 """
-FTW V1 ADVANCED STATE MINER + RECOVERY + PATTERN ENGINE
+FTW V2 ADVANCED STATE MINER + RECOVERY + PATTERN ENGINE
 ========================================================
 - Uses last ~1000 recent results
 - Exact suffix mining window 3..12
@@ -42,12 +42,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v1_advanced_state.db")
+    db_path: str = os.environ.get("DB_PATH", "ftw_v2_advanced_state.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V1"
+    bot_name: str = "FTW V2"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -80,7 +80,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v1_advanced_state.log",
+        Path(CFG.log_dir) / "ftw_v2_advanced_state.log",
         maxBytes=1_000_000,
         backupCount=2
     )
