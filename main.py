@@ -1,14 +1,15 @@
 """
-FTW FINAL FIXED VERSION
-=======================
-- Fully working version
-- fixes: Counter.most_common on defaultdict
-- deep number pattern + family logic
-- trend exhaustion / dragon fatigue
-- size prediction + number prediction improved
+FTW V16 FULL CODE
+=================
+Advanced deep predictor with:
+- trend phase detection
+- exhaustion logic
+- momentum decay
+- dominance check
+- opposite-side reversal pressure
+- deep number family analysis
+- exact sequence mining 4..14
 - anti-bias guard
-- 12 recent results
-- no skip
 - Telegram ready
 """
 
@@ -43,12 +44,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_final_fixed.db")
-    cache_file: str = "ftw_final_fixed_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v16_full.db")
+    cache_file: str = "ftw_v16_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW FINAL FIXED"
+    bot_name: str = "FTW V16 PHASE ENGINE"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -82,7 +83,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_final_fixed.log",
+        Path(CFG.log_dir) / "ftw_v16_full.log",
         maxBytes=1_000_000,
         backupCount=2
     )
@@ -90,7 +91,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_final_fixed")
+log = logging.getLogger("ftw_v16")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -228,6 +229,11 @@ def bias_guard(pred_size: str, history: List[Dict[str, Any]]) -> str:
         return "BIG"
     if balance < -0.18 and pred_size == "BIG":
         return "SMALL"
+
+    exhaustion = trend_exhaustion(history)
+    if exhaustion and exhaustion["size"] != pred_size:
+        return exhaustion["size"]
+
     return pred_size
 
 
@@ -482,48 +488,111 @@ ADAPTIVE = AdaptiveWeights()
 
 
 # ============================================================
-# LONG TREND / DRAGON EXHAUSTION
+# TREND PHASE DETECTION
 # ============================================================
-def long_trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def trend_phase(history: List[Dict[str, Any]]) -> str:
+    if len(history) < 8:
+        return "COLD"
+
+    seq = [x["size"] for x in history]
+    run = trailing_run(seq)
+    current_side = seq[-1]
+    recent = seq[-10:]
+    same_share = sum(1 for v in recent if v == current_side) / len(recent)
+
+    # detect momentum decay
+    last3 = seq[-3:]
+    prev3 = seq[-6:-3]
+    if len(last3) == 3 and len(prev3) == 3:
+        last_same = sum(1 for v in last3 if v == current_side)
+        prev_same = sum(1 for v in prev3 if v == current_side)
+        momentum_decay = (last_same < prev_same)
+
+    else:
+        momentum_decay = False
+
+    if run >= 5 and same_share >= 0.75 and momentum_decay:
+        return "EXHAUSTED"
+    if run >= 4 and same_share >= 0.68:
+        return "DOMINANT"
+    if run >= 2:
+        return "BUILDING"
+    return "COLD"
+
+def trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(history) < 8:
         return None
 
     seq = [x["size"] for x in history]
-    run = trailing_run(seq)
+    phase = trend_phase(history)
     current_side = seq[-1]
     recent = seq[-12:]
     big_share = sum(1 for v in recent if v == 1) / len(recent)
     small_share = sum(1 for v in recent if v == 0) / len(recent)
 
-    if run >= 5:
+    if phase == "EXHAUSTED":
         if current_side == 1 and big_share >= 0.75:
             return {
                 "size": "SMALL",
-                "logic": "DRAGON EXHAUSTION: BIG TREND SATURATED",
-                "confidence": 0.82,
+                "logic": "TREND EXHAUSTION: BIG DOMINANCE + DECAY",
+                "confidence": 0.92,
                 "stake": "1x"
             }
         if current_side == 0 and small_share >= 0.75:
             return {
                 "size": "BIG",
-                "logic": "DRAGON EXHAUSTION: SMALL TREND SATURATED",
+                "logic": "TREND EXHAUSTION: SMALL DOMINANCE + DECAY",
+                "confidence": 0.92,
+                "stake": "1x"
+            }
+
+    if phase == "DOMINANT":
+        if current_side == 1 and big_share >= 0.68:
+            return {
+                "size": "SMALL",
+                "logic": "TREND FATIGUE: BIG DOMINANCE BUT WEAK CONTINUATION",
+                "confidence": 0.82,
+                "stake": "1x"
+            }
+        if current_side == 0 and small_share >= 0.68:
+            return {
+                "size": "BIG",
+                "logic": "TREND FATIGUE: SMALL DOMINANCE BUT WEAK CONTINUATION",
                 "confidence": 0.82,
                 "stake": "1x"
             }
 
-    if run >= 4 and len(recent) >= 8:
-        if current_side == 1 and big_share >= 0.7:
+    return None
+
+def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if len(history) < 8:
+        return None
+
+    seq = [x["size"] for x in history]
+    current_side = seq[-1]
+    opposite = "SMALL" if current_side == 1 else "BIG"
+
+    # strong reversal requirement
+    phase = trend_phase(history)
+    if phase not in ("EXHAUSTED", "DOMINANT"):
+        return None
+
+    recent = seq[-12:]
+    current_share = sum(1 for v in recent if v == current_side) / len(recent)
+    if current_share < 0.68:
+        return None
+
+    # check if recent continuation is fading
+    last3 = seq[-3:]
+    prev3 = seq[-6:-3]
+    if len(last3) == 3 and len(prev3) == 3:
+        last_same = sum(1 for v in last3 if v == current_side)
+        prev_same = sum(1 for v in prev3 if v == current_side)
+        if last_same <= prev_same:
             return {
-                "size": "SMALL",
-                "logic": "TREND FATIGUE",
-                "confidence": 0.76,
-                "stake": "1x"
-            }
-        if current_side == 0 and small_share >= 0.7:
-            return {
-                "size": "BIG",
-                "logic": "TREND FATIGUE",
-                "confidence": 0.76,
+                "size": opposite,
+                "logic": "REVERSAL PRESSURE: momentum fading",
+                "confidence": 0.85,
                 "stake": "1x"
             }
 
@@ -722,20 +791,32 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "stake": "1x" if confidence >= 0.68 else "0.5x"
     }
 
+
+# ============================================================
+# RECOVERY / REVERSAL
+# ============================================================
 def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     seq = [x["size"] for x in history]
     if not seq:
         return None
 
     recent = seq[-6:]
-    trend_exhaust = long_trend_exhaustion(history)
-
+    trend_exhaust = trend_exhaustion(history)
     if trend_exhaust:
         return {
             "size": trend_exhaust["size"],
             "logic": trend_exhaust["logic"],
             "confidence": trend_exhaust["confidence"],
             "stake": trend_exhaust["stake"]
+        }
+
+    reversal = trend_reversal_signal(history)
+    if reversal:
+        return {
+            "size": reversal["size"],
+            "logic": reversal["logic"],
+            "confidence": reversal["confidence"],
+            "stake": reversal["stake"]
         }
 
     if STATE.loss_streak >= 3:
@@ -747,14 +828,19 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         if big_share >= 0.75 and small_share <= 0.25:
             return {"size": "SMALL", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
 
+    # keep the normal reverse only when realistic
     if trailing_run(seq) >= 4:
         last = seq[-1]
-        return {"size": "SMALL" if last == 1 else "BIG", "logic": "DRAGON PROTECTION", "confidence": 0.88, "stake": "1x"}
+        return {
+            "size": "SMALL" if last == 1 else "BIG",
+            "logic": "DRAGON PROTECTION",
+            "confidence": 0.88,
+            "stake": "1x"
+        }
 
     if len(recent) >= 4:
         recent_small = sum(1 for v in recent if v == 0)
         recent_big = sum(1 for v in recent if v == 1)
-
         if recent_small >= 4 and recent_big <= 1:
             return {"size": "BIG", "logic": "LOSS ROLLBACK", "confidence": 0.76, "stake": "1x"}
         if recent_big >= 4 and recent_small <= 1:
@@ -916,6 +1002,11 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
             final_size = "SMALL"
             final_score = max(final_score, trend_conf)
 
+    reversal = trend_reversal_signal(history)
+    if reversal:
+        final_size = reversal["size"]
+        final_score = max(final_score, reversal["confidence"])
+
     if not exact:
         final_size = fallback["size"]
         final_score = fallback["confidence"]
@@ -945,10 +1036,7 @@ def generate_prediction() -> Dict[str, Any]:
             "raw_conf": 50,
             "logic": "WARMING UP",
             "stake": "0.5x",
-            "details": {
-                "recovery_mode": False,
-                "regime": "COLD"
-            }
+            "details": {"recovery_mode": False, "regime": "COLD"}
         }
 
     history = STATE.history[-2000:]
@@ -984,8 +1072,9 @@ def generate_prediction() -> Dict[str, Any]:
             "signal_strength": signal_strength(history),
             "regime": detect_regime(seq),
             "side_balance": round(side_balance(history, 20), 4),
+            "trend_phase": trend_phase(history),
             "trend_shift": trend_shift_score(history),
-            "trend_exhaustion": long_trend_exhaustion(history)
+            "trend_exhaustion": trend_exhaustion(history)
         }
     }
 
@@ -1001,6 +1090,7 @@ def learn_from_resolution(res: Dict[str, Any]):
 
     ADAPTIVE.update(res["win"])
     STATE.save_cache()
+
 
 # ============================================================
 # BACKTEST
@@ -1266,7 +1356,7 @@ async def worker_loop(app, session):
 # HEALTH CHECK
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW Final Fixed is Running")
+    return web.Response(text="FTW V16 FULL is Running")
 
 async def start_web_server():
     app = web.Application()
