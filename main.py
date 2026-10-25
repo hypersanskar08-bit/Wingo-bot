@@ -1,10 +1,10 @@
 """
-V909 PERFECT LOGIC (No Skip, Always Best)
+V910 PERFECT EITHER/OR LOGIC
 =========================================
-- Always predicts the highest probability for Size (BIG/SMALL).
-- Always predicts the highest probability for Color (RED/GREEN/VIOLET).
-- Combines both to find the perfect Number.
-- No thresholds, no periods skipped.
+- Predicts EITHER Size OR Color, NEVER both.
+- Calculates the strength of Size vs Color and picks the most confident one.
+- If Size is stronger -> Shows only Size + Number.
+- If Color is stronger -> Shows only Color + Number.
 - Render-safe, SQLite WAL, Local Cache.
 """
 
@@ -38,12 +38,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v909_perfect.db")
+    db_path: str = os.environ.get("DB_PATH", "v910_either_or.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V909 PERFECT"
+    bot_name: str = "V910 FINAL"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -74,18 +74,18 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
     
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v909.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v910.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v909")
+log = logging.getLogger("v910")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 async def health_check(request):
-    return web.Response(text="V909 Bot is Running!")
+    return web.Response(text="V910 Bot is Running!")
 
 async def start_web_server():
     app = web.Application()
@@ -197,25 +197,6 @@ def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> fl
             repeats += 1
             if repeats >= 2: break
     return min(0.45, repeats * 0.14)
-
-def signal_strength(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8: return 0.2
-    sizes = [x["size"] for x in history]
-    regime = detect_regime(sizes)
-    run = trailing_run(sizes)
-    alt = alternating_score(sizes, 12)
-    bp = block_pattern(sizes, 10)
-    ratio = ratio_big(sizes, 20)
-
-    s = 0.0
-    if regime == "TRAP": s += 0.35
-    if regime == "TREND": s += 0.25
-    if regime == "ALTERNATING": s += 0.30
-    if bp: s += 0.20
-    if run >= 3: s += 0.25
-    if abs(ratio - 0.5) > 0.18: s += 0.15
-    if alt >= 0.6: s += 0.15
-    return min(1.0, s)
 
 # ============================================================
 # STATE & CACHE
@@ -464,34 +445,39 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     history = STATE.history[-2000:]
     sizes = [x["size"] for x in history]
     
-    # --- 1. Size Analysis (Highest chance) ---
+    # --- 1. Size Analysis ---
     p_big = ensemble_probability(history)["p_big"]
     p_small = 1.0 - p_big
+    size_pred = "BIG" if p_big >= 0.5 else "SMALL"
+    size_conf = max(p_big, p_small)
     
-    if p_big >= p_small:
-        size_pred = "BIG"
-        size_conf = p_big
-    else:
-        size_pred = "SMALL"
-        size_conf = p_small
-        
-    # --- 2. Color Analysis (Highest chance) ---
+    # --- 2. Color Analysis ---
     color_probs = calculate_color_probs(history)
     best_color = max(color_probs, key=color_probs.get)
     color_conf = color_probs[best_color]
 
-    # --- 3. Filter Valid Numbers (Intersection) ---
-    valid_nums = []
-    for n in range(10):
-        n_size = "BIG" if n >= 5 else "SMALL"
-        if n_size == size_pred and best_color in get_num_colors_list(n):
-            valid_nums.append(n)
+    # --- 3. Compare Strengths (Delta) ---
+    # Size baseline is 50%, Color baseline is 33.3%
+    size_strength = size_conf - 0.50
+    color_strength = color_conf - 0.3333
 
-    # --- 4. Pick Best Number ---
+    valid_nums = []
+    
+    # We ONLY predict one of them. The one with higher strength.
+    if size_strength >= color_strength:
+        final_size = size_pred
+        final_color = "" # Empty color
+        valid_nums = [n for n in range(10) if ("BIG" if n >= 5 else "SMALL") == final_size]
+    else:
+        final_size = "" # Empty size
+        final_color = best_color
+        valid_nums = [n for n in range(10) if final_color in get_num_colors_list(n)]
+
+    # --- 4. Pick Number ---
     best_num = pick_best_number(valid_nums, history)
 
     # Confidence & Stake (Dynamic)
-    combined_conf = (size_conf + color_conf) / 2
+    combined_conf = max(size_conf, color_conf)
     if combined_conf > 0.65:
         confidence, stake = 75, "1x"
     elif combined_conf > 0.55:
@@ -503,9 +489,9 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     
     return {
         "issue": issue, 
-        "size": size_pred, 
+        "size": final_size, 
         "num": best_num, 
-        "color": best_color,
+        "color": final_color,
         "p_big": round(p_big, 4), 
         "size_conf": round(size_conf, 4),
         "color_conf": round(color_conf, 4),
@@ -515,7 +501,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
         "mode": "NORMAL", 
         "regime": detect_regime(sizes), 
         "logic": "Best Analysis", 
-        "sigs": [{"name": "Smart Logic", "dir": 1 if size_pred == "BIG" else 0}],
+        "sigs": [{"name": "Smart Logic", "dir": 1 if (final_size == "BIG" or best_num>=5) else 0}],
         "stake": stake, 
         "details": {"loss_streak": STATE.loss_streak}
     }
@@ -591,11 +577,19 @@ def format_prediction(p, recent_rows):
     recent_text = "".join(f"➜ <code>{h(r[0][-4:])}</code> {h(r[1])} {h(r[2])} → <b>{h(r[3])}</b>\n" for r in recent_rows[-12:])
     stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
 
+    # Dynamic Format: Either Size OR Color
+    info_lines = []
+    if p.get('size'):
+        info_lines.append(f"📊 <b>Size</b>: <b>{h(p['size'])}</b> ({p['size_conf']*100:.1f}%)")
+    if p.get('color'):
+        info_lines.append(f"🎨 <b>Color</b>: <b>{h(p['color'])}</b> ({p['color_conf']*100:.1f}%)")
+    
+    info_str = "\n".join(info_lines)
+
     return f"""
 📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
 🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
-📊 <b>Size</b>: <b>{h(p['size'])}</b> ({p['size_conf']*100:.1f}%)
-🎨 <b>Color</b>: <b>{h(p['color'])}</b> ({p['color_conf']*100:.1f}%)
+{info_str}
 
 🧠 <b>Mode</b>: <b>{h(p['mode'])}</b>
 💰 <b>Risk Stake</b>: <b>{stake_emoji}</b>
@@ -607,7 +601,11 @@ def format_prediction(p, recent_rows):
 """
 
 def format_result(res):
-    pred_str = f"{res['size']} ({res['color']}) Num {res['num']}"
+    pred_str = ""
+    if res['size']: pred_str += f"{res['size']} "
+    if res['color']: pred_str += f"({res['color']}) "
+    pred_str += f"Num {res['num']}"
+    
     return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'][-4:])}</code>\nPred: {h(pred_str)}\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
 
 async def send_msg(app, text, retries=3):
