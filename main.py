@@ -1,11 +1,10 @@
 """
-V912 FINAL CLEAN (Smart Recent Outcomes + Either Size/Color)
+V913 PERFECT BALANCE (Size Priority + Clean Recent Outcomes)
 ============================================================
-- Recent Outcomes now reflects exactly what was predicted (Size or Color).
+- Fixed the math bug where Color was always winning over Size.
+- Now compares raw Size % vs Color % (Size will win more often).
+- Recent Outcomes shows exactly what was predicted (Size or Color).
 - Clean formatting for Prediction and Result messages.
-- Advanced Color Analysis (Streak Break + Regress to Mean).
-- Either predicts Size OR Color (The strongest signal).
-- Render-safe, SQLite WAL, Local Cache.
 """
 
 import asyncio
@@ -38,12 +37,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v912_final.db")
+    db_path: str = os.environ.get("DB_PATH", "v913_balance.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 30.0
-    bot_name: str = "V912 ULTIMATE"
+    bot_name: str = "V913 BALANCE"
     min_history: int = 50
 
     def parse_chat_id(self):
@@ -74,18 +73,18 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
     
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v912.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v913.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("v912")
+log = logging.getLogger("v913")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
 
 async def health_check(request):
-    return web.Response(text="V912 Bot is Running!")
+    return web.Response(text="V913 Bot is Running!")
 
 async def start_web_server():
     app = web.Application()
@@ -316,7 +315,6 @@ class Storage:
             for x in STATE.history[-limit:]:
                 sz = "BIG" if x["size"] == 1 else "SMALL"
                 col = get_color_from_num(x["num"])
-                # Mark as PAST so we know it wasn't a real prediction
                 fallback.append((x["issue"], sz, col, "PAST"))
             return fallback
             
@@ -476,21 +474,24 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
     history = STATE.history[-2000:]
     sizes = [x["size"] for x in history]
     
+    # 1. Analyze Size
     p_big = ensemble_probability(history)["p_big"]
     p_small = 1.0 - p_big
     size_pred = "BIG" if p_big >= 0.5 else "SMALL"
     size_conf = max(p_big, p_small)
     
+    # 2. Analyze Color
     color_probs = calculate_color_probs(history)
     best_color = max(color_probs, key=color_probs.get)
     color_conf = color_probs[best_color]
 
-    size_strength = size_conf - 0.50
-    color_strength = color_conf - 0.3333
-
+    # 3. Choose the BEST (Highest raw confidence)
+    # Since size has 2 options (50%) and color has 3 (33%), size_conf will usually be higher.
+    # We only pick Color if its confidence is strictly higher.
+    
     valid_nums = []
     
-    if size_strength >= color_strength:
+    if size_conf >= color_conf:
         final_size = size_pred
         final_color = "" 
         valid_nums = [n for n in range(10) if ("BIG" if n >= 5 else "SMALL") == final_size]
@@ -501,6 +502,7 @@ def generate_prediction() -> Optional[Dict[str, Any]]:
 
     best_num = pick_best_number(valid_nums, history)
 
+    # Confidence & Stake
     combined_conf = max(size_conf, color_conf)
     if combined_conf > 0.65:
         confidence, stake = 75, "1x"
@@ -603,9 +605,9 @@ def format_prediction(p, recent_rows):
         issue, p_size, p_color, status = r
         
         # Display ONLY what was predicted
-        if p_size:
+        if p_size and p_size != "":
             recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> <b>{h(p_size)}</b> → <b>{h(status)}</b>")
-        elif p_color:
+        elif p_color and p_color != "":
             recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> <b>{h(p_color)}</b> → <b>{h(status)}</b>")
         else:
             recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> <b>{h(status)}</b>")
@@ -614,9 +616,9 @@ def format_prediction(p, recent_rows):
     stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
 
     info_lines = []
-    if p.get('size'):
+    if p.get('size') and p.get('size') != "":
         info_lines.append(f"📊 <b>Size</b>: <b>{h(p['size'])}</b> ({p['size_conf']*100:.1f}%)")
-    if p.get('color'):
+    if p.get('color') and p.get('color') != "":
         info_lines.append(f"🎨 <b>Color</b>: <b>{h(p['color'])}</b> ({p['color_conf']*100:.1f}%)")
     
     info_str = "\n".join(info_lines)
@@ -636,10 +638,9 @@ def format_prediction(p, recent_rows):
 """
 
 def format_result(res):
-    # Clean result display
-    if res['size']: 
+    if res['size'] and res['size'] != "": 
         pred_str = f"{res['size']} {res['num']}"
-    elif res['color']: 
+    elif res['color'] and res['color'] != "": 
         pred_str = f"{res['color']} {res['num']}"
     else:
         pred_str = f"Num {res['num']}"
