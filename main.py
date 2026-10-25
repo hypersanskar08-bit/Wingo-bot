@@ -1,116 +1,50 @@
 """
-V916 LIVE TUNING DEEP PREDICTOR
+V916 REAL STATE-BASED PREDICTOR
 ================================
-- Pattern tracking: 5..12
-- Deep size + color analysis
-- Adaptive live tuning after each result
-- Winner selected among: BIG / SMALL / RED / GREEN
-- Render-safe + Telegram-safe
+- Exact suffix matching on windows 5..12
+- Separate size and color transition analysis
+- Regime detection
+- Anti-repeat penalty
+- Winner selection among BIG / SMALL / RED / GREEN
+- Live tuning with observed result feedback
 """
 
 import asyncio
 import gc
-import html
 import json
-import logging
 import os
 import random
 import sqlite3
 import time
-from collections import Counter
+from collections import defaultdict, Counter
 from dataclasses import dataclass
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-import aiohttp
-from aiohttp import web
-from telegram.ext import Application
-
+from typing import List, Dict, Any, Optional
 
 # ============================================================
 # CONFIG
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM"
-    chat_id_raw: str = "1264164655"
-    source_api_urls: str = os.environ.get(
-        "API_URLS",
+    tg_token: str = "8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM"
+    tg_chat: str = "1264164655"
+    api_url: str = os.environ.get(
+        "API_URL",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v916_live_tuning.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_state_predictor.db")
     cache_file: str = "history_cache.json"
-    log_dir: str = "logs"
     fetch_every: float = 1.0
-    request_timeout: float = 30.0
-    bot_name: str = "V916 LIVE TUNING"
+    timeout: float = 25.0
     min_history: int = 50
 
-    def parse_chat_id(self):
-        raw = self.chat_id_raw.strip()
-        return int(raw) if raw.lstrip("-").isdigit() else raw
-
-    def api_urls(self) -> List[str]:
-        urls = [u.strip() for u in self.source_api_urls.split(",") if u.strip()]
-        return urls if urls else [
-            "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
-        ]
-
-    def validate(self):
-        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
-
-
 CFG = Config()
-
-
-# ============================================================
-# LOGGING + HEALTH
-# ============================================================
-def setup_logging():
-    Path(CFG.log_dir).mkdir(parents=True, exist_ok=True)
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
-
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_live_tuning.log", maxBytes=1_000_000, backupCount=2)
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-
-
-setup_logging()
-log = logging.getLogger("v916")
-
-
-def h(x: Any) -> str:
-    return html.escape(str(x))
-
-
-async def health_check(request):
-    return web.Response(text="V916 Live Tuning Predictor is Running!")
-
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"Web server started on port {port}")
-
 
 # ============================================================
 # HELPERS
 # ============================================================
-def clamp(v: float, low: float, high: float) -> float:
-    return max(low, min(high, v))
-
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 def safe_int(x, default=0):
     try:
@@ -118,94 +52,81 @@ def safe_int(x, default=0):
     except Exception:
         return default
 
-
-def normalize_issue(value: Any) -> Optional[int]:
-    if value is None:
+def normalize_issue(x):
+    if x is None:
         return None
-    if isinstance(value, str):
-        value = value.strip()
-        if value == "":
+    if isinstance(x, str):
+        x = x.strip()
+        if not x:
             return None
-        if value.isdigit():
-            return int(value)
-        digits = "".join(ch for ch in value if ch.isdigit())
+        if x.isdigit():
+            return int(x)
+        digits = "".join(ch for ch in x if ch.isdigit())
         if digits:
             return int(digits)
     try:
-        return int(value)
+        return int(x)
     except Exception:
         return None
 
-
-def get_color_from_num(num: int) -> str:
+def get_color(num):
     if num in (0, 2, 4, 6, 8):
         return "RED"
     if num in (1, 3, 5, 7, 9):
         return "GREEN"
     return "UNKNOWN"
 
+def size_of_num(num):
+    return 1 if num >= 5 else 0
 
 # ============================================================
-# PATTERN METRICS
+# PATTERN MATH
 # ============================================================
-def trailing_run(values: List[int], target: Optional[int] = None) -> int:
-    if not values:
+def trailing_run(seq: List[int]):
+    if not seq:
         return 0
-    last = values[-1] if target is None else target
-    run = 1
-    for i in range(len(values) - 2, -1, -1):
-        if values[i] == last:
-            run += 1
+    last = seq[-1]
+    c = 1
+    for i in range(len(seq)-2, -1, -1):
+        if seq[i] == last:
+            c += 1
         else:
             break
-    return run
+    return c
 
-
-def ratio_big(values: List[int], window: int = 20) -> float:
-    if not values:
+def ratio_big(seq: List[int], window=20):
+    if not seq:
         return 0.5
-    arr = values[-window:]
+    arr = seq[-window:]
     return sum(arr) / len(arr)
 
-
-def alternating_score(values: List[int], window: int = 12) -> float:
-    if len(values) < 2:
+def alternation(seq: List[int], window=12):
+    if len(seq) < 2:
         return 0.0
-    arr = values[-window:]
+    arr = seq[-window:]
     changes = 0
     for i in range(1, len(arr)):
-        if arr[i] != arr[i - 1]:
+        if arr[i] != arr[i-1]:
             changes += 1
-    return changes / max(1, len(arr) - 1)
+    return changes / max(1, len(arr)-1)
 
-
-def block_pattern(values: List[int], window: int = 10) -> bool:
-    if len(values) < 4:
+def block_pattern(seq: List[int], window=10):
+    if len(seq) < 4:
         return False
-    arr = values[-window:]
-    for i in range(len(arr) - 3):
-        a, b, c, d = arr[i:i + 4]
+    arr = seq[-window:]
+    for i in range(len(arr)-3):
+        a, b, c, d = arr[i:i+4]
         if a == b and c == d and a != c:
             return True
     return False
 
-
-def volatility(values: List[int], window: int = 20) -> float:
-    if len(values) < 2:
-        return 0.0
-    arr = values[-window:]
-    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
-    return sum(diffs) / max(1, len(diffs))
-
-
-def detect_regime(sizes: List[int]) -> str:
-    if len(sizes) < 8:
+def detect_regime(seq: List[int]):
+    if len(seq) < 8:
         return "COLD"
-
-    run = trailing_run(sizes)
-    alt = alternating_score(sizes, 10)
-    bp = block_pattern(sizes, 10)
-    ratio = ratio_big(sizes, 10)
+    run = trailing_run(seq)
+    alt = alternation(seq, 10)
+    bp = block_pattern(seq, 10)
+    ratio = ratio_big(seq, 10)
 
     if alt >= 0.65:
         return "ALTERNATING"
@@ -219,189 +140,77 @@ def detect_regime(sizes: List[int]) -> str:
         return "CHOPPY"
     return "CYCLE"
 
-
-def stale_pattern_penalty(history: List[Dict[str, Any]], window: int = 12) -> float:
-    if len(history) < window + 4:
-        return 0.0
-    current = tuple(x["size"] for x in history[-window:])
-    repeats = 0
-    for i in range(len(history) - window - 1, 0, -1):
-        prev = tuple(x["size"] for x in history[i:i + window])
-        if prev == current:
-            repeats += 1
-            if repeats >= 2:
-                break
-    return min(0.45, repeats * 0.14)
-
-
-def signal_strength(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8:
-        return 0.2
-
-    sizes = [x["size"] for x in history]
-    regime = detect_regime(sizes)
-    run = trailing_run(sizes)
-    alt = alternating_score(sizes, 12)
-    bp = block_pattern(sizes, 10)
-    ratio = ratio_big(sizes, 20)
-
-    s = 0.0
-    if regime == "TRAP":
-        s += 0.35
-    if regime == "TREND":
-        s += 0.25
-    if regime == "ALTERNATING":
-        s += 0.30
-    if bp:
-        s += 0.20
-    if run >= 3:
-        s += 0.25
-    if abs(ratio - 0.5) > 0.18:
-        s += 0.15
-    if alt >= 0.6:
-        s += 0.15
-    return min(1.0, s)
-
-
-def detect_trend_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(history) < 20:
-        return {"direction": "NONE", "confidence": 0.0, "recent_ratio": 0.5, "prev_ratio": 0.5}
-
-    recent = [x["size"] for x in history[-12:]]
-    prev = [x["size"] for x in history[-24:-12]]
-
-    recent_ratio = ratio_big(recent, 12)
-    prev_ratio = ratio_big(prev, 12)
-    diff = recent_ratio - prev_ratio
-
-    if diff > 0.22:
-        direction = "SHIFT_TO_BIG"
-    elif diff < -0.22:
-        direction = "SHIFT_TO_SMALL"
-    else:
-        direction = "NONE"
-
-    confidence = clamp(abs(diff) * 2.5, 0.0, 1.0)
-    return {
-        "direction": direction,
-        "confidence": confidence,
-        "recent_ratio": recent_ratio,
-        "prev_ratio": prev_ratio,
-    }
-
-
-# ============================================================
-# LIVE TUNING WEIGHTS
-# ============================================================
-class LiveWeights:
-    def __init__(self):
-        self.size = {
-            "Exact": 1.00,
-            "Trend": 1.00,
-            "Alternation": 1.00,
-            "Block": 1.00,
-            "Run": 1.00,
-            "Volatility": 1.00,
-            "Bias": 1.00,
-            "Parity": 1.00,
-            "Similarity": 1.00,
-        }
-        self.color = {
-            "Freq": 1.00,
-            "Streak": 1.00,
-            "Similarity": 1.00,
-            "ShiftBias": 1.00,
-        }
-        self.regime = {
-            "TREND": {"BIG": 1.00, "SMALL": 1.00},
-            "TRAP": {"BIG": 1.00, "SMALL": 1.00},
-            "ALTERNATING": {"RED": 1.00, "GREEN": 1.00},
-            "BLOCK": {"BIG": 1.00, "SMALL": 1.00},
-            "COLD": {"BIG": 1.00, "SMALL": 1.00},
-            "CHOPPY": {"RED": 1.00, "GREEN": 1.00},
-            "CYCLE": {"BIG": 1.00, "SMALL": 1.00},
-        }
-
-    def boost(self, key: str, amount: float = 0.08):
-        self.size[key] = clamp(self.size.get(key, 1.0) + amount, 0.3, 3.0)
-
-    def boost_color(self, key: str, amount: float = 0.08):
-        self.color[key] = clamp(self.color.get(key, 1.0) + amount, 0.3, 3.0)
-
-    def decayed(self, key: str, amount: float = 0.05):
-        self.size[key] = clamp(self.size.get(key, 1.0) - amount, 0.3, 3.0)
-
-    def decayed_color(self, key: str, amount: float = 0.05):
-        self.color[key] = clamp(self.color.get(key, 1.0) - amount, 0.3, 3.0)
-
-    def regime_boost(self, regime: str, winner: str, amount: float = 0.10):
-        if regime not in self.regime:
-            self.regime[regime] = {"BIG": 1.0, "SMALL": 1.0, "RED": 1.0, "GREEN": 1.0}
-        if winner in self.regime[regime]:
-            self.regime[regime][winner] = clamp(self.regime[regime][winner] + amount, 0.3, 3.0)
-
-    def regime_decay(self, regime: str, winner: str, amount: float = 0.08):
-        if regime not in self.regime:
-            self.regime[regime] = {"BIG": 1.0, "SMALL": 1.0, "RED": 1.0, "GREEN": 1.0}
-        if winner in self.regime[regime]:
-            self.regime[regime][winner] = clamp(self.regime[regime][winner] - amount, 0.3, 3.0)
-
-
 # ============================================================
 # STATE
 # ============================================================
 class BotState:
     def __init__(self):
         self.history: List[Dict[str, Any]] = []
-        self.loss_streak = 0
-        self.win_streak = 0
-        self.weights = LiveWeights()
-        self.regime_stats: Dict[str, Dict[str, int]] = {}
-        self.last_predicted_winner: Optional[str] = None
+        self.weights = {
+            "size_exact": 1.0,
+            "size_trend": 1.0,
+            "size_alt": 1.0,
+            "size_trap": 1.0,
+            "size_run": 1.0,
+            "size_bias": 1.0,
+            "color_freq": 1.0,
+            "color_streak": 1.0,
+            "color_shift": 1.0,
+            "anti_repeat": 1.0,
+        }
+        self.last_predicted = None
 
     def save_cache(self):
         try:
             with open(CFG.cache_file, "w", encoding="utf-8") as f:
                 json.dump(self.history[-2000:], f)
-        except Exception as e:
-            log.warning(f"Cache save failed: {e}")
+        except Exception:
+            pass
 
     def load_cache(self):
         try:
             if os.path.exists(CFG.cache_file):
                 with open(CFG.cache_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if isinstance(data, list) and data:
+                    if isinstance(data, list):
                         self.history = data
-                        log.info(f"Loaded {len(self.history)} records from cache.")
         except Exception:
             pass
 
-
 STATE = BotState()
 
-
 # ============================================================
-# STORAGE
+# SQLITE STORAGE
 # ============================================================
 class Storage:
-    def __init__(self, path: str):
-        self.path = path
-        self._init_db()
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.init_db()
 
-    def _conn(self):
-        c = sqlite3.connect(self.path, timeout=20)
+    def conn(self):
+        c = sqlite3.connect(self.db_path, timeout=20)
         c.execute("PRAGMA journal_mode=WAL")
         return c
 
-    def _init_db(self):
-        with self._conn() as c:
+    def init_db(self):
+        with self.conn() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS predictions (
-                    issue TEXT PRIMARY KEY, size TEXT, num INTEGER, color TEXT, status TEXT DEFAULT 'PENDING',
-                    actual_num INTEGER, actual_size TEXT, actual_color TEXT, mode TEXT, logic TEXT, sigs TEXT,
-                    raw_conf INTEGER, regime TEXT, details TEXT, p_big REAL, calibrated_conf INTEGER,
-                    consensus REAL, stake TEXT, created_at REAL
+                    issue TEXT PRIMARY KEY,
+                    size TEXT,
+                    num INTEGER,
+                    color TEXT,
+                    status TEXT DEFAULT 'PENDING',
+                    actual_num INTEGER,
+                    actual_size TEXT,
+                    actual_color TEXT,
+                    mode TEXT,
+                    logic TEXT,
+                    sigs TEXT,
+                    raw_conf INTEGER,
+                    regime TEXT,
+                    details TEXT,
+                    created_at REAL
                 )
             """)
             c.execute("""
@@ -424,79 +233,126 @@ class Storage:
                 )
             """)
 
-    def prediction_exists(self, issue: str) -> bool:
-        with self._conn() as c:
-            return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
-
-    def save_prediction(self, p: dict):
-        with self._conn() as c:
+    def save_prediction(self, p):
+        with self.conn() as c:
             c.execute("""
                 INSERT OR IGNORE INTO predictions
-                (issue, size, num, color, mode, logic, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (issue, size, num, color, mode, logic, sigs, raw_conf, regime, details, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                p["issue"], p["size"], p["num"], p["color"], p["mode"], p["logic"], json.dumps(p.get("sigs", [])),
-                p.get("raw_conf", 50), p.get("regime", "UNKNOWN"), json.dumps(p.get("details", {})),
-                p.get("p_big", 0.5), p.get("confidence", 50), p.get("consensus", 0.5), p.get("stake", "1x"), time.time()
+                p["issue"], p["size"], p["num"], p["color"], p["mode"], p["logic"],
+                json.dumps(p.get("sigs", [])),
+                p.get("raw_conf", 50), p.get("regime", "UNKNOWN"),
+                json.dumps(p.get("details", {})),
+                time.time()
             ))
 
-    def resolve_pending(self, history_dict: Dict[str, Dict[str, Any]]):
+    def exists(self, issue):
+        with self.conn() as c:
+            row = c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
+            return row is not None
+
+    def update_pattern_memory(self, seq: List[int], actual_size: int):
+        for w in [5, 6, 7, 8, 9, 10, 11, 12]:
+            if len(seq) < w:
+                continue
+            suffix = tuple(seq[-w:])
+            key = f"{w}:{json.dumps(list(suffix))}"
+            with self.conn() as c:
+                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+                if row is None:
+                    c.execute("INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, 0, 0, 0, ?)", (key, w, time.time()))
+                    row = (0, 0, 0)
+                b, s, total = row
+                if actual_size == 1:
+                    b += 1
+                else:
+                    s += 1
+                total += 1
+                c.execute("UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?", (b, s, total, time.time(), key))
+
+    def update_color_memory(self, colors: List[str], actual_color: str):
+        for w in [5, 6, 7, 8, 9, 10, 11, 12]:
+            if len(colors) < w:
+                continue
+            suffix = tuple(colors[-w:])
+            key = f"{w}:{json.dumps(list(suffix))}"
+            with self.conn() as c:
+                row = c.execute("SELECT red_count, green_count, total_count FROM color_stats WHERE color=?", (key,)).fetchone()
+                if row is None:
+                    c.execute("INSERT INTO color_stats (color, red_count, green_count, total_count, last_seen) VALUES (?, 0, 0, 0, ?)", (key, time.time()))
+                    row = (0, 0, 0)
+                r, g, total = row
+                if actual_color == "RED":
+                    r += 1
+                else:
+                    g += 1
+                total += 1
+                c.execute("UPDATE color_stats SET red_count=?, green_count=?, total_count=?, last_seen=? WHERE color=?", (r, g, total, time.time(), key))
+
+    def get_pattern_prob(self, seq: List[int]):
+        matches = []
+        for w in [5, 6, 7, 8, 9, 10, 11, 12]:
+            if len(seq) < w:
+                continue
+            suffix = tuple(seq[-w:])
+            key = f"{w}:{json.dumps(list(suffix))}"
+            with self.conn() as c:
+                row = c.execute("SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?", (key,)).fetchone()
+            if row is not None and row[2] > 0:
+                total = row[2]
+                p_big = row[0] / total
+                matches.append((p_big, total))
+        if not matches:
+            return 0.5
+        weighted = 0.0
+        total_count = 0
+        for p_big, total in matches:
+            weighted += p_big * total
+            total_count += total
+        return weighted / total_count if total_count else 0.5
+
+    def resolve_pending(self, history_by_issue):
         resolved = []
-        with self._conn() as c:
+        with self.conn() as c:
             rows = c.execute("""
-                SELECT issue, size, num, color, mode, sigs, raw_conf, regime, details, p_big, calibrated_conf, consensus, stake
+                SELECT issue, size, num, color, mode, sigs, raw_conf, regime, details
                 FROM predictions WHERE status='PENDING'
             """).fetchall()
-
         for row in rows:
-            issue, p_size, p_num, p_color, mode, sigs_json, raw_conf, regime, details_json, p_big, cal_conf, consensus, stake = row
-            act = history_dict.get(str(issue)) or history_dict.get(issue)
+            issue, p_size, p_num, p_color, mode, sigs_json, raw_conf, regime, details_json = row
+            act = history_by_issue.get(str(issue))
             if act is None:
                 continue
+            actual_size = "BIG" if act["size"] == 1 else "SMALL"
+            actual_color = get_color(act["num"])
+            size_match = (p_size == actual_size) if p_size else True
+            color_match = (p_color == actual_color) if p_color else True
+            win = size_match and color_match
 
-            act_size = "BIG" if act["size"] == 1 else "SMALL"
-            act_color = get_color_from_num(act["num"])
-            win_size = (p_size == act_size) if p_size else True
-            win_color = (p_color == act_color) if p_color else True
-            win = win_size and win_color
+            status = "JACK" if win and p_num == act["num"] else ("WIN" if win else "LOSS")
 
-            if win and p_num == act["num"]:
-                status = "JACK 🏆"
-            elif win:
-                status = "WIN ✅"
-            else:
-                status = "LOSS ❌"
-
-            with self._conn() as c:
+            with self.conn() as c:
                 c.execute(
                     "UPDATE predictions SET status=?, actual_num=?, actual_size=?, actual_color=? WHERE issue=?",
-                    (status, act["num"], act_size, act_color, issue)
+                    (status, act["num"], actual_size, actual_color, issue)
                 )
 
             resolved.append({
                 "issue": issue,
-                "size": p_size,
-                "num": p_num,
-                "color": p_color,
+                "pred_size": p_size,
+                "pred_color": p_color,
+                "pred_num": p_num,
                 "actual_num": act["num"],
-                "actual_size": act_size,
-                "actual_color": act_color,
-                "status": status,
-                "mode": mode,
+                "actual_size": actual_size,
+                "actual_color": actual_color,
                 "win": win,
-                "raw_conf": raw_conf,
-                "regime": regime,
-                "details": json.loads(details_json) if details_json else {},
-                "sigs": json.loads(sigs_json) if sigs_json else [],
-                "p_big": p_big if p_big is not None else 0.5,
-                "calibrated_conf": cal_conf or 50,
-                "consensus": consensus or 0.5,
-                "stake": stake or "1x"
+                "status": status,
             })
         return resolved
 
-    def recent_outcomes(self, limit: int = 12):
-        with self._conn() as c:
+    def recent(self, limit=10):
+        with self.conn() as c:
             rows = c.execute("""
                 SELECT issue, size, color, status
                 FROM predictions
@@ -506,157 +362,42 @@ class Storage:
             """, (limit,)).fetchall()
         return rows[::-1]
 
-    def update_pattern_memory(self, sizes: List[int], actual_size: int):
-        for window in [5, 6, 7, 8, 9, 10, 11, 12]:
-            if len(sizes) < window:
-                continue
-            seq = tuple(sizes[-window:])
-            key = f"{window}:{json.dumps(list(seq))}"
-            with self._conn() as c:
-                row = c.execute(
-                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
-                    (key,),
-                ).fetchone()
-                if row is None:
-                    c.execute(
-                        "INSERT INTO pattern_stats (pattern_key, window, big_count, small_count, total_count, last_seen) VALUES (?, ?, 0, 0, 0, ?)",
-                        (key, window, time.time()),
-                    )
-                    row = (0, 0, 0)
-                big_count, small_count, total_count = row
-                if actual_size == 1:
-                    big_count += 1
-                else:
-                    small_count += 1
-                total_count += 1
-                c.execute(
-                    "UPDATE pattern_stats SET big_count=?, small_count=?, total_count=?, last_seen=? WHERE pattern_key=?",
-                    (big_count, small_count, total_count, time.time(), key),
-                )
-
-    def update_color_memory(self, colors: List[str], actual_color: str):
-        for window in [5, 6, 7, 8, 9, 10, 11, 12]:
-            if len(colors) < window:
-                continue
-            seq = tuple(colors[-window:])
-            key = f"{window}:{json.dumps(list(seq))}"
-            with self._conn() as c:
-                row = c.execute(
-                    "SELECT red_count, green_count, total_count FROM color_stats WHERE color=?",
-                    (key,),
-                ).fetchone()
-                if row is None:
-                    c.execute(
-                        "INSERT INTO color_stats (color, red_count, green_count, total_count, last_seen) VALUES (?, 0, 0, 0, ?)",
-                        (key, time.time()),
-                    )
-                    row = (0, 0, 0)
-                red_count, green_count, total_count = row
-                if actual_color == "RED":
-                    red_count += 1
-                else:
-                    green_count += 1
-                total_count += 1
-                c.execute(
-                    "UPDATE color_stats SET red_count=?, green_count=?, total_count=?, last_seen=? WHERE color=?",
-                    (red_count, green_count, total_count, time.time(), key),
-                )
-
-    def get_exact_pattern_probability(self, sizes: List[int]) -> float:
-        matches = []
-        for window in [5, 6, 7, 8, 9, 10, 11, 12]:
-            if len(sizes) < window:
-                continue
-            seq = tuple(sizes[-window:])
-            key = f"{window}:{json.dumps(list(seq))}"
-            with self._conn() as c:
-                row = c.execute(
-                    "SELECT big_count, small_count, total_count FROM pattern_stats WHERE pattern_key=?",
-                    (key,),
-                ).fetchone()
-            if row and row[2] > 0:
-                matches.append({"p_big": row[0] / row[2], "count": int(row[2])})
-        if not matches:
-            return 0.5
-        total_count = sum(m["count"] for m in matches)
-        return sum(m["p_big"] * m["count"] for m in matches) / total_count
-
 
 STORE = Storage(CFG.db_path)
 
-
 # ============================================================
-# ANALYSIS MODELS
+# STRONG STATE SCORING
 # ============================================================
-def model_trend(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    run = trailing_run(sizes)
-    if run >= 5:
-        return 1.0 if sizes[-1] == 1 else 0.0
-    if run >= 3:
-        return 1.0 if sizes[-1] == 0 else 0.0
-    return 0.5
+def size_score(seq: List[int], regime: str):
+    # exact suffix memory
+    exact = STORE.get_pattern_prob(seq)
+    trend_val = 1.0 if trailing_run(seq) >= 4 else 0.0
+    alt_val = alternation(seq, 12)
+    trap_bias = 0.0
+    if regime == "TRAP":
+        trap_bias = 1.0 if trailing_run(seq) >= 2 and seq[-1] == 0 else 0.0
 
+    p_big = exact
+    # emphasis on actual trend and reversal
+    if regime == "TREND":
+        p_big = p_big * 1.3 + 0.2 if seq[-1] == 1 else p_big * 0.7
+    if regime == "TRAP":
+        p_big = p_big * 0.7 + (0.25 if seq[-1] == 0 else 0.75)
+    if regime == "ALTERNATING":
+        p_big = 1.0 - seq[-1]
+    if block_pattern(seq, 10):
+        p_big = 1.0 - seq[-1]
 
-def model_alternation(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    alt = alternating_score(sizes, 12)
-    if alt >= 0.6:
-        return 1.0 - sizes[-1]
-    return 0.5
+    return clamp(p_big, 0.05, 0.95)
 
+def color_score(seq_nums: List[int], regime: str):
+    colors = [get_color(n) for n in seq_nums]
+    red_count = colors.count("RED")
+    green_count = colors.count("GREEN")
+    red_ratio = red_count / max(1, len(colors))
+    green_ratio = green_count / max(1, len(colors))
 
-def model_block(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    if block_pattern(sizes, 10):
-        return 1.0 - sizes[-1]
-    return 0.5
-
-
-def model_run(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    last = sizes[-1]
-    run = trailing_run(sizes)
-    if run >= 3:
-        return 1.0 if last == 1 else 0.0
-    return 0.5
-
-
-def model_volatility(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    return 1.0 - sizes[-1] if volatility(sizes, 20) > 0.5 else 0.5
-
-
-def model_bias(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    ratio = ratio_big(sizes, 20)
-    if abs(ratio - 0.5) > 0.18:
-        return 1.0 if ratio >= 0.5 else 0.0
-    return 0.5
-
-
-def model_parity(history: List[Dict[str, Any]]) -> float:
-    nums = [x["num"] for x in history[-30:]]
-    if not nums:
-        return 0.5
-    even = sum(1 for n in nums if n % 2 == 0)
-    odd = sum(1 for n in nums if n % 2 != 0)
-    return 1.0 if even > odd else 0.0
-
-
-def color_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
-    colors = [get_color_from_num(x["num"]) for x in history[-50:]]
-    if not colors:
-        return {"RED": 0.5, "GREEN": 0.5}
-    red = colors.count("RED") / len(colors)
-    green = colors.count("GREEN") / len(colors)
-    return {"RED": red, "GREEN": green}
-
-
-def color_streak_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
-    colors = [get_color_from_num(x["num"]) for x in history[-30:]]
-    if not colors:
-        return {"RED": 0.5, "GREEN": 0.5}
+    # streak detection
     last = colors[-1]
     streak = 1
     for c in reversed(colors[:-1]):
@@ -665,339 +406,197 @@ def color_streak_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
         else:
             break
 
-    red_prob = colors.count("RED") / len(colors)
-    green_prob = colors.count("GREEN") / len(colors)
-
     if streak >= 3:
         if last == "RED":
-            return {"RED": 0.7, "GREEN": 0.3}
-        return {"RED": 0.3, "GREEN": 0.7}
+            red_ratio += 0.18
+        else:
+            green_ratio += 0.18
 
-    return {"RED": red_prob, "GREEN": green_prob}
+    # anti-repeat on same color
+    if len(colors) >= 3:
+        if colors[-1] == colors[-2] == colors[-3]:
+            if last == "RED":
+                green_ratio += 0.18
+            else:
+                red_ratio += 0.18
 
-
-def size_sequence_similarity(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 12:
-        return 0.5
-
-    sizes = [x["size"] for x in history]
-    windows = [5, 6, 7, 8, 9, 10, 11, 12]
-    scores = []
-    for w in windows:
-        if len(sizes) < w:
-            continue
-        seq = tuple(sizes[-w:])
-        for i in range(len(sizes) - w - 1, max(0, len(sizes) - w - 20), -1):
-            if tuple(sizes[i:i + w]) == seq:
-                scores.append(1.0 / (len(sizes) - i))
-    if not scores:
-        return 0.5
-    return sum(scores) / len(scores)
-
-
-def color_sequence_similarity(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 12:
-        return 0.5
-
-    colors = [get_color_from_num(x["num"]) for x in history]
-    windows = [5, 6, 7, 8, 9, 10, 11, 12]
-    scores = []
-    for w in windows:
-        if len(colors) < w:
-            continue
-        seq = tuple(colors[-w:])
-        for i in range(len(colors) - w - 1, max(0, len(colors) - w - 20), -1):
-            if tuple(colors[i:i + w]) == seq:
-                scores.append(1.0 / (len(colors) - i))
-    if not scores:
-        return 0.5
-    return sum(scores) / len(scores)
-
-
-def apply_live_size_weights(base: Dict[str, float]) -> Dict[str, float]:
-    out = {}
-    for k, v in base.items():
-        out[k] = v * STATE.weights.size.get(k, 1.0)
-    return out
-
-
-def apply_live_color_weights(base: Dict[str, float]) -> Dict[str, float]:
-    out = {}
-    for k, v in base.items():
-        out[k] = v * STATE.weights.color.get(k, 1.0)
-    return out
-
-
-def ensemble_size_probability(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    exact = STORE.get_exact_pattern_probability(sizes)
-    shift = detect_trend_shift(history)
-    seq_sim = size_sequence_similarity(history)
-
-    base = {
-        "Exact": exact,
-        "Trend": model_trend(history),
-        "Alternation": model_alternation(history),
-        "Block": model_block(history),
-        "Run": model_run(history),
-        "Volatility": model_volatility(history),
-        "Bias": model_bias(history),
-        "Parity": model_parity(history),
-        "Similarity": seq_sim,
-    }
-
-    weights = {
-        "Exact": 0.28,
-        "Trend": 0.12,
-        "Alternation": 0.10,
-        "Block": 0.10,
-        "Run": 0.10,
-        "Volatility": 0.08,
-        "Bias": 0.08,
-        "Parity": 0.06,
-        "Similarity": 0.08,
-    }
-
-    regime = detect_regime(sizes)
-    if regime == "TRAP":
-        weights["Alternation"] += 0.08
-        weights["Run"] += 0.08
-    if regime == "TREND":
-        weights["Trend"] += 0.12
-    if regime == "ALTERNATING":
-        weights["Alternation"] += 0.12
-    if shift["direction"] == "SHIFT_TO_BIG":
-        weights["Trend"] += 0.10
-        weights["Bias"] += 0.05
-    elif shift["direction"] == "SHIFT_TO_SMALL":
-        weights["Trend"] -= 0.08
-        weights["Bias"] += 0.05
-
-    live = apply_live_size_weights(weights)
-    total = sum(live.values())
-    weighted = 0.0
-    for name, value in base.items():
-        weighted += value * live.get(name, 1.0)
-
-    final = weighted / total
-    if shift["direction"] == "SHIFT_TO_BIG":
-        final = clamp(final + 0.12, 0.05, 0.95)
-    elif shift["direction"] == "SHIFT_TO_SMALL":
-        final = clamp(final - 0.12, 0.05, 0.95)
-
-    stale = stale_pattern_penalty(history, 12)
-    if stale > 0.12:
-        final = clamp(final * 0.92, 0.05, 0.95)
-
-    return clamp(final, 0.05, 0.95)
-
-
-def ensemble_color_probability(history: List[Dict[str, Any]]) -> Dict[str, float]:
-    col_prob = color_probability(history)
-    streak_prob = color_streak_probability(history)
-    sim = color_sequence_similarity(history)
-    shift = detect_trend_shift(history)
-
-    red = (col_prob["RED"] * 0.5) + (streak_prob["RED"] * 0.3) + (sim * 0.2)
-    green = (col_prob["GREEN"] * 0.5) + (streak_prob["GREEN"] * 0.3) + ((1.0 - sim) * 0.2)
-
-    if shift["direction"] == "SHIFT_TO_BIG":
-        red = red + 0.05
-    elif shift["direction"] == "SHIFT_TO_SMALL":
-        green = green + 0.05
-
-    total = red + green
-    if total == 0:
-        return {"RED": 0.5, "GREEN": 0.5}
-    return {"RED": red / total, "GREEN": green / total}
-
-
-def choose_best_number(valid_nums: List[int], history: List[Dict[str, Any]]) -> int:
-    if not valid_nums:
-        return random.randint(0, 9)
-
-    nums = [x["num"] for x in history[-250:]]
-    freq = Counter(nums)
-    score = {}
-
-    for n in valid_nums:
-        s = freq.get(n, 0) * 3.0
-        if nums and nums[-1] == n:
-            s *= 0.7
-        if n in (1, 3, 7, 9):
-            s += 1.2
-        if n in (2, 4, 6, 8):
-            s += 1.0
-        if n % 2 == 0 and get_color_from_num(n) == "RED":
-            s += 1.2
-        if n % 2 != 0 and get_color_from_num(n) == "GREEN":
-            s += 1.2
-        score[n] = s
-
-    return max(score, key=score.get)
-
-
-def score_winner(p_big: float, p_small: float, p_red: float, p_green: float) -> Dict[str, float]:
     return {
+        "RED": clamp(red_ratio, 0.05, 0.95),
+        "GREEN": clamp(green_ratio, 0.05, 0.95)
+    }
+
+def anti_repeat_penalty(seq_sizes: List[int], seq_nums: List[int]):
+    # if same side has repeated too much, expect reversal
+    last = seq_sizes[-1]
+    run = trailing_run(seq_sizes)
+    if run >= 4:
+        # strong anti-repeat on same side
+        return {"BIG": 0.25, "SMALL": 0.25}
+    return {"BIG": 0.0, "SMALL": 0.0}
+
+def pick_best_winner(history: List[Dict[str, Any]]):
+    seq_sizes = [x["size"] for x in history]
+    seq_nums = [x["num"] for x in history]
+    regime = detect_regime(seq_sizes)
+
+    p_big = size_score(seq_sizes, regime)
+    p_small = 1.0 - p_big
+
+    color_probs = color_score(seq_nums, regime)
+    p_red = color_probs["RED"]
+    p_green = color_probs["GREEN"]
+
+    # anti-repeat: if same side is overextended, push opposite
+    arp = anti_repeat_penalty(seq_sizes, seq_nums)
+    if trailing_run(seq_sizes) >= 4:
+        if seq_sizes[-1] == 1:
+            p_small += 0.18 + arp["SMALL"]
+            p_big *= 0.8
+        else:
+            p_big += 0.18 + arp["BIG"]
+            p_small *= 0.8
+
+    # if recent regime strongly favors one side, bias it stronger
+    if regime == "TREND":
+        if seq_sizes[-1] == 1:
+            p_big = clamp(p_big + 0.12, 0.05, 0.95)
+        else:
+            p_small = clamp(p_small + 0.12, 0.05, 0.95)
+
+    if regime == "ALTERNATING":
+        p_big = 1.0 - seq_sizes[-1]
+        p_small = seq_sizes[-1]
+
+    # final candidate scores
+    candidates = {
         "BIG": p_big,
         "SMALL": p_small,
         "RED": p_red,
         "GREEN": p_green,
     }
 
+    winner = max(candidates, key=candidates.get)
+    return winner, candidates
 
-# ============================================================
-# FINAL PREDICTION
-# ============================================================
-def generate_prediction() -> Optional[Dict[str, Any]]:
+def choose_num_from_winner(winner: str, history: List[Dict[str, Any]]):
+    if winner == "BIG":
+        valid = [n for n in range(10) if n >= 5]
+    elif winner == "SMALL":
+        valid = [n for n in range(10) if n < 5]
+    elif winner == "RED":
+        valid = [n for n in range(10) if get_color(n) == "RED"]
+    else:
+        valid = [n for n in range(10) if get_color(n) == "GREEN"]
+
+    nums = [x["num"] for x in history[-200:]]
+    freq = Counter(nums)
+    score = {}
+    for n in valid:
+        s = freq.get(n, 0) * 3
+        if nums and nums[-1] == n:
+            s *= 0.7
+        if n in (1, 3, 7, 9):
+            s += 1.2
+        if n in (2, 4, 6, 8):
+            s += 1.0
+        if n % 2 == 0 and get_color(n) == "RED":
+            s += 1.2
+        if n % 2 != 0 and get_color(n) == "GREEN":
+            s += 1.2
+        score[n] = s
+
+    return max(score, key=score.get) if score else random.randint(0, 9)
+
+def generate_prediction():
     if len(STATE.history) < CFG.min_history:
-        issue = str(int(STATE.history[-1]["issue"]) + 1) if STATE.history else "1"
-        num = random.randint(0, 9)
+        n = random.randint(0, 9)
         return {
-            "issue": issue,
-            "size": "BIG" if num >= 5 else "SMALL",
-            "num": num,
+            "issue": "1",
+            "winner": "BIG" if n >= 5 else "SMALL",
+            "size": "BIG" if n >= 5 else "SMALL",
+            "num": n,
             "color": "",
-            "p_big": 0.5,
-            "size_conf": 0.5,
-            "color_conf": 0.5,
-            "confidence": 55,
             "raw_conf": 55,
-            "consensus": 0.5,
             "mode": "FALLBACK",
+            "logic": "fallback",
+            "sigs": [{"name": "fallback"}],
             "regime": "COLD",
-            "logic": "Fallback",
-            "sigs": [{"name": "Fallback", "dir": 1 if num >= 5 else 0}],
-            "stake": "0.25x",
-            "details": {"fallback": True},
+            "details": {}
         }
 
     history = STATE.history[-2000:]
-    sizes = [x["size"] for x in history]
+    winner, candidates = pick_best_winner(history)
+    num = choose_num_from_winner(winner, history)
 
-    p_big = ensemble_size_probability(history)
-    p_small = 1.0 - p_big
-    color_probs = ensemble_color_probability(history)
-    p_red = color_probs["RED"]
-    p_green = color_probs["GREEN"]
-
-    all_scores = score_winner(p_big, p_small, p_red, p_green)
-    best_choice = max(all_scores, key=all_scores.get)
-    best_conf = all_scores[best_choice]
-
-    if best_choice == "BIG":
-        final_size = "BIG"
-        final_color = ""
-        valid_nums = [n for n in range(10) if n >= 5]
-    elif best_choice == "SMALL":
-        final_size = "SMALL"
-        final_color = ""
-        valid_nums = [n for n in range(10) if n < 5]
-    elif best_choice == "RED":
-        final_size = ""
-        final_color = "RED"
-        valid_nums = [n for n in range(10) if get_color_from_num(n) == "RED"]
+    best_conf = max(candidates.values())
+    if best_conf > 0.75:
+        stake = "1x"
+    elif best_conf > 0.62:
+        stake = "0.5x"
     else:
-        final_size = ""
-        final_color = "GREEN"
-        valid_nums = [n for n in range(10) if get_color_from_num(n) == "GREEN"]
+        stake = "0.25x"
 
-    best_num = choose_best_number(valid_nums, history)
+    issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
-    if best_conf > 0.72:
-        confidence, stake = 80, "1x"
-    elif best_conf > 0.60:
-        confidence, stake = 70, "0.5x"
+    if winner == "BIG":
+        size = "BIG"
+        color = ""
+    elif winner == "SMALL":
+        size = "SMALL"
+        color = ""
+    elif winner == "RED":
+        size = ""
+        color = "RED"
     else:
-        confidence, stake = 56, "0.25x"
-
-    issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
+        size = ""
+        color = "GREEN"
 
     return {
         "issue": issue,
-        "size": final_size,
-        "num": best_num,
-        "color": final_color,
-        "winner": best_choice,
-        "p_big": round(p_big, 4),
-        "size_conf": round(max(p_big, p_small), 4),
-        "color_conf": round(max(p_red, p_green), 4),
-        "confidence": confidence,
-        "raw_conf": confidence,
-        "consensus": best_conf,
-        "mode": "LIVE-TUNING",
-        "regime": detect_regime(sizes),
-        "logic": f"Winner selected: {best_choice}",
-        "sigs": [{"name": "Adaptive Winner", "dir": 1 if best_choice in ("BIG", "RED") else 0}],
-        "stake": stake,
+        "winner": winner,
+        "size": size,
+        "num": num,
+        "color": color,
+        "raw_conf": int(best_conf * 100),
+        "mode": "STATE-BASED",
+        "logic": f"winner:{winner}; regime:{detect_regime([x['size'] for x in history])}",
+        "sigs": [{"name": "state-base", "winner": winner}],
+        "regime": detect_regime([x["size"] for x in history]),
         "details": {
-            "winner": best_choice,
-            "best_conf": best_conf,
-            "p_big": p_big,
-            "p_small": p_small,
-            "p_red": p_red,
-            "p_green": p_green,
-            "regime": detect_regime(sizes),
-            "trend_shift": detect_trend_shift(history),
-            "loss_streak": STATE.loss_streak,
-            "signal_strength": signal_strength(history),
+            "candidates": candidates,
+            "regime": detect_regime([x["size"] for x in history]),
         },
+        "stake": stake
     }
 
+# ============================================================
+# LIVE TUNING
+# ============================================================
+def learn_from_result(res):
+    if not STATE.history:
+        return
 
-# ============================================================
-# LIVE TUNING AFTER RESULT
-# ============================================================
-def learn_from_resolution(res: dict):
+    actual_size = 1 if res["actual_size"] == "BIG" else 0
+    actual_color = get_color(res["actual_num"])
+
+    # Update sequence memory
+    STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
+    STORE.update_color_memory([get_color(x["num"]) for x in STATE.history], actual_color)
+
+    # dynamic weights
     if res["win"]:
-        STATE.loss_streak = 0
-        STATE.win_streak += 1
+        STATE.weights["size_exact"] = clamp(STATE.weights["size_exact"] + 0.04, 0.3, 3.0)
+        STATE.weights["color_freq"] = clamp(STATE.weights["color_freq"] + 0.03, 0.3, 3.0)
+        STATE.weights["anti_repeat"] = clamp(STATE.weights["anti_repeat"] + 0.04, 0.3, 3.0)
     else:
-        STATE.loss_streak += 1
-        STATE.win_streak = 0
-
-    if STATE.history:
-        actual_size = 1 if res["actual_size"] == "BIG" else 0
-        actual_color = get_color_from_num(res["actual_num"])
-
-        # pattern learning
-        STORE.update_pattern_memory([x["size"] for x in STATE.history], actual_size)
-        STORE.update_color_memory([get_color_from_num(x["num"]) for x in STATE.history], actual_color)
-
-        regime = detect_regime([x["size"] for x in STATE.history])
-        predicted_winner = res.get("details", {}).get("winner") or res.get("size", "") or res.get("color", "")
-
-        if predicted_winner in ("BIG", "SMALL"):
-            if res["win"]:
-                STATE.weights.boost("Exact", 0.06)
-                STATE.weights.boost("Trend", 0.04)
-                STATE.weights.boost("Run", 0.04)
-            else:
-                STATE.weights.decayed("Exact", 0.05)
-                STATE.weights.decayed("Trend", 0.05)
-                STATE.weights.decayed("Run", 0.05)
-
-        if predicted_winner in ("RED", "GREEN"):
-            if res["win"]:
-                STATE.weights.boost_color("Freq", 0.05)
-                STATE.weights.boost_color("Streak", 0.05)
-            else:
-                STATE.weights.decayed_color("Freq", 0.06)
-                STATE.weights.decayed_color("Streak", 0.06)
-
-        if predicted_winner in ("BIG", "SMALL", "RED", "GREEN") and regime in STATE.weights.regime:
-            if res["win"]:
-                STATE.weights.regime_boost(regime, predicted_winner, 0.10)
-            else:
-                STATE.weights.regime_decay(regime, predicted_winner, 0.08)
-
-    STATE.save_cache()
-
+        STATE.weights["size_exact"] = clamp(STATE.weights["size_exact"] - 0.06, 0.3, 3.0)
+        STATE.weights["color_freq"] = clamp(STATE.weights["color_freq"] - 0.04, 0.3, 3.0)
+        STATE.weights["anti_repeat"] = clamp(STATE.weights["anti_repeat"] - 0.05, 0.3, 3.0)
 
 # ============================================================
-# API PARSING
+# PARSE HISTORY
 # ============================================================
-def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
+def parse_history_payload(payload):
     if payload is None:
         return []
 
@@ -1025,248 +624,136 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
     out = []
     seen = set()
-
     for item in items:
-        try:
-            if not isinstance(item, dict):
-                continue
+        if not isinstance(item, dict):
+            continue
+        issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
+        if issue is None:
+            issue = normalize_issue(item.get("issue"))
+        if issue is None:
+            continue
+        if str(issue) in seen:
+            continue
+        seen.add(str(issue))
 
-            issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
-            if issue is None:
-                issue = normalize_issue(item.get("issue"))
-            if issue is None:
-                continue
-
-            if str(issue) in seen:
-                continue
-            seen.add(str(issue))
-
-            num = safe_int(item.get("number", item.get("value", 0)), 0)
-            if num < 0 or num > 9:
-                continue
-
-            out.append({
-                "issue": str(issue),
-                "num": num,
-                "size": 1 if num >= 5 else 0
-            })
-        except Exception:
+        num = safe_int(item.get("number", item.get("value", 0)), 0)
+        if num < 0 or num > 9:
             continue
 
+        out.append({
+            "issue": str(issue),
+            "num": num,
+            "size": 1 if num >= 5 else 0
+        })
     out.sort(key=lambda x: int(x["issue"]))
     return out
-
 
 # ============================================================
 # FETCH DATA
 # ============================================================
-async def fetch_data(session):
-    urls = CFG.api_urls()
-    if not urls:
-        log.warning("No API_URLS configured. Waiting.")
-        return False
-
-    last_good = [x for x in STATE.history]
+async def fetch_history():
+    headers = {"User-Agent": "Mozilla/5.0"}
+    urls = [CFG.api_url]
+    last_good = list(STATE.history)
 
     for url in urls:
         try:
-            for retry in range(4):
-                try:
-                    async with session.get(
-                        url,
-                        timeout=aiohttp.ClientTimeout(total=CFG.request_timeout),
-                        headers={"User-Agent": "Mozilla/5.0"}
-                    ) as r:
-                        if r.status == 429:
-                            await asyncio.sleep((retry + 1) * 2)
-                            continue
-
-                        if r.status != 200:
-                            log.warning("HTTP %s from %s", r.status, url)
-                            break
-
-                        ctype = (r.headers.get("Content-Type") or "").lower()
-                        if "json" not in ctype:
-                            body = await r.text()
-                            log.warning("Non-JSON response from %s -> %s | sample=%r", url, ctype, body[:200])
-                            break
-
-                        payload = await r.json(content_type=None)
-                        parsed = parse_history_payload(payload)
-
-                        if parsed:
-                            STATE.history = parsed[-1000:]
-                            STATE.save_cache()
-                            log.info("Fetched %d records from %s", len(parsed), url)
-                            return True
-
-                        log.warning("Empty payload from %s", url)
-                        break
-
-                except asyncio.TimeoutError:
-                    log.warning("Timeout for %s (retry %s)", url, retry + 1)
-                    await asyncio.sleep((retry + 1) * 2)
-                    continue
-                except Exception as e:
-                    log.warning("Retry fail on %s: %s", url, e)
-                    await asyncio.sleep((retry + 1) * 2)
-                    continue
-
-        except Exception as e:
-            log.warning("Fetch exception on %s: %s", url, e)
+            async with aiohttp.ClientSession() as session:
+                for i in range(4):
+                    try:
+                        async with session.get(url, timeout=CFG.timeout, headers=headers) as r:
+                            if r.status != 200:
+                                await asyncio.sleep(1)
+                                continue
+                            payload = await r.json(content_type=None)
+                            parsed = parse_history_payload(payload)
+                            if parsed:
+                                STATE.history = parsed[-1000:]
+                                STATE.save_cache()
+                                return True
+                    except Exception:
+                        await asyncio.sleep(1)
+        except Exception:
+            pass
 
     if last_good:
         STATE.history = last_good
-        log.warning("Using last known good history because all endpoints failed.")
         return True
-
-    log.warning("All endpoints failed and no last-good history exists.")
     return False
-
-
-# ============================================================
-# FORMATTING
-# ============================================================
-def format_prediction(p, recent_rows):
-    recent_text = "".join(
-        f"➜ <code>{h(r[0][-4:])}</code> {h(r[1] or '')} {h(r[2] or '')} → <b>{h(r[3])}</b>\n"
-        for r in recent_rows[-12:]
-    )
-
-    info_lines = []
-    if p.get("size") and p.get("size") != "":
-        info_lines.append(f"📊 <b>Size</b>: <b>{h(p['size'])}</b> ({p['size_conf'] * 100:.1f}%)")
-    if p.get("color") and p.get("color") != "":
-        info_lines.append(f"🎨 <b>Color</b>: <b>{h(p['color'])}</b> ({p['color_conf'] * 100:.1f}%)")
-
-    info_str = "\n".join(info_lines) if info_lines else ""
-    stake_emoji = {"2x": "🔥 2x", "1x": "🟡 1x", "0.5x": "🛡️ 0.5x", "0.25x": "🧯 0.25x"}.get(p["stake"], "1x")
-
-    return f"""
-📌 <b>Period</b>: <code>{h(p['issue'][-4:])}</code>
-🎯 <b>Winner</b>: <b>{h(p['winner'])}</b>
-🎯 <b>Target No</b>: <code>{h(p['num'])}</code>
-{info_str}
-
-🧠 <b>Mode</b>: <b>{h(p['mode'])}</b>
-💰 <b>Risk Stake</b>: <b>{stake_emoji}</b>
-
-━━━━━━━━━━━━━━━━━━
-🕒 <b>Recent Outcomes</b>:
-{recent_text}━━━━━━━━━━━━━━━━━━
-⚡ <i>{h(CFG.bot_name)}</i>
-"""
-
-
-def format_result(res):
-    if res.get("size") and res.get("size") != "":
-        pred_str = f"{res['size']} {res['num']}"
-    elif res.get("color") and res.get("color") != "":
-        pred_str = f"{res['color']} {res['num']}"
-    else:
-        pred_str = f"{res['num']}"
-
-    return (
-        f"🎯 <b>Result</b>\n"
-        f"Period: <code>{h(res['issue'][-4:])}</code>\n"
-        f"Pred: <b>{h(pred_str)}</b>\n"
-        f"Act: {h(res['actual_size'])} {h(res['actual_num'])}\n"
-        f"<b>{h(res['status'])}</b>"
-    )
-
 
 # ============================================================
 # TELEGRAM
 # ============================================================
-async def verify_telegram(app):
+async def send_msg(bot, text, chat_id):
     try:
-        me = await app.bot.get_me()
-        log.info("Telegram verified. Bot username: %s", me.username)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
         return True
     except Exception:
-        log.exception("Telegram verification failed")
         return False
 
+def format_prediction(pred):
+    win = pred["winner"]
+    prob = pred["raw_conf"]
+    stake = pred["stake"]
+    return (
+        f"<b>Winner:</b> {win}\n"
+        f"<b>Target:</b> {pred['num']}\n"
+        f"<b>Regime:</b> {pred['regime']}\n"
+        f"<b>Confidence:</b> {prob}%\n"
+        f"<b>Stake:</b> {stake}"
+    )
 
-async def send_msg(app, text, retries=3):
-    for attempt in range(retries):
-        try:
-            await app.bot.send_message(
-                chat_id=CFG.parse_chat_id(),
-                text=text,
-                parse_mode="HTML"
-            )
-            return True
-        except Exception as e:
-            log.exception("Telegram send failed attempt %s/%s: %s", attempt + 1, retries, e)
-            await asyncio.sleep(1)
-    return False
-
+def format_result(res):
+    return (
+        f"<b>Result</b>\n"
+        f"Actual: {res['actual_size']} {res['actual_num']}\n"
+        f"State: {res['status']}"
+    )
 
 # ============================================================
-# WORKER LOOP
+# BOT LOOP
 # ============================================================
-async def worker_loop(app, session):
-    last_processed_issue = None
+async def run_bot():
+    if not CFG.tg_token or not CFG.tg_chat:
+        print("Set TG_TOKEN and TG_CHAT")
+        return
+
+    app = Application.builder().token(CFG.tg_token).build()
+    await app.initialize()
+    await app.start()
+    chat_id = int(CFG.tg_chat)
+
+    # initial load
+    STATE.load_cache()
+    if not STATE.history:
+        await fetch_history()
 
     while True:
         try:
-            if await fetch_data(session):
-                hist_dict = {str(x["issue"]): x for x in STATE.history}
-                resolved = STORE.resolve_pending(hist_dict)
+            if await fetch_history():
+                history_by_issue = {str(x["issue"]): x for x in STATE.history}
 
-                for res in resolved:
-                    learn_from_resolution(res)
-                    await send_msg(app, format_result(res))
+                # resolve pending predictions
+                pending = STORE.resolve_pending(history_by_issue)
+                for res in pending:
+                    learn_from_result(res)
+                    await send_msg(app.bot, format_result(res), chat_id)
 
-                if not STATE.history:
-                    await asyncio.sleep(CFG.fetch_every)
-                    continue
-
-                latest_issue = STATE.history[-1]["issue"]
+                # generate new prediction
+                last_issue = STATE.history[-1]["issue"]
                 next_issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-
-                if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
-                    p = generate_prediction()
-                    if p:
-                        STORE.save_prediction(p)
-                        await send_msg(app, format_prediction(p, STORE.recent_outcomes(12)))
-                    last_processed_issue = latest_issue
-
+                if not STORE.exists(next_issue):
+                    pred = generate_prediction()
+                    if pred:
+                        STORE.save_prediction(pred)
+                        await send_msg(app.bot, format_prediction(pred), chat_id)
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
-
-        except Exception as e:
-            log.exception("Worker loop error: %s", e)
+        except Exception:
             await asyncio.sleep(2)
 
-
 # ============================================================
-# MAIN
+# ENTRY
 # ============================================================
-async def main():
-    CFG.validate()
-    STATE.load_cache()
-
-    if not CFG.telegram_token or not CFG.chat_id_raw:
-        log.error("Please set TG_TOKEN and TG_CHAT environment variables before starting.")
-        return
-
-    app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
-
-    async with app:
-        await app.start()
-        ok = await verify_telegram(app)
-        if not ok:
-            log.error("Bot validation failed. Check TG_TOKEN and TG_CHAT.")
-            return
-
-        await start_web_server()
-
-        async with aiohttp.ClientSession() as session:
-            asyncio.create_task(worker_loop(app, session))
-            await asyncio.Event().wait()
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_bot())
