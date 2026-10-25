@@ -1,13 +1,12 @@
 """
-V916 HYPER PRO PREDICTOR (FINAL ADVANCED RECOVERY MODE)
-======================================================
-- Fixed: self.conn() -> self._conn()
-- Fixed: missing logic key
-- Fixed: color logic confusion
-- One final prediction per period only
+V1000 HYPER PRO PREDICTOR (FIXED: TIMEOUT + RECOVERY + ONE PREDICTION)
+======================================================================
+- Fixed: Telegram send timeout
+- Fixed: HTTP timeout on API fetch
+- Fixed: stuck worker loop
+- Fixed: 1 prediction only per issue
 - Recovery mode after losses
-- Chooses SIZE or COLOR dynamically
-- Predicts BIG / SMALL / RED / GREEN by strongest edge
+- Dynamic choose between SIZE and COLOR
 """
 
 import asyncio
@@ -35,17 +34,17 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
+    telegram_token: str = "8611789455:AAGYPljbnGjbOnM8CZcL6NnDmUlqEBkKOgM"
     chat_id_raw: str = "1264164655"
     source_api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "v916_hyper_final.db")
+    db_path: str = os.environ.get("DB_PATH", "v916_hyper_fixed.db")
     cache_file: str = "history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
-    request_timeout: float = 30.0
+    request_timeout: float = 15.0
     bot_name: str = "V916 HYPER PRO"
     min_history: int = 50
 
@@ -61,7 +60,6 @@ class Config:
 
     def validate(self):
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
-
 
 CFG = Config()
 
@@ -79,10 +77,9 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_hyper_final.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "v916_hyper_fixed.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
-
 
 setup_logging()
 log = logging.getLogger("v916")
@@ -92,8 +89,11 @@ def h(x: Any) -> str:
     return html.escape(str(x))
 
 
+# ============================================================
+# HEALTH CHECK FOR RENDER
+# ============================================================
 async def health_check(request):
-    return web.Response(text="V916 Hyper Pro Final is Running!")
+    return web.Response(text="V916 Hyper Pro Fixed is Running")
 
 
 async def start_web_server():
@@ -137,13 +137,11 @@ def normalize_issue(value: Any) -> Optional[int]:
         return None
 
 def get_color_for_logic(num: int) -> str:
-    """Logic uses 0,2,4,6,8 as RED and 1,3,5,7,9 as GREEN."""
     if num in (0, 2, 4, 6, 8):
         return "RED"
     return "GREEN"
 
 def get_display_color(num: int) -> str:
-    """Display only, to avoid weird confusion."""
     if num in (0, 5):
         return "VIOLET"
     if num in (2, 4, 6, 8):
@@ -233,29 +231,9 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
         s += 0.15
     return min(1.0, s)
 
-def detect_shift(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(history) < 20:
-        return {"direction": "NONE", "confidence": 0.0}
-
-    recent = [x["size"] for x in history[-12:]]
-    prev = [x["size"] for x in history[-24:-12]]
-    recent_ratio = ratio_big(recent, 12)
-    prev_ratio = ratio_big(prev, 12)
-    diff = recent_ratio - prev_ratio
-
-    if diff > 0.22:
-        direction = "SHIFT_TO_BIG"
-    elif diff < -0.22:
-        direction = "SHIFT_TO_SMALL"
-    else:
-        direction = "NONE"
-
-    confidence = clamp(abs(diff) * 2.4, 0.0, 1.0)
-    return {"direction": direction, "confidence": confidence}
-
 
 # ============================================================
-# WEIGHTS & STATE
+# BOT STATE
 # ============================================================
 class BayesianWeights:
     def __init__(self):
@@ -279,18 +257,10 @@ class BayesianWeights:
     def adjust(self, winner: str, actual_side: str, is_size: bool):
         if is_size:
             for name in self.size:
-                self.size[name] = clamp(
-                    self.size[name] * (1.08 if winner == actual_side else 0.92),
-                    0.25,
-                    3.0
-                )
+                self.size[name] = clamp(self.size[name] * (1.08 if winner == actual_side else 0.92), 0.25, 3.0)
         else:
             for name in self.color:
-                self.color[name] = clamp(
-                    self.color[name] * (1.08 if winner == actual_side else 0.92),
-                    0.25,
-                    3.0
-                )
+                self.color[name] = clamp(self.color[name] * (1.08 if winner == actual_side else 0.92), 0.25, 3.0)
 
     def recovery_boost(self, is_size: bool):
         if is_size:
@@ -326,11 +296,12 @@ class BotState:
         except Exception:
             pass
 
+
 STATE = BotState()
 
 
 # ============================================================
-# STORAGE
+# DB
 # ============================================================
 class Storage:
     def __init__(self, path: str):
@@ -376,7 +347,6 @@ class Storage:
                     last_seen REAL DEFAULT 0
                 )
             """)
-
             c.execute("""
                 CREATE TABLE IF NOT EXISTS color_stats (
                     color TEXT PRIMARY KEY,
@@ -579,7 +549,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# PREDICTION MODELS
+# MAIN PREDICTION MODELS
 # ============================================================
 def model_markov_size(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -735,8 +705,6 @@ def compute_size_score(history: List[Dict[str, Any]]) -> float:
 
 def compute_color_score(history: List[Dict[str, Any]]) -> Dict[str, float]:
     colors = [get_color_for_logic(x["num"]) for x in history]
-    regime = detect_regime([x["size"] for x in history])
-
     exact = STORE.get_color_prob(colors)
     p_markov = model_color_markov(history)
     p_streak = model_color_streak(history)
@@ -918,10 +886,6 @@ def generate_prediction() -> Dict[str, Any]:
         }
     }
 
-
-# ============================================================
-# LEARN RESULT
-# ============================================================
 def learn_from_resolution(res: Dict[str, Any]):
     if STATE.history:
         seq = [x["size"] for x in STATE.history]
@@ -941,6 +905,7 @@ def learn_from_resolution(res: Dict[str, Any]):
         STATE.recovery_mode = False
 
     STATE.save_cache()
+
 
 # ============================================================
 # PARSE API
@@ -996,24 +961,30 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: int(x["issue"]))
     return out
 
+
 # ============================================================
-# FETCH
+# FETCH DATA WITH TIMEOUT
 # ============================================================
-async def fetch_data(session):
+async def fetch_data():
     urls = CFG.api_urls()
     last_good = list(STATE.history)
 
     for url in urls:
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)) as r:
-                if r.status != 200:
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with asyncio.wait_for(session.get(url, timeout=CFG.request_timeout), timeout=CFG.request_timeout) as r:
+                        if r.status != 200:
+                            continue
+                        payload = await asyncio.wait_for(r.json(content_type=None), timeout=CFG.request_timeout)
+                        parsed = parse_history_payload(payload)
+                        if parsed:
+                            STATE.history = parsed[-1000:]
+                            STATE.save_cache()
+                            return True
+                except asyncio.TimeoutError:
+                    log.warning("Fetch timed out for %s", url)
                     continue
-                payload = await r.json(content_type=None)
-                parsed = parse_history_payload(payload)
-                if parsed:
-                    STATE.history = parsed[-1000:]
-                    STATE.save_cache()
-                    return True
         except Exception:
             pass
 
@@ -1023,6 +994,7 @@ async def fetch_data(session):
         return True
 
     return False
+
 
 # ============================================================
 # FORMATTING
@@ -1069,31 +1041,36 @@ def format_result(res: Dict[str, Any]):
     )
 
 # ============================================================
-# TELEGRAM
+# SEND MESSAGE WITH TIMEOUT
 # ============================================================
-async def send_msg(app, text: str, retries: int = 3):
-    for _ in range(retries):
+async def send_msg(bot, text: str, retries: int = 3):
+    for attempt in range(retries):
         try:
-            await app.bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML")
+            await asyncio.wait_for(
+                bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML"),
+                timeout=CFG.request_timeout
+            )
             return True
         except Exception as e:
-            log.exception("Send failed: %s", e)
+            log.warning("Telegram send timeout/retry %s/%s: %s", attempt + 1, retries, e)
             await asyncio.sleep(1)
     return False
+
 
 # ============================================================
 # WORKER LOOP
 # ============================================================
-async def worker_loop(app, session):
+async def worker_loop(app):
     last_processed_issue = None
 
     while True:
         try:
-            if await fetch_data(session):
+            if await asyncio.wait_for(fetch_data(), timeout=CFG.request_timeout + 5):
                 history_by_issue = {str(x["issue"]): x for x in STATE.history}
+
                 for res in STORE.resolve_pending(history_by_issue):
                     learn_from_resolution(res)
-                    await send_msg(app, format_result(res))
+                    await send_msg(app.bot, format_result(res))
 
                 if not STATE.history:
                     await asyncio.sleep(CFG.fetch_every)
@@ -1106,15 +1083,16 @@ async def worker_loop(app, session):
                     pred = generate_prediction()
                     if pred:
                         STORE.save_prediction(pred)
-                        await send_msg(app, format_prediction(pred, STORE.recent_outcomes(8)))
+                        await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(8)))
                     last_processed_issue = latest_issue
 
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
 
         except Exception as e:
-            log.exception("Worker loop error: %s", e)
+            log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
+
 
 # ============================================================
 # MAIN
@@ -1124,15 +1102,16 @@ async def main():
     STATE.load_cache()
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
+    await app.initialize()
+    await app.start()
 
-    async with app:
-        await app.start()
-        bot_info = await app.bot.get_me()
-        log.info("Bot started: %s", bot_info.username)
+    bot_info = await app.bot.get_me()
+    log.info("Bot started: %s", bot_info.username)
 
-        async with aiohttp.ClientSession() as session:
-            asyncio.create_task(worker_loop(app, session))
-            await asyncio.Event().wait()
+    await start_web_server()
+
+    asyncio.create_task(worker_loop(app))
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
