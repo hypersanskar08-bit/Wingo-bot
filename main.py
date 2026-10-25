@@ -2,7 +2,7 @@
 V916 HYPER PRO PREDICTOR (FIXED: TIMEOUT + RECOVERY + ONE PREDICTION)
 ======================================================================
 - Fixed: Telegram send timeout
-- Fixed: HTTP timeout on API fetch
+- Fixed: HTTP timeout on API fetch (FIXED asyncio.wait_for async with issue)
 - Fixed: stuck worker loop
 - Fixed: 1 prediction only per issue
 - Recovery mode after losses
@@ -963,7 +963,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# FETCH DATA WITH TIMEOUT
+# FETCH DATA WITH TIMEOUT (FIXED)
 # ============================================================
 async def fetch_data():
     urls = CFG.api_urls()
@@ -971,12 +971,15 @@ async def fetch_data():
 
     for url in urls:
         try:
-            async with aiohttp.ClientSession() as session:
+            # Fixed: Used aiohttp.ClientTimeout instead of asyncio.wait_for inside async with
+            timeout = aiohttp.ClientTimeout(total=CFG.request_timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 try:
-                    async with asyncio.wait_for(session.get(url, timeout=CFG.request_timeout), timeout=CFG.request_timeout) as r:
+                    async with session.get(url) as r:
                         if r.status != 200:
                             continue
-                        payload = await asyncio.wait_for(r.json(content_type=None), timeout=CFG.request_timeout)
+                        # r.json() is already awaited, no need for wait_for wrapper
+                        payload = await r.json(content_type=None)
                         parsed = parse_history_payload(payload)
                         if parsed:
                             STATE.history = parsed[-1000:]
@@ -985,7 +988,8 @@ async def fetch_data():
                 except asyncio.TimeoutError:
                     log.warning("Fetch timed out for %s", url)
                     continue
-        except Exception:
+        except Exception as e:
+            log.error(f"Fetch exception: {e}")
             pass
 
     if last_good:
