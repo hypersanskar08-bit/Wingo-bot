@@ -1,11 +1,11 @@
 """
-FTW V7 REAL PATTERN TRACKER (FIXED)
-===================================
-- Fixed missing helper functions
-- Fixed SyntaxError in volatility()
-- Real pattern tracking vs noisy pattern filter
-- Recovery mode + dragon protection
-- No skip logic
+FTW V8 REAL PATTERN MASTER (4..14 LENGTH EXACT SEQUENCES)
+==========================================================
+- Exact pattern mining window: 4..14
+- Tracks real pattern support, recency, and hit-rate
+- Noise filtering for fake patterns
+- Recovery only on actual danger
+- Stronger than weak static pattern matching
 """
 
 import asyncio
@@ -39,12 +39,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v7_real_pattern.db")
-    cache_file: str = "ftw_v7_history_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v8_real_pattern.db")
+    cache_file: str = "ftw_v8_history_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V7 REAL PATTERN"
+    bot_name: str = "FTW V8 PATTERN MASTER"
     min_history: int = 8
 
     def parse_chat_id(self):
@@ -77,7 +77,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v7_real_pattern.log",
+        Path(CFG.log_dir) / "ftw_v8_pattern_master.log",
         maxBytes=1_000_000,
         backupCount=2
     )
@@ -85,7 +85,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v7")
+log = logging.getLogger("ftw_v8")
 
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -113,10 +113,8 @@ def normalize_issue(value: Any) -> Optional[int]:
     except Exception:
         return None
 
-def get_color_for_logic(num: int) -> str:
-    if num in (0, 2, 4, 6, 8):
-        return "RED"
-    return "GREEN"
+def clamp(v: float, low: float, high: float) -> float:
+    return max(low, min(high, v))
 
 def trailing_run(seq: List[int]) -> int:
     if not seq:
@@ -129,9 +127,6 @@ def trailing_run(seq: List[int]) -> int:
         else:
             break
     return c
-
-def clamp(v: float, low: float, high: float) -> float:
-    return max(low, min(high, v))
 
 def alternating_score(seq: List[int], window: int = 12) -> float:
     if len(seq) < 2:
@@ -265,11 +260,9 @@ class Storage:
                     pred_type TEXT,
                     size TEXT,
                     num INTEGER,
-                    color TEXT,
                     status TEXT DEFAULT 'PENDING',
                     actual_num INTEGER,
                     actual_size TEXT,
-                    actual_color TEXT,
                     logic TEXT,
                     details TEXT,
                     stake TEXT,
@@ -281,14 +274,13 @@ class Storage:
         with self._conn() as c:
             c.execute("""
                 INSERT OR IGNORE INTO predictions
-                (issue, pred_type, size, num, color, logic, details, stake, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (issue, pred_type, size, num, logic, details, stake, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 p["issue"],
                 p["type"],
                 p.get("size", ""),
                 p.get("num", 0),
-                p.get("color", ""),
                 p.get("logic", "N/A"),
                 json.dumps(p.get("details", {})),
                 p.get("stake", "1x"),
@@ -302,18 +294,15 @@ class Storage:
     def resolve_pending(self, history_by_issue):
         resolved = []
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT issue, pred_type, size, num, color, details, stake FROM predictions WHERE status='PENDING'"
-            ).fetchall()
+            rows = c.execute("SELECT issue, pred_type, size, num, details, stake FROM predictions WHERE status='PENDING'").fetchall()
 
         for row in rows:
-            issue, pred_type, p_size, p_num, p_color, details_json, stake = row
+            issue, pred_type, p_size, p_num, details_json, stake = row
             act = history_by_issue.get(str(issue))
             if not act:
                 continue
 
             actual_size = "BIG" if act["size"] == 1 else "SMALL"
-
             win = (p_size == actual_size) if p_size else True
 
             if win and p_num == act["num"]:
@@ -347,7 +336,7 @@ class Storage:
     def recent_outcomes(self, limit: int = 6):
         with self._conn() as c:
             rows = c.execute(
-                "SELECT issue, size, color, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
+                "SELECT issue, size, status FROM predictions WHERE status!='PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
                 (limit,)
             ).fetchall()
         return rows[::-1]
@@ -356,133 +345,24 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# PATTERN LIBRARY
+# PATTERN TRACKER
 # ============================================================
-PATTERN_LIBRARY = [
-    # Streaks
-    ((1, 1, 1), 1, "3-BIG DRAGON", 1.8),
-    ((0, 0, 0), 0, "3-SMALL DRAGON", 1.8),
-    ((1, 1, 1, 1), 1, "4-BIG DRAGON", 2.2),
-    ((0, 0, 0, 0), 0, "4-SMALL DRAGON", 2.2),
-    ((1, 1, 1, 1, 1), 0, "5-BIG REVERSE", 1.9),
-    ((0, 0, 0, 0, 0), 1, "5-SMALL REVERSE", 1.9),
-
-    # Alternating
-    ((1, 0, 1), 0, "B-S-B => S", 1.6),
-    ((0, 1, 0), 1, "S-B-S => B", 1.6),
-    ((1, 0, 1, 0), 1, "B-S-B-S => B", 1.7),
-    ((0, 1, 0, 1), 0, "S-B-S-B => S", 1.7),
-    ((1, 0, 1, 0, 1), 0, "B-S-B-S-B => S", 1.8),
-    ((0, 1, 0, 1, 0), 1, "S-B-S-B-S => B", 1.8),
-
-    # Symmetry
-    ((1, 1, 0, 0), 1, "2B-2S => B", 1.5),
-    ((0, 0, 1, 1), 0, "2S-2B => S", 1.5),
-    ((1, 1, 1, 0, 0, 0), 1, "3B-3S => B", 1.8),
-    ((0, 0, 0, 1, 1, 1), 0, "3S-3B => S", 1.8),
-
-    # Skips
-    ((1, 0, 0, 0, 1), 0, "B-S-S-S-B => S", 1.5),
-    ((0, 1, 1, 1, 0), 1, "S-B-B-B-S => B", 1.5),
-    ((1, 0, 1, 1), 0, "B-S-B-B => S", 1.4),
-    ((0, 1, 0, 0), 1, "S-B-S-S => B", 1.4),
-    ((1, 0, 0, 1), 0, "B-S-S-B => S", 1.3),
-    ((0, 1, 1, 0), 1, "S-B-B-S => B", 1.3),
-
-    # Block / trap
-    ((1, 1, 0, 1, 0), 1, "B-B-S-B-S => B", 1.5),
-    ((0, 0, 1, 0, 1), 0, "S-S-B-S-B => S", 1.5),
-    ((1, 0, 0, 1, 0), 0, "B-S-S-B-S => S", 1.5),
-    ((0, 1, 1, 0, 1), 1, "S-B-B-S-B => B", 1.5),
-
-    # X and mirror
-    ((1, 0, 1), 1, "X-B-S-B => B", 1.5),
-    ((0, 1, 0), 0, "X-S-B-S => S", 1.5),
-    ((1, 0, 0, 1), 0, "V-B-S-S-B => S", 1.4),
-    ((0, 1, 1, 0), 1, "V-S-B-B-S => B", 1.4),
-
-    # Edge continuations
-    ((1, 1, 1, 1, 0), 1, "4B-1S => B", 1.4),
-    ((0, 0, 0, 0, 1), 0, "4S-1B => S", 1.4),
-    ((1, 0, 0, 0, 0), 1, "1B-4S => B", 1.4),
-    ((0, 1, 1, 1, 1), 0, "1S-4B => S", 1.4),
-
-    # Reversal break patterns
-    ((1, 0, 0, 0), 1, "SMALL BREAK => B", 1.3),
-    ((0, 1, 1, 1), 0, "BIG BREAK => S", 1.3),
-
-    # Extra patterns 50+
-    ((1, 0, 0, 0, 1, 0), 0, "P1", 1.4),
-    ((0, 1, 1, 1, 0, 1), 1, "P2", 1.4),
-    ((1, 1, 0, 1, 1, 0), 0, "P3", 1.4),
-    ((0, 0, 1, 0, 0, 1), 1, "P4", 1.4),
-    ((1, 0, 1, 1, 0, 1), 0, "P5", 1.5),
-    ((0, 1, 0, 0, 1, 0), 1, "P6", 1.5),
-    ((1, 1, 1, 0, 1, 1), 0, "P7", 1.5),
-    ((0, 0, 0, 1, 0, 0), 1, "P8", 1.5),
-    ((1, 0, 1, 0, 1, 0), 1, "P9", 1.5),
-    ((0, 1, 0, 1, 0, 1), 0, "P10", 1.5),
-    ((1, 1, 0, 0, 1, 0), 1, "P11", 1.5),
-    ((0, 0, 1, 1, 0, 1), 0, "P12", 1.5),
-    ((1, 0, 0, 1, 1, 0), 0, "P13", 1.5),
-    ((0, 1, 1, 0, 0, 1), 1, "P14", 1.5),
-    ((1, 1, 0, 1, 0, 1), 0, "P15", 1.5),
-    ((0, 0, 1, 0, 1, 0), 1, "P16", 1.5),
-    ((1, 0, 1, 1, 1, 0), 1, "P17", 1.5),
-    ((0, 1, 0, 0, 0, 1), 0, "P18", 1.5),
-    ((1, 1, 1, 1, 0, 0), 1, "P19", 1.5),
-    ((0, 0, 0, 0, 1, 1), 0, "P20", 1.5),
-    ((1, 1, 0, 0, 1, 0), 1, "P21", 1.5),
-    ((0, 0, 1, 1, 0, 1), 0, "P22", 1.5),
-    ((1, 0, 0, 1, 0, 0), 1, "P23", 1.5),
-    ((0, 1, 1, 0, 1, 1), 0, "P24", 1.5),
-    ((1, 0, 1, 0, 0, 1), 0, "P25", 1.5),
-    ((0, 1, 0, 1, 1, 0), 1, "P26", 1.5),
-    ((1, 1, 0, 1, 1, 1), 0, "P27", 1.5),
-    ((0, 0, 1, 0, 0, 0), 1, "P28", 1.5),
-    ((1, 0, 1, 1, 0, 0), 1, "P29", 1.5),
-    ((0, 1, 0, 0, 1, 1), 0, "P30", 1.5),
-    ((1, 1, 0, 0, 1, 1), 0, "P31", 1.5),
-    ((0, 0, 1, 1, 0, 0), 1, "P32", 1.5),
-    ((1, 0, 1, 1, 1, 1), 0, "P33", 1.6),
-    ((0, 1, 0, 0, 0, 0), 1, "P34", 1.6),
-    ((1, 0, 0, 1, 1, 1), 0, "P35", 1.6),
-    ((0, 1, 1, 0, 0, 0), 1, "P36", 1.6),
-    ((1, 1, 0, 0, 1, 1, 0), 1, "P37", 1.7),
-    ((0, 0, 1, 1, 0, 0, 1), 0, "P38", 1.7),
-    ((1, 0, 1, 0, 1, 1, 0), 0, "P39", 1.7),
-    ((0, 1, 0, 1, 0, 0, 1), 1, "P40", 1.7),
-    ((1, 1, 1, 0, 0, 1, 1), 0, "P41", 1.7),
-    ((0, 0, 0, 1, 1, 0, 0), 1, "P42", 1.7),
-    ((1, 0, 0, 0, 1, 1, 1), 0, "P43", 1.7),
-    ((0, 1, 1, 1, 0, 0, 0), 1, "P44", 1.7),
-    ((1, 1, 0, 1, 1, 0, 1), 0, "P45", 1.7),
-    ((0, 0, 1, 0, 0, 1, 0), 1, "P46", 1.7),
-    ((1, 0, 1, 1, 0, 1, 0), 1, "P47", 1.7),
-    ((0, 1, 0, 0, 1, 0, 1), 0, "P48", 1.7),
-    ((1, 1, 0, 0, 1, 0, 0), 1, "P49", 1.7),
-    ((0, 0, 1, 1, 0, 1, 1), 0, "P50", 1.7),
-]
-
-
 class PatternTracker:
     def __init__(self):
         self.stats: Dict[str, Dict[str, Any]] = {}
 
-    def register_pattern(self, key: str, value: int):
+    def register_pattern(self, key: str, pred_value: int):
         if key not in self.stats:
-            self.stats[key] = {"hits": 0, "misses": 0, "last_seen": 0, "last_result": None}
+            self.stats[key] = {"hits": 0, "misses": 0, "last_seen": 0}
 
         entry = self.stats[key]
         entry["last_seen"] = time.time()
-        entry["last_result"] = value
-
-        if value == 1:
+        if pred_value == 1:
             entry["hits"] += 1
         else:
             entry["misses"] += 1
 
-    def support_score(self, key: str) -> float:
+    def score(self, key: str) -> float:
         entry = self.stats.get(key)
         if not entry:
             return 0.0
@@ -492,116 +372,216 @@ class PatternTracker:
             return 0.0
 
         hit_rate = entry["hits"] / total
-        recency = max(0.0, 1.0 - (time.time() - entry["last_seen"]) / 500.0)
-        return hit_rate * 0.7 + recency * 0.3
+        recency = max(0.0, 1.0 - (time.time() - entry["last_seen"]) / 600.0)
+        return hit_rate * 0.75 + recency * 0.25
 
     def purge_stale(self):
         now = time.time()
-        stale_keys = []
+        stale = []
         for key, entry in self.stats.items():
             age = now - entry["last_seen"]
-            if age > 1200:
-                stale_keys.append(key)
-        for key in stale_keys:
+            if age > 900:
+                stale.append(key)
+        for key in stale:
             del self.stats[key]
 
 PT = PatternTracker()
 
 
 # ============================================================
-# PATTERN MATCHER
+# EXACT PATTERN MINER (4..14)
 # ============================================================
-def lookup_best_pattern(seq: List[int]) -> Optional[Tuple[float, int, str]]:
-    best = None
-    for pattern in PATTERN_LIBRARY:
-        pat_seq, pred_value, name, weight = pattern
-        if len(seq) >= len(pat_seq):
-            if tuple(seq[-len(pat_seq):]) == pat_seq:
-                score = (len(pat_seq) * 2.2) * weight
-                candidate = (score, pred_value, name)
-                if best is None or score > best[0]:
-                    best = candidate
-    return best
-
-def pattern_match_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seq = [x["size"] for x in history]
-    if not seq:
-        return {"pred": None, "name": "NO REAL PATTERN", "score": 0.0}
+    candidates: List[Dict[str, Any]] = []
 
-    best = lookup_best_pattern(seq)
-    if best is None:
-        return {"pred": None, "name": "NO REAL PATTERN", "score": 0.0}
+    for window in range(4, 15):
+        if len(seq) < window + 1:
+            continue
 
-    score, pred_value, name = best
-    key = str(tuple(seq[-len(seq):])) + "|" + name
-    support = PT.support_score(key)
+        suffix = tuple(seq[-window:])
+        counts = defaultdict(int)
+        next_big = defaultdict(int)
+        next_small = defaultdict(int)
 
-    final_score = score + (support * 20.0)
+        for i in range(len(seq) - window):
+            key = tuple(seq[i:i + window])
+            counts[key] += 1
+            if seq[i + window] == 1:
+                next_big[key] += 1
+            else:
+                next_small[key] += 1
 
-    if support < 0.25 and final_score < 18:
-        return {"pred": None, "name": "NOISY PATTERN", "score": 0.0}
+        if suffix not in counts:
+            continue
 
-    pred = "BIG" if pred_value == 1 else "SMALL"
-    return {"pred": pred, "name": name, "score": final_score, "support": support}
+        total = counts[suffix]
+        big_prob = next_big.get(suffix, 0) / total
+        small_prob = next_small.get(suffix, 0) / total
+        support = total / max(1, len(seq) - window)
 
-def markov_size_prob(history: List[Dict[str, Any]]) -> float:
+        pred = "BIG" if big_prob >= small_prob else "SMALL"
+        confidence = abs(big_prob - small_prob) * 100.0
+
+        if support < 0.02 and confidence < 15:
+            continue
+
+        key = f"{window}:{suffix}"
+        score = confidence + (support * 100.0) + (window * 2.0) + PT.score(key) * 25.0
+
+        candidates.append({
+            "window": window,
+            "suffix": suffix,
+            "pred": pred,
+            "confidence": confidence,
+            "support": support,
+            "score": score,
+            "key": key
+        })
+
+    # sort by strongest exact match
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[:12]
+
+def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = exact_pattern_candidates(history)
+
+    if not candidates:
+        return None
+
+    best = candidates[0]
+
+    # Anti-noise filter:
+    # candidate must be strong enough and not just tiny support
+    if best["confidence"] < 12 and best["support"] < 0.04:
+        return None
+
+    pred = best["pred"]
+    confidence = clamp(best["confidence"] / 100.0, 0.55, 0.92)
+    note = f"EXACT {best['window']}-SEQ PATTERN"
+
+    # register support for this pattern
+    key = best["key"]
+    PT.register_pattern(key, 1 if pred == "BIG" else 0)
+
+    return {
+        "size": pred,
+        "logic": note,
+        "confidence": confidence,
+        "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
+    }
+
+# ============================================================
+# HYBRID FALLBACK
+# ============================================================
+def markov_prob(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     if len(sizes) < 3:
         return 0.5
-    seq = tuple(sizes[-2:])
+
+    recent_pair = tuple(sizes[-2:])
     count, big = 0, 0
     for i in range(len(sizes) - 2):
-        if tuple(sizes[i:i + 2]) == seq:
+        if tuple(sizes[i:i + 2]) == recent_pair:
             count += 1
             if sizes[i + 2] == 1:
                 big += 1
-    return (big / count) if count > 0 else 0.5
-
-def frequency_bias(history: List[Dict[str, Any]]) -> float:
-    seq = [x["size"] for x in history[-50:]]
-    if not seq:
+    if count == 0:
         return 0.5
-    return sum(seq) / len(seq)
+    return big / count
 
-def parity_bias(history: List[Dict[str, Any]]) -> float:
+def parity_prob(history: List[Dict[str, Any]]) -> float:
     nums = [x["num"] for x in history[-30:]]
     if not nums:
         return 0.5
     evens = sum(1 for n in nums if n % 2 == 0)
     return evens / len(nums)
 
-# ============================================================
-# FINAL PREDICTION
-# ============================================================
-def choose_best_number(size: str, history: List[Dict[str, Any]]) -> int:
-    valid = [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
-    freq = Counter([x["num"] for x in history[-50:]])
-    if not freq:
-        return random.choice(valid)
-    return max(valid, key=lambda x: freq.get(x, 0))
+def result_bias(history: List[Dict[str, Any]]) -> float:
+    seq = [x["size"] for x in history[-40:]]
+    if not seq:
+        return 0.5
+    return sum(seq) / len(seq)
 
+def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    markov = markov_prob(history)
+    parity = parity_prob(history)
+    bias = result_bias(history)
+    vol = volatility([x["size"] for x in history], 20)
+
+    # strong trends are dangerous
+    score = (markov * 0.36) + (bias * 0.28) + (parity * 0.18) + ((1.0 - min(vol, 1.0)) * 0.18)
+
+    size = "BIG" if score >= 0.5 else "SMALL"
+    confidence = clamp(max(score, 1.0 - score), 0.55, 0.78)
+    return {
+        "size": size,
+        "logic": "HYBRID FALLBACK",
+        "confidence": confidence,
+        "stake": "1x" if confidence >= 0.68 else "0.5x"
+    }
+
+# ============================================================
+# RECOVERY / DRAGON LOGIC
+# ============================================================
 def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     seq = [x["size"] for x in history]
     if not seq:
         return None
 
     recent = seq[-6:]
-    if STATE.loss_streak >= 2:
+    if STATE.loss_streak >= 3:
+        # We are in actual danger: reverse hard
         if sum(recent) >= 4:
-            return {"size": "SMALL", "logic": "🛡️ RECOVERY REVERSE", "score": 0.82, "stake": "1x"}
+            return {"size": "SMALL", "logic": "RECOVERY REVERSE", "confidence": 0.82, "stake": "1x"}
         if sum(recent) <= 1:
-            return {"size": "BIG", "logic": "🛡️ RECOVERY REVERSE", "score": 0.82, "stake": "1x"}
+            return {"size": "BIG", "logic": "RECOVERY REVERSE", "confidence": 0.82, "stake": "1x"}
 
     if trailing_run(seq) >= 4:
-        current = seq[-1]
+        last = seq[-1]
         return {
-            "size": "SMALL" if current == 1 else "BIG",
-            "logic": "🐉 DRAGON PROTECTION",
-            "score": 0.88,
+            "size": "SMALL" if last == 1 else "BIG",
+            "logic": "DRAGON PROTECTION",
+            "confidence": 0.88,
             "stake": "1x"
         }
 
+    if len(recent) >= 4 and sum(recent) >= 4:
+        return {"size": "SMALL", "logic": "LOSS ROLLBACK", "confidence": 0.76, "stake": "1x"}
+    if len(recent) >= 4 and sum(recent) <= 1:
+        return {"size": "BIG", "logic": "LOSS ROLLBACK", "confidence": 0.76, "stake": "1x"}
+
     return None
+
+# ============================================================
+# NUMBER PICKER
+# ============================================================
+def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
+    valid = [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
+    freq = Counter([x["num"] for x in history[-80:]])
+    if not freq:
+        return random.choice(valid)
+    return max(valid, key=lambda x: freq.get(x, 0))
+
+# ============================================================
+# FINAL CHOICE
+# ============================================================
+def choose_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    override = recovery_override(history)
+
+    if override:
+        return {
+            "size": override["size"],
+            "logic": override["logic"],
+            "confidence": override["confidence"],
+            "stake": override["stake"]
+        }
+
+    exact = choose_exact_prediction(history)
+    if exact:
+        return exact
+
+    return hybrid_prediction(history)
 
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
@@ -614,44 +594,18 @@ def generate_prediction() -> Dict[str, Any]:
             "raw_conf": 50,
             "logic": "WARMING UP",
             "stake": "0.5x",
-            "details": {"recovery_mode": False}
+            "details": {
+                "recovery_mode": False,
+                "regime": "COLD"
+            }
         }
 
     history = STATE.history[-2000:]
-    seq = [x["size"] for x in history]
+    choice = choose_prediction(history)
 
-    override = recovery_override(history)
-    if override is not None:
-        final_size = override["size"]
-        logic = override["logic"]
-        confidence = override["score"]
-        stake = override["stake"]
-    else:
-        match = pattern_match_score(history)
-        if match["pred"] is not None:
-            final_size = match["pred"]
-            logic = f"🎯 {match['name']} | support={match['support']:.2f}"
-            confidence = clamp((match["score"] / 22.0), 0.55, 0.92)
-            stake = "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
-        else:
-            markov = markov_size_prob(history)
-            freq = frequency_bias(history)
-            parity = parity_bias(history)
-            hybrid = (markov * 0.4) + (freq * 0.35) + (parity * 0.25)
-            final_size = "BIG" if hybrid >= 0.5 else "SMALL"
-            logic = "📊 HYBRID FALLBACK"
-            confidence = clamp(max(hybrid, 1 - hybrid), 0.55, 0.72)
-            stake = "1x" if confidence >= 0.65 else "0.5x"
-
-    final_num = choose_best_number(final_size, history)
+    final_size = choice["size"]
+    final_num = choose_number_for_size(final_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-
-    # Track pattern usage for support and filtering
-    for pattern in PATTERN_LIBRARY:
-        pat_seq, pred_value, name, weight = pattern
-        if len(seq) >= len(pat_seq):
-            if tuple(seq[-len(pat_seq):]) == pat_seq:
-                PT.register_pattern(str(pat_seq) + "|" + name, pred_value)
 
     PT.purge_stale()
 
@@ -660,13 +614,13 @@ def generate_prediction() -> Dict[str, Any]:
         "type": "SIZE",
         "size": final_size,
         "num": final_num,
-        "raw_conf": int(confidence * 100),
-        "logic": logic,
-        "stake": stake,
+        "raw_conf": int(choice["confidence"] * 100),
+        "logic": choice["logic"],
+        "stake": choice["stake"],
         "details": {
             "recovery_mode": STATE.recovery_mode,
             "signal_strength": signal_strength(history),
-            "regime": detect_regime(seq)
+            "regime": detect_regime([x["size"] for x in history])
         }
     }
 
@@ -713,6 +667,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
     out = []
     seen = set()
+
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -728,6 +683,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
         num = safe_int(item.get("number", item.get("value", 0)), 0)
         if 0 <= num <= 9:
             out.append({"issue": str(issue), "num": num, "size": 1 if num >= 5 else 0})
+
     out.sort(key=lambda x: int(x["issue"]))
     return out
 
@@ -855,7 +811,7 @@ async def worker_loop(app, session):
 # HEALTH CHECK
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V7 Real Pattern Tracker is Running")
+    return web.Response(text="FTW V8 Pattern Master is Running")
 
 async def start_web_server():
     app = web.Application()
