@@ -1,5 +1,5 @@
 """
-FTW V16 FULL CODE
+FTW V16 UPGRADED
 =================
 Advanced deep predictor with:
 - trend phase detection
@@ -10,8 +10,10 @@ Advanced deep predictor with:
 - deep number family analysis
 - exact sequence mining 4..14
 - anti-bias guard
+- HTML signal integration
+- vote-based final decision
+- no-skip strategy with confidence-based risk
 - Telegram ready
-- HTML frontend logic integrated
 """
 
 import asyncio
@@ -974,7 +976,7 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 
 
 # ============================================================
-# HTML FRONTEND PREDICTION LOGIC (TRADEGENIUS07)
+# HTML FRONTEND PREDICTION LOGIC
 # ============================================================
 def bs_of_number(num: Any) -> str:
     try:
@@ -1028,6 +1030,107 @@ def html_tradegenius_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str,
         "stake": "2x" if conf >= 97.0 else "1x",
         "bs_hint": pattern_name,
         "num_hint": f"High-Prob {size} Number"
+    }
+
+
+# ============================================================
+# SIGNAL VOTING / NO-SKIP SYSTEM
+# ============================================================
+def signal_vote(history: List[Dict[str, Any]], side: str) -> float:
+    score = 0.0
+
+    exact = choose_exact_prediction(history)
+    if exact and exact["size"] == side:
+        score += 1.15
+
+    trend = trend_shift_score(history)
+    if trend["pred"] == side:
+        score += 0.90
+
+    ex = trend_exhaustion(history)
+    if ex and ex["size"] == side:
+        score += 1.20
+
+    rev = trend_reversal_signal(history)
+    if rev and rev["size"] == side:
+        score += 1.00
+
+    html_signal = html_tradegenius_signal(history)
+    if html_signal and html_signal["size"] == side:
+        score += 0.80
+
+    return score
+
+def vote_based_side(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    big_score = signal_vote(history, "BIG")
+    small_score = signal_vote(history, "SMALL")
+
+    if big_score >= small_score:
+        size = "BIG"
+        confidence = clamp(big_score / max(1e-6, big_score + small_score), 0.55, 0.96)
+    else:
+        size = "SMALL"
+        confidence = clamp(small_score / max(1e-6, big_score + small_score), 0.55, 0.96)
+
+    return {
+        "size": size,
+        "confidence": confidence,
+        "big_score": big_score,
+        "small_score": small_score
+    }
+
+def dynamic_stake(confidence: float) -> str:
+    if confidence >= 0.82:
+        return "2x"
+    if confidence >= 0.72:
+        return "1x"
+    if confidence >= 0.62:
+        return "0.5x"
+    return "0.25x"
+
+def resolve_final_side(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    seq = [x["size"] for x in history]
+    regime = detect_regime(seq)
+    balance = side_balance(history, 20)
+
+    vote = vote_based_side(history)
+    base = weighted_ensemble(history)
+
+    side = vote["size"]
+    conf = max(base["confidence"], vote["confidence"])
+
+    # If both sides are too close, use base model
+    if abs(vote["big_score"] - vote["small_score"]) < 0.7:
+        side = base["size"]
+        conf = max(conf, base["confidence"] * 0.92)
+
+    # Strong anti-bias guard
+    if balance > 0.18 and side == "SMALL":
+        side = "BIG"
+        conf *= 0.96
+    elif balance < -0.18 and side == "BIG":
+        side = "SMALL"
+        conf *= 0.96
+
+    # Trend-based recovery
+    ex = trend_exhaustion(history)
+    if ex:
+        side = ex["size"]
+        conf = max(conf, ex["confidence"] * 0.97)
+
+    # No skip rule: always predict, but lower confidence in weak regimes
+    if regime in ("COLD", "CHOPPY"):
+        side = "BIG" if result_bias(history) >= 0.5 else "SMALL"
+        conf = 0.60
+
+    # Stability clamp
+    conf = clamp(conf, 0.55, 0.94)
+
+    return {
+        "size": side,
+        "confidence": conf,
+        "logic": "VOTED ENGINE + SAFE FALLBACK",
+        "stake": dynamic_stake(conf)
     }
 
 
@@ -1096,42 +1199,31 @@ def generate_prediction() -> Dict[str, Any]:
             "num": n,
             "raw_conf": 50,
             "logic": "WARMING UP",
-            "stake": "0.5x",
+            "stake": "0.25x",
             "details": {"recovery_mode": False, "regime": "COLD"}
         }
 
     history = STATE.history[-2000:]
     seq = [x["size"] for x in history]
 
-    override = recovery_override(history)
-    html_signal = html_tradegenius_signal(history)
-
-    if override:
-        pred_size = override["size"]
-        pred_logic = override["logic"]
-        pred_conf = override["confidence"]
-        pred_stake = override["stake"]
-    else:
-        ensemble = weighted_ensemble(history)
-        pred_size = ensemble["size"]
-        pred_logic = ensemble["logic"]
-        pred_conf = ensemble["confidence"]
-        pred_stake = ensemble["stake"]
-
-    if html_signal and html_signal["confidence"] >= pred_conf:
-        pred_size = html_signal["size"]
-        pred_logic = html_signal["logic"]
-        pred_conf = html_signal["confidence"]
-        pred_stake = html_signal["stake"]
+    # Use no-skip decision pipeline
+    resolved = resolve_final_side(history)
+    pred_size = resolved["size"]
+    pred_conf = resolved["confidence"]
+    pred_logic = resolved["logic"]
+    pred_stake = resolved["stake"]
 
     pred_size = bias_guard(pred_size, history)
 
-    if html_signal and html_signal["size"] == pred_size:
-        final_num = html_signal["num"]
-    else:
-        final_num = choose_number_for_size(pred_size, history)
+    # Final number selection
+    final_num = choose_number_for_size(pred_size, history)
 
-    issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
+    issue = str(
+        max(
+            [normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None],
+            default=0
+        ) + 1
+    )
 
     return {
         "issue": issue,
@@ -1148,7 +1240,8 @@ def generate_prediction() -> Dict[str, Any]:
             "side_balance": round(side_balance(history, 20), 4),
             "trend_phase": trend_phase(history),
             "trend_shift": trend_shift_score(history),
-            "trend_exhaustion": trend_exhaustion(history)
+            "trend_exhaustion": trend_exhaustion(history),
+            "vote_summary": vote_based_side(history)
         }
     }
 
@@ -1170,42 +1263,17 @@ def learn_from_resolution(res: Dict[str, Any]):
 # BACKTEST
 # ============================================================
 def generate_prediction_from_history(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
-    override = recovery_override(history)
-    html_signal = html_tradegenius_signal(history)
+    resolved = resolve_final_side(history)
+    pred_size = bias_guard(resolved["size"], history)
+    final_num = choose_number_for_size(pred_size, history)
 
-    if override:
-        pred_size = override["size"]
-        pred_logic = override["logic"]
-        pred_conf = override["confidence"]
-        pred_stake = override["stake"]
-    else:
-        exact = choose_exact_prediction(history)
-        if exact:
-            pred_size = exact["size"]
-            pred_logic = exact["logic"]
-            pred_conf = exact["confidence"]
-            pred_stake = exact["stake"]
-        else:
-            hybrid = hybrid_prediction(history)
-            pred_size = hybrid["size"]
-            pred_logic = hybrid["logic"]
-            pred_conf = hybrid["confidence"]
-            pred_stake = hybrid["stake"]
-
-    if html_signal and html_signal["confidence"] >= pred_conf:
-        pred_size = html_signal["size"]
-        pred_logic = html_signal["logic"]
-        pred_conf = html_signal["confidence"]
-        pred_stake = html_signal["stake"]
-
-    pred_size = bias_guard(pred_size, history)
     return {
         "issue": str(issue),
         "size": pred_size,
-        "num": html_signal["num"] if html_signal and html_signal["size"] == pred_size else choose_number_for_size(pred_size, history),
-        "logic": pred_logic,
-        "raw_conf": int(pred_conf * 100),
-        "stake": pred_stake
+        "num": final_num,
+        "logic": resolved["logic"],
+        "raw_conf": int(resolved["confidence"] * 100),
+        "stake": resolved["stake"]
     }
 
 def run_backtest(history: List[Dict[str, Any]], window_size: int = 50) -> Dict[str, Any]:
