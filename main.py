@@ -1,6 +1,6 @@
 """
-FTW V16 UPGRADED
-=================
+FTW V16 UPGRADED - NO-SKIP / ANTI-TRAP / DRAGON GUARD
+======================================================
 Advanced deep predictor with:
 - trend phase detection
 - exhaustion logic
@@ -10,9 +10,9 @@ Advanced deep predictor with:
 - deep number family analysis
 - exact sequence mining 4..14
 - anti-bias guard
-- HTML signal integration
-- vote-based final decision
-- no-skip strategy with confidence-based risk
+- anti-trap / dragon guard
+- confidence decay
+- dynamic risk scaling
 - Telegram ready
 """
 
@@ -701,6 +701,7 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
 # ============================================================
 # STAT MODELS
 # ============================================================
+
 def markov_prob(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     if len(sizes) < 3:
@@ -1034,6 +1035,112 @@ def html_tradegenius_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str,
 
 
 # ============================================================
+# DRAGON / ANTI-TRAP LOGIC
+# ============================================================
+def dragon_guard(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if len(history) < 6:
+        return None
+
+    seq = [x["size"] for x in history]
+    current = seq[-1]
+    recent = seq[-8:]
+    big_share = sum(1 for v in recent if v == 1) / len(recent)
+    small_share = sum(1 for v in recent if v == 0) / len(recent)
+    run = trailing_run(seq)
+    phase = trend_phase(history)
+
+    if run >= 4 and phase in ("BUILDING", "DOMINANT") and current == 1 and big_share >= 0.68:
+        return {
+            "size": "BIG",
+            "logic": "VALID DRAGON TREND",
+            "confidence": 0.78,
+            "stake": "1x"
+        }
+
+    if run >= 4 and phase in ("BUILDING", "DOMINANT") and current == 0 and small_share >= 0.68:
+        return {
+            "size": "SMALL",
+            "logic": "VALID DRAGON TREND",
+            "confidence": 0.78,
+            "stake": "1x"
+        }
+
+    if run >= 5 and phase in ("EXHAUSTED", "DOMINANT"):
+        if current == 1 and big_share >= 0.75:
+            return {
+                "size": "SMALL",
+                "logic": "DRAGON EXHAUSTED: REVERSE",
+                "confidence": 0.62,
+                "stake": "0.25x"
+            }
+        if current == 0 and small_share >= 0.75:
+            return {
+                "size": "BIG",
+                "logic": "DRAGON EXHAUSTED: REVERSE",
+                "confidence": 0.62,
+                "stake": "0.25x"
+            }
+
+    return None
+
+def anti_trap_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if len(history) < 6:
+        return None
+
+    seq = [x["size"] for x in history[-8:]]
+    if seq.count(1) >= 5:
+        return {
+            "size": "SMALL",
+            "logic": "ANTI-TRAP: BIG CLUSTER OVERLOADED",
+            "confidence": 0.62,
+            "stake": "0.25x"
+        }
+    if seq.count(0) >= 5:
+        return {
+            "size": "BIG",
+            "logic": "ANTI-TRAP: SMALL CLUSTER OVERLOADED",
+            "confidence": 0.62,
+            "stake": "0.25x"
+        }
+
+    if seq.count(1) >= 4 and seq[-1] == 1:
+        return {
+            "size": "SMALL",
+            "logic": "REVERSE TRAP: BIG SIDE EXHAUSTED",
+            "confidence": 0.66,
+            "stake": "0.5x"
+        }
+    if seq.count(0) >= 4 and seq[-1] == 0:
+        return {
+            "size": "BIG",
+            "logic": "REVERSE TRAP: SMALL SIDE EXHAUSTED",
+            "confidence": 0.66,
+            "stake": "0.5x"
+        }
+
+    return None
+
+def confidence_decay(conf: float, loss_count: int) -> float:
+    decay_map = {
+        0: 1.0,
+        1: 0.75,
+        2: 0.55,
+        3: 0.35,
+        4: 0.20
+    }
+    return conf * decay_map.get(loss_count, 0.10)
+
+def dynamic_stake(confidence: float) -> str:
+    if confidence >= 0.82:
+        return "2x"
+    if confidence >= 0.68:
+        return "1x"
+    if confidence >= 0.58:
+        return "0.5x"
+    return "0.25x"
+
+
+# ============================================================
 # SIGNAL VOTING / NO-SKIP SYSTEM
 # ============================================================
 def signal_vote(history: List[Dict[str, Any]], side: str) -> float:
@@ -1059,6 +1166,10 @@ def signal_vote(history: List[Dict[str, Any]], side: str) -> float:
     if html_signal and html_signal["size"] == side:
         score += 0.80
 
+    dragon = dragon_guard(history)
+    if dragon and dragon["size"] == side:
+        score += 0.85
+
     return score
 
 def vote_based_side(history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1079,19 +1190,27 @@ def vote_based_side(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "small_score": small_score
     }
 
-def dynamic_stake(confidence: float) -> str:
-    if confidence >= 0.82:
-        return "2x"
-    if confidence >= 0.72:
-        return "1x"
-    if confidence >= 0.62:
-        return "0.5x"
-    return "0.25x"
-
 def resolve_final_side(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [x["size"] for x in history]
     regime = detect_regime(seq)
     balance = side_balance(history, 20)
+
+    # anti-trap must be checked first
+    trap = anti_trap_override(history)
+    if trap:
+        side = trap["size"]
+        conf = trap["confidence"]
+        logic = trap["logic"]
+        stake = trap["stake"]
+        return {"size": side, "confidence": conf, "logic": logic, "stake": stake}
+
+    dragon = dragon_guard(history)
+    if dragon:
+        side = dragon["size"]
+        conf = dragon["confidence"]
+        logic = dragon["logic"]
+        stake = dragon["stake"]
+        return {"size": side, "confidence": conf, "logic": logic, "stake": stake}
 
     vote = vote_based_side(history)
     base = weighted_ensemble(history)
@@ -1099,12 +1218,10 @@ def resolve_final_side(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     side = vote["size"]
     conf = max(base["confidence"], vote["confidence"])
 
-    # If both sides are too close, use base model
     if abs(vote["big_score"] - vote["small_score"]) < 0.7:
         side = base["size"]
         conf = max(conf, base["confidence"] * 0.92)
 
-    # Strong anti-bias guard
     if balance > 0.18 and side == "SMALL":
         side = "BIG"
         conf *= 0.96
@@ -1112,25 +1229,30 @@ def resolve_final_side(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         side = "SMALL"
         conf *= 0.96
 
-    # Trend-based recovery
     ex = trend_exhaustion(history)
     if ex:
         side = ex["size"]
         conf = max(conf, ex["confidence"] * 0.97)
 
-    # No skip rule: always predict, but lower confidence in weak regimes
     if regime in ("COLD", "CHOPPY"):
         side = "BIG" if result_bias(history) >= 0.5 else "SMALL"
         conf = 0.60
 
-    # Stability clamp
+    # confidence decay after losses
+    if STATE.loss_streak >= 1:
+        conf = confidence_decay(conf, STATE.loss_streak)
+        if STATE.loss_streak >= 3:
+            side = "SMALL" if side == "BIG" else "BIG"
+            conf = min(conf, 0.58)
+
     conf = clamp(conf, 0.55, 0.94)
+    stake = dynamic_stake(conf)
 
     return {
         "size": side,
         "confidence": conf,
         "logic": "VOTED ENGINE + SAFE FALLBACK",
-        "stake": dynamic_stake(conf)
+        "stake": stake
     }
 
 
@@ -1206,16 +1328,13 @@ def generate_prediction() -> Dict[str, Any]:
     history = STATE.history[-2000:]
     seq = [x["size"] for x in history]
 
-    # Use no-skip decision pipeline
     resolved = resolve_final_side(history)
     pred_size = resolved["size"]
-    pred_conf = resolved["confidence"]
     pred_logic = resolved["logic"]
+    pred_conf = resolved["confidence"]
     pred_stake = resolved["stake"]
 
     pred_size = bias_guard(pred_size, history)
-
-    # Final number selection
     final_num = choose_number_for_size(pred_size, history)
 
     issue = str(
@@ -1241,7 +1360,8 @@ def generate_prediction() -> Dict[str, Any]:
             "trend_phase": trend_phase(history),
             "trend_shift": trend_shift_score(history),
             "trend_exhaustion": trend_exhaustion(history),
-            "vote_summary": vote_based_side(history)
+            "dragon_guard": dragon_guard(history),
+            "anti_trap": anti_trap_override(history)
         }
     }
 
