@@ -28,12 +28,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_fix_pattern.db")
-    cache_file: str = "ftw_fix_pattern_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_recent_pattern.db")
+    cache_file: str = "ftw_recent_pattern_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW FIX PATTERN"
+    bot_name: str = "FTW RECENT PATTERN"
     min_history: int = 8
     recent_limit: int = 12
     max_history: int = 1000
@@ -69,7 +69,7 @@ def setup_logging():
         root.addHandler(stream_handler)
 
         fh = RotatingFileHandler(
-            Path(CFG.log_dir) / "ftw_fix_pattern.log",
+            Path(CFG.log_dir) / "ftw_recent_pattern.log",
             maxBytes=1_000_000,
             backupCount=3
         )
@@ -77,7 +77,7 @@ def setup_logging():
         root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_fix_pattern")
+log = logging.getLogger("ftw_recent_pattern")
 
 # ============================================================
 # HELPERS
@@ -378,6 +378,7 @@ class Storage:
                 FROM pattern_penalties
                 WHERE pattern_key=?
             """, (pattern_key,)).fetchone()
+
             if row is None:
                 fail_streak = 0
                 penalty = 1.0
@@ -409,7 +410,6 @@ class Storage:
                 FROM pattern_stats
                 WHERE pattern_key=?
             """, (key,)).fetchone()
-
             if row is None:
                 hit, miss, last_seen, support, confidence = 0, 0, 0.0, 0.0, 0.0
             else:
@@ -448,13 +448,12 @@ class Storage:
         support, confidence, last_seen = row
         age = max(0.0, 1.0 - ((time.time() - float(last_seen)) / 600.0))
         base = (support * 0.7 + confidence * 0.3) * (0.5 + age * 0.5)
-        penalty = self.get_penalty(key)
-        return base * penalty
+        return base * self.get_penalty(key)
 
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# PATTERN MINING
+# RECENT PATTERN MINER
 # ============================================================
 def mine_recent_patterns(history: List[Dict[str, Any]], min_len: int = 5, max_len: int = 12):
     seq = [x["size"] for x in history]
@@ -538,7 +537,7 @@ def mine_recent_patterns(history: List[Dict[str, Any]], min_len: int = 5, max_le
     results.sort(key=lambda x: (x["win_rate"], x["confidence"], x["total_count"], x["raw_score"]), reverse=True)
     return results
 
-def choose_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def select_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     patterns = mine_recent_patterns(history, min_len=5, max_len=12)
     if not patterns:
         return None
@@ -756,7 +755,6 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
         suffix = tuple(nums[-w:])
         counts = defaultdict(int)
         next_counts = defaultdict(int)
-
         for i in range(len(nums) - w):
             key = tuple(nums[i:i + w])
             counts[key] += 1
@@ -798,10 +796,10 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     return random.choice(valid)
 
 # ============================================================
-# ENSEMBLE
+# FINAL ENSEMBLE
 # ============================================================
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq_signal = choose_valid_pattern(history)
+    seq_signal = select_valid_pattern(history)
     hybrid = hybrid_prediction(history)
 
     final_size = seq_signal["size"] if seq_signal else hybrid["size"]
@@ -837,7 +835,7 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 # ============================================================
-# BUILD PREDICTION
+# PREDICTION BUILD
 # ============================================================
 def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
     if len(history) < CFG.min_history:
@@ -1035,9 +1033,10 @@ async def worker_loop(app, session):
                         STATE.recovery_mode = STATE.loss_streak >= 2
 
                     details = res.get("details", {})
-                    pattern_key = details.get("pattern_key") if isinstance(details, dict) else None
-                    if pattern_key:
-                        STORE.penalize_pattern(str(pattern_key), bool(res["win"]))
+                    if isinstance(details, dict):
+                        pattern_key = details.get("pattern_key")
+                        if pattern_key:
+                            STORE.penalize_pattern(str(pattern_key), bool(res["win"]))
 
                     STATE.save_cache()
                     await send_msg(app.bot, format_result(res))
@@ -1053,11 +1052,8 @@ async def worker_loop(app, session):
                     pred = build_prediction(STATE.history, next_issue)
 
                     if pred:
-                        candidate = choose_valid_pattern(STATE.history)
-                        if candidate:
-                            pred["details"] = {"pattern_key": candidate.get("pattern_key")}
-                        else:
-                            pred["details"] = {"pattern_key": None}
+                        candidate = select_valid_pattern(STATE.history)
+                        pred["details"] = {"pattern_key": candidate.get("pattern_key") if candidate else None}
 
                         STORE.save_prediction({
                             **pred,
@@ -1075,7 +1071,7 @@ async def worker_loop(app, session):
             await asyncio.sleep(2)
 
 async def health_check(request):
-    return web.Response(text="FTW FIX PATTERN is Running")
+    return web.Response(text="FTW RECENT PATTERN is Running")
 
 async def start_web_server():
     app = web.Application()
