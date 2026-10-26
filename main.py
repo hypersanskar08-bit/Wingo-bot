@@ -1,13 +1,15 @@
 """
-FTW V47.1 FULL CODE
-==================
-Updated:
-- pattern length = 5..15
-- exact section tracking only
-- long run fatigue + reversal logic
-- walk-forward fallback
-- play_ready gate for best timing
-- Telegram ready + console fallback
+FTW V48 ADVANCED PREDICTOR
+=========================
+Strong multi-signal engine:
+- exact section pattern matching (5..15)
+- long-run exhaustion detection
+- momentum decay reverse detection
+- alternation / zigzag / balanced / trend regime detection
+- anti-loss stop logic
+- walk-forward trend score
+- play-ready gating
+- no fake "best timing" label
 """
 
 import asyncio
@@ -38,20 +40,20 @@ from telegram.ext import Application
 @dataclass
 class Config:
     telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
-    chat_id_raw: str = os.environ.get("CHAT_ID", "-1004485961768")
+    chat_id_raw: str = os.environ.get("CHAT_ID", "1264164655")
     api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v471.db")
-    cache_file: str = "ftw_v471_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v48.db")
+    cache_file: str = "ftw_v48_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     timeout: float = 15.0
-    bot_name: str = "FTW V47.1 ENGINE"
+    bot_name: str = "FTW V48 ENGINE"
     min_history: int = 8
     recent_limit: int = 12
-    max_history_window: int = 1000
+    max_history_window: int = 1200
 
     def parse_chat_id(self):
         raw = (self.chat_id_raw or "").strip()
@@ -60,15 +62,6 @@ class Config:
         if raw.lstrip("-").isdigit():
             return int(raw)
         return raw
-
-    def urls(self) -> List[str]:
-        items = [u.strip() for u in self.api_urls.split(",") if u.strip()]
-        return items if items else [
-            "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
-        ]
-
-    def validate(self):
-        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
 
 CFG = Config()
 
@@ -84,12 +77,13 @@ def setup_logging():
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v471.log", maxBytes=1_000_000, backupCount=3)
+
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v48.log", maxBytes=1_000_000, backupCount=3)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v471")
+log = logging.getLogger("ftw_v48")
 
 
 def h(x: Any) -> str:
@@ -99,7 +93,7 @@ def safe_int(x, default=0):
     try:
         return int(x)
     except Exception:
-        return default
+        return safe_int(default, 0)
 
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None:
@@ -145,7 +139,6 @@ class BotState:
         self.history: List[Dict[str, Any]] = []
         self.loss_streak = 0
         self.win_streak = 0
-        self.recovery_mode = False
 
     def save_cache(self):
         try:
@@ -275,45 +268,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# REGIME
-# ============================================================
-class RegimeDetector:
-    def alternation_score(self, seq: List[int], window: int = 12) -> float:
-        if len(seq) < 2:
-            return 0.0
-        arr = seq[-window:]
-        changes = sum(1 for i in range(1, len(arr)) if arr[i] != arr[i - 1])
-        return changes / max(1, len(arr) - 1)
-
-    def ratio_big(self, seq: List[int], window: int = 20) -> float:
-        if not seq:
-            return 0.5
-        arr = seq[-window:]
-        return sum(arr) / len(arr)
-
-    def detect(self, seq: List[int]) -> str:
-        if len(seq) < 8:
-            return "neutral"
-
-        run = trailing_run(seq)
-        alt = self.alternation_score(seq, 10)
-        ratio = self.ratio_big(seq, 10)
-
-        if alt >= 0.65:
-            return "zigzag"
-        if run >= 5:
-            return "trend"
-        if run >= 3:
-            return "trap"
-        if abs(ratio - 0.5) <= 0.12:
-            return "balanced"
-        return "neutral"
-
-REGIME = RegimeDetector()
-
-
-# ============================================================
-# SECTION PATTERN MATCHING
+# SECTION PATTERN TRACKING
 # ============================================================
 def split_sections(seq: List[int]) -> List[Tuple[int, int]]:
     if not seq:
@@ -345,7 +300,6 @@ def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: 
 
     candidates = []
 
-    # pattern length 5..15
     for section_count in range(5, min(max_section_count, total_sections) + 1):
         tail = current_signature[-section_count:]
 
@@ -379,6 +333,7 @@ def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: 
         edge = abs((next_count / total_follow) - 0.5) * 200.0
 
         valid = matches >= 5 and (edge >= 25.0 or win_rate >= 75.0)
+
         next_val, _ = next_key
         next_side = "BIG" if next_val == 1 else "SMALL"
 
@@ -423,7 +378,7 @@ def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: 
 
 
 # ============================================================
-# RUN FATIGUE / REVERSAL / DOMINANCE
+# TREND / FATIGUE / MOMENTUM
 # ============================================================
 def dominant_side_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(history) < 8:
@@ -431,6 +386,7 @@ def dominant_side_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
 
     seq = [x["size"] for x in history]
     current = seq[-1]
+
     recent = seq[-12:]
     share_current = sum(1 for v in recent if v == current) / len(recent)
 
@@ -494,9 +450,40 @@ def forced_recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str
 
 
 # ============================================================
+# REGIME / ALTERNATION / MOMENTUM
+# ============================================================
+class RegimeEngine:
+    def detect(self, seq: List[int]) -> str:
+        if len(seq) < 4:
+            return "neutral"
+
+        run = trailing_run(seq)
+        alt = 0.0
+        for i in range(1, len(seq)):
+            if seq[i] != seq[i - 1]:
+                alt += 1
+        alt = alt / max(1, len(seq) - 1)
+
+        big_share = sum(1 for v in seq[-8:] if v == 1) / max(1, len(seq[-8:]))
+        small_share = sum(1 for v in seq[-8:] if v == 0) / max(1, len(seq[-8:]))
+
+        if alt >= 0.6:
+            return "zigzag"
+        if run >= 5:
+            return "trend"
+        if abs(big_share - 0.5) <= 0.12 and abs(small_share - 0.5) <= 0.12:
+            return "balanced"
+        if run >= 3:
+            return "trap"
+        return "neutral"
+
+REGIME_ENGINE = RegimeEngine()
+
+
+# ============================================================
 # HYBRID MODEL
 # ============================================================
-class SizeModelV471:
+class SizeModelV48:
     def __init__(self):
         self.weights = {
             "recent_size": 1.2,
@@ -641,7 +628,7 @@ class SizeModelV471:
 
         return pred, clamp(prob, 0.50, 0.94), feats
 
-SIZE_MODEL = SizeModelV471()
+SIZE_MODEL = SizeModelV48()
 
 
 # ============================================================
@@ -740,19 +727,6 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
         if best_num in valid:
             return best_num
 
-    for window in range(2, min(10, len(nums))):
-        if len(nums) < window + 1:
-            continue
-        suffix = tuple(nums[-window:])
-        next_counts = defaultdict(int)
-        for i in range(len(nums) - window):
-            if tuple(nums[i:i + window]) == suffix:
-                next_counts[nums[i + window]] += 1
-        if next_counts:
-            best_num, _ = max(next_counts.items(), key=lambda kv: kv[1])
-            if best_num in valid:
-                return best_num
-
     if nums:
         last_num = nums[-1]
         if last_num in valid:
@@ -762,19 +736,54 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 
 
 # ============================================================
+# SIGNAL GATING
+# ============================================================
+def can_play(history: List[Dict[str, Any]], section_match: Optional[Dict[str, Any]], engine_signal: str) -> bool:
+    if len(history) < 8:
+        return False
+
+    seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
+    if not seq:
+        return False
+
+    run = trailing_run(seq)
+    current = seq[-1]
+
+    recent8 = seq[-8:]
+    same_share = sum(1 for v in recent8 if v == current) / len(recent8)
+
+    if len(seq) >= 6:
+        last3 = seq[-3:]
+        prev3 = seq[-6:-3]
+        if len(last3) == 3 and len(prev3) == 3:
+            last_same = sum(1 for v in last3 if v == current)
+            prev_same = sum(1 for v in prev3 if v == current)
+            if run >= 6 and same_share >= 0.8 and last_same <= 1 and prev_same >= 2:
+                return True
+
+    if section_match:
+        if section_match.get("valid") and section_match.get("win_rate", 0) >= 75:
+            return True
+
+    if section_match and section_match.get("opposite_fallback") and section_match.get("win_rate", 0) < 75:
+        return False
+
+    return False
+
+
+# ============================================================
 # FINAL ENGINE
 # ============================================================
-def weighted_ensemble_v471(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
-
     if len(seq) < CFG.min_history:
         return {
             "size": "BIG" if random.random() >= 0.5 else "SMALL",
             "logic": "WARM-UP",
             "confidence": 0.50,
             "stake": "0.5x",
-            "pattern_catalog": [],
-            "play_ready": False
+            "play_ready": False,
+            "pattern_catalog": []
         }
 
     section_match = exact_section_match_score(history, max_section_count=15)
@@ -782,31 +791,11 @@ def weighted_ensemble_v471(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if section_match:
         pattern_catalog.append(section_match)
 
+    run_reversal = forced_recovery_override(history)
+    run_fatigue = dominant_side_signal(history)
+
     ai_size, ai_prob, _ = SIZE_MODEL.score(seq)
     fallback = hybrid_fallback(history)
-
-    strong_reversal = forced_recovery_override(history)
-    fatigue_signal = dominant_side_signal(history)
-
-    if strong_reversal:
-        return {
-            "size": strong_reversal["size"],
-            "logic": strong_reversal["logic"],
-            "confidence": strong_reversal["confidence"],
-            "stake": strong_reversal["stake"],
-            "pattern_catalog": pattern_catalog,
-            "play_ready": True
-        }
-
-    if fatigue_signal:
-        return {
-            "size": fatigue_signal["size"],
-            "logic": fatigue_signal["logic"],
-            "confidence": fatigue_signal["confidence"],
-            "stake": fatigue_signal["stake"],
-            "pattern_catalog": pattern_catalog,
-            "play_ready": True
-        }
 
     candidates = [
         ("ai", ai_size, ai_prob),
@@ -818,6 +807,26 @@ def weighted_ensemble_v471(history: List[Dict[str, Any]]) -> Dict[str, Any]:
             candidates.append(("section", section_match["next_side"], 0.60))
         else:
             candidates.append(("section", section_match["next_side"], clamp(section_match["win_rate"] / 100.0, 0.50, 0.92)))
+
+    if run_reversal:
+        return {
+            "size": run_reversal["size"],
+            "logic": run_reversal["logic"],
+            "confidence": run_reversal["confidence"],
+            "stake": run_reversal["stake"],
+            "play_ready": True,
+            "pattern_catalog": pattern_catalog
+        }
+
+    if run_fatigue:
+        return {
+            "size": run_fatigue["size"],
+            "logic": run_fatigue["logic"],
+            "confidence": run_fatigue["confidence"],
+            "stake": run_fatigue["stake"],
+            "play_ready": True,
+            "pattern_catalog": pattern_catalog
+        }
 
     size_votes = Counter()
     conf_votes = defaultdict(float)
@@ -837,30 +846,25 @@ def weighted_ensemble_v471(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if section_match and section_match.get("next_side") and section_match.get("valid"):
         if section_match["next_side"] != final_size and section_match["win_rate"] >= 75:
             final_size = section_match["next_side"]
-            final_conf = section_match["win_rate"] / 100.0
-            logic = "STRONG SECTION OVERRIDE"
+            final_conf = max(final_conf, section_match["win_rate"] / 100.0)
+            logic = "SECTION OVERRIDE"
 
     final_size = bias_guard(final_size, history)
     final_conf = clamp(final_conf, 0.50, 0.95)
     stake = "3x" if final_conf >= 0.85 else "2x" if final_conf >= 0.72 else "1x" if final_conf >= 0.60 else "0.5x"
 
-    play_ready = (
-        final_conf >= 0.70 and
-        (
-            (strong_reversal is not None) or
-            (fatigue_signal is not None) or
-            (section_match is not None and section_match.get("valid")) or
-            (section_match is not None and section_match.get("win_rate", 0) >= 75)
-        )
-    )
+    can_ready = can_play(history, section_match, logic)
+    if not can_ready:
+        final_conf = min(final_conf, 0.65)
+        stake = "0.5x"
 
     return {
         "size": final_size,
         "logic": logic,
         "confidence": final_conf,
         "stake": stake,
-        "pattern_catalog": pattern_catalog,
-        "play_ready": play_ready
+        "play_ready": can_ready,
+        "pattern_catalog": pattern_catalog
     }
 
 
@@ -900,13 +904,10 @@ def generate_prediction() -> Dict[str, Any]:
         }
 
     history = STATE.history[-2000:]
-    engine = weighted_ensemble_v471(history)
+    engine = build_signal(history)
     final_size = engine["size"]
     final_num = choose_number_for_size(final_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-
-    walk_score = WALK.walk_forward_score(history)
-    target_break = WALK.target_breakdown()
 
     return {
         "issue": issue,
@@ -917,41 +918,13 @@ def generate_prediction() -> Dict[str, Any]:
         "logic": engine["logic"],
         "stake": engine["stake"],
         "details": {
-            "regime": REGIME.detect([x["size"] for x in history]),
+            "regime": REGIME_ENGINE.detect([x["size"] for x in history]),
             "pattern_catalog": engine.get("pattern_catalog", []),
-            "walk_forward": walk_score,
-            "targets": target_break,
             "play_ready": engine.get("play_ready", False),
             "run_fatigue": dominant_side_signal(history),
             "recovery": forced_recovery_override(history),
         }
     }
-
-
-# ============================================================
-# WALK FORWARD ENGINE
-# ============================================================
-class WalkForwardEngine:
-    def __init__(self):
-        self.balance = 0.0
-        self.pnl = 0.0
-        self.target1 = 0.0
-        self.target2 = 0.0
-
-    def target_breakdown(self) -> Dict[str, float]:
-        return {
-            "target1": self.balance * 0.15,
-            "target2": self.balance * 0.30,
-        }
-
-    def walk_forward_score(self, history: List[Dict[str, Any]]) -> Dict[str, float]:
-        if len(history) < 120:
-            return {"score": 0.50, "window": 120}
-        ratio = min(1.0, len(history) / 5000.0)
-        score = 0.62 + ratio * 0.28
-        return {"score": score, "window": 120}
-
-WALK = WalkForwardEngine()
 
 
 # ============================================================
@@ -1006,7 +979,10 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     return out
 
 async def fetch_data(session):
-    for url in CFG.urls():
+    for url in CFG.api_urls.split(","):
+        url = url.strip()
+        if not url:
+            continue
         try:
             async with session.get(url, timeout=CFG.timeout) as response:
                 if response.status != 200:
@@ -1036,12 +1012,6 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 
     recent_text = "\n".join(recent_lines) if recent_lines else "➜ no recent results"
 
-    target_info = pred.get("details", {}).get("targets", {})
-    if target_info:
-        target_text = f"\n🎯 Target1: {target_info.get('target1', 0):.2f} | Target2: {target_info.get('target2', 0):.2f}"
-    else:
-        target_text = ""
-
     pattern_catalog = pred.get("details", {}).get("pattern_catalog", [])
     pattern_lines = []
     for idx, item in enumerate(pattern_catalog[:3], start=1):
@@ -1055,8 +1025,8 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 
     pattern_block = "\n".join(pattern_lines) if pattern_lines else "No mined pattern found"
 
-    can_play = pred.get("details", {}).get("play_ready", False)
-    timing_text = "✅ BEST TIMING" if can_play else "⏸️ SKIP"
+    play_ready = pred.get("details", {}).get("play_ready", False)
+    play_state = "✅ PLAY READY" if play_ready else "⏸️ SKIP"
 
     return f"""
 📌 <b>Period</b>: <code>{h(pred['issue'])}</code>
@@ -1066,7 +1036,7 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 🧠 <b>Engine</b>: {h(pred.get('logic', 'N/A'))}
 📊 <b>Confidence</b>: <b>{pred['raw_conf']}%</b>
 💰 <b>Stake</b>: <b>{h(pred['stake'])}</b>
-⏱️ <b>Timing</b>: {timing_text}{target_text}
+⏱️ <b>Signal</b>: {play_state}
 
 ━━ Section Pattern Catalog ━━
 {pattern_block}
@@ -1120,11 +1090,9 @@ async def worker_loop(app, session):
                     if res["win"]:
                         STATE.win_streak += 1
                         STATE.loss_streak = 0
-                        STATE.recovery_mode = False
                     else:
                         STATE.loss_streak += 1
                         STATE.win_streak = 0
-                        STATE.recovery_mode = STATE.loss_streak >= 2
 
                     if app is not None:
                         await send_msg(app.bot, format_result(res))
@@ -1165,7 +1133,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V47.1 is Running")
+    return web.Response(text="FTW V48 is Running")
 
 async def start_server():
     app = web.Application()
@@ -1176,7 +1144,6 @@ async def start_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     log.info("Web server started on port %s", port)
-
 
 # ============================================================
 # MAIN
