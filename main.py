@@ -133,7 +133,7 @@ def volatility(seq: List[int], window: int = 20) -> float:
     if len(seq) < 2:
         return 0.0
     arr = seq[-window:]
-    diffs = [abs(arr[i] - arr[i - 1)] for i in range(1, len(arr))]
+    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 def ratio_big(seq: List[int], window: int = 20) -> float:
@@ -423,7 +423,6 @@ def should_send_prediction(history: List[Dict[str, Any]], signal: Optional[Dict[
         if run >= 4:
             pattern_count += 1
 
-    # signal must be stronger than a weak heuristic
     if pattern_count == 0 and confidence < 0.82:
         return False
 
@@ -738,7 +737,6 @@ def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
 
-    # strong exact number match only
     for w in range(3, 9):
         if len(history) < w + 1:
             continue
@@ -812,7 +810,6 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     final_conf = clamp(final_score, 0.55, 0.94)
     logic = exact["logic"] if exact else "STRICT ENSEMBLE: PATTERN + CONTEXT + HYBRID"
 
-    # strict skip
     if final_conf < 0.75:
         return {
             "size": "BIG" if result_bias(history) >= 0.5 else "SMALL",
