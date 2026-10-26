@@ -1,15 +1,14 @@
 """
-FTW AI V29 FULL SCRIPT
-=====================
-Advanced AI predictor with:
-- 12 model inputs
-- weighted scoring
-- trap protection
-- momentum + pattern + reversal logic
-- number prediction
-- Telegram bot
-- SQLite result tracking
-- API fetch loop
+FTW AI V30 FULL CODE
+====================
+- Advanced AI size predictor
+- Advanced number predictor
+- 12-feature size model
+- Weighted number distribution engine
+- Exact suffix continuation weighting
+- Family bias + recency bias + pattern bias
+- Trap protection
+- Telegram ready
 """
 
 import asyncio
@@ -43,12 +42,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v29_full.db")
-    cache_file: str = "ftw_ai_v29_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v30_full.db")
+    cache_file: str = "ftw_ai_v30_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW AI V29"
+    bot_name: str = "FTW AI V30"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 2000
@@ -73,7 +72,6 @@ CFG = Config()
 # ============================================================
 def setup_logging():
     Path(CFG.log_dir).mkdir(parents=True, exist_ok=True)
-
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -82,19 +80,15 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_ai_v29_full.log",
-        maxBytes=1_000_000,
-        backupCount=3,
-    )
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_ai_v30_full.log", maxBytes=1_000_000, backupCount=3)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_ai_v29")
+log = logging.getLogger("ftw_ai_v30")
 
 # ============================================================
-# UTILITIES
+# HELPERS
 # ============================================================
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -129,21 +123,21 @@ def trailing_run(seq: List[int]) -> int:
     if not seq:
         return 0
     last = seq[-1]
-    c = 1
-    for i in range(len(seq)-2, -1, -1):
+    r = 1
+    for i in range(len(seq) - 2, -1, -1):
         if seq[i] == last:
-            c += 1
+            r += 1
         else:
             break
-    return c
+    return r
 
 def family_for_size(size: str) -> List[int]:
     return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
 
 # ============================================================
-# AI SCORER
+# ADVANCED AI SIZE SCORER
 # ============================================================
-class AdvancedAIScorer:
+class AdvancedSizeScorer:
     def __init__(self):
         self.weights = {
             "recent_size": 1.25,
@@ -162,11 +156,6 @@ class AdvancedAIScorer:
 
     def _sigmoid(self, x: float) -> float:
         return 1.0 / (1.0 + math.exp(-x))
-
-    def _recent_size_bias(self, seq: List[int]) -> float:
-        if not seq:
-            return 0.0
-        return 1.0 if seq[-1] == 1 else -1.0
 
     def _run_length(self, seq: List[int]) -> Tuple[float, int]:
         if not seq:
@@ -192,7 +181,7 @@ class AdvancedAIScorer:
             return 0.0
         flips = 0
         for i in range(1, len(seq)):
-            if seq[i] != seq[i-1]:
+            if seq[i] != seq[i - 1]:
                 flips += 1
         return (flips / max(1, len(seq)-1)) * 2.0 - 1.0
 
@@ -259,7 +248,7 @@ class AdvancedAIScorer:
     def compute_features(self, seq: List[int]) -> Dict[str, float]:
         run_sign, run_len = self._run_length(seq)
         return {
-            "recent_size": self._recent_size_bias(seq),
+            "recent_size": 1.0 if seq[-1] == 1 else -1.0 if seq[-1] == 0 else 0.0,
             "run_length": run_sign * min(run_len / 10.0, 1.0),
             "last3_big_ratio": self._big_ratio(seq, 3),
             "last5_big_ratio": self._big_ratio(seq, 5),
@@ -282,25 +271,188 @@ class AdvancedAIScorer:
         for name, value in features.items():
             logit += self.weights[name] * value
 
-        final_prob = self._sigmoid(logit)
-        label = "BIG" if final_prob >= 0.5 else "SMALL"
+        prob = self._sigmoid(logit)
+        label = "BIG" if prob >= 0.5 else "SMALL"
 
         # Trap protection:
-        # only invert when run is weak and multiple conflicting signals exist
+        # do not invert on consensus alone; only prevent overreaction in a strong current streak
         run_sign, run_len = self._run_length(seq)
-        if run_len >= 2:
-            # strong current-side run should not be beaten by weak consensus alone
-            if features["consensus"] > 0.4 and abs(final_prob - 0.5) < 0.10:
-                if label == "BIG":
-                    label = "SMALL"
-                    final_prob = 0.35
-                else:
-                    label = "BIG"
-                    final_prob = 0.65
+        if run_len >= 3 and abs(prob - 0.5) < 0.12:
+            if run_sign > 0:
+                label = "BIG"
+                prob = 0.65
+            else:
+                label = "SMALL"
+                prob = 0.35
 
-        return label, final_prob, features
+        return label, clamp(prob, 0.50, 0.95), features
 
-SCORER = AdvancedAIScorer()
+SIZE_SCORER = AdvancedSizeScorer()
+
+# ============================================================
+# ADVANCED NUMBER PREDICTOR
+# ============================================================
+class AdvancedNumberPredictor:
+    def __init__(self):
+        pass
+
+    def _digit_distribution(self, seq: List[int]) -> Dict[int, float]:
+        if not seq:
+            return {d: 1/10 for d in range(10)}
+
+        counts = Counter(seq)
+        total = len(seq)
+        dist = {d: 0.0 for d in range(10)}
+        for d in range(10):
+            dist[d] = counts.get(d, 0) / total
+
+        # recency boost
+        for idx, d in enumerate(reversed(seq[-20:])):
+            weight = 1.0 + (idx / 20.0)
+            dist[d] += 0.06 * weight
+
+        # normalize
+        s = sum(dist.values())
+        if s == 0:
+            return {d: 1/10 for d in range(10)}
+        for d in dist:
+            dist[d] /= s
+        return dist
+
+    def _suffix_pattern_distribution(self, seq: List[int]) -> Dict[int, float]:
+        dist = {d: 0.0 for d in range(10)}
+        if len(seq) < 3:
+            return dist
+
+        for window in range(2, min(8, len(seq))):
+            suffix = tuple(seq[-window:])
+            count = 0
+            for i in range(len(seq) - window):
+                if tuple(seq[i:i+window]) == suffix:
+                    nxt = seq[i + window]
+                    count += 1
+                    dist[nxt] += 1.0 / (window * 1.2)
+
+            if count == 0:
+                continue
+
+        total = sum(dist.values())
+        if total == 0:
+            return {d: 1/10 for d in range(10)}
+        for d in dist:
+            dist[d] /= total
+        return dist
+
+    def _family_bias(self, predicted_size: str) -> Dict[int, float]:
+        target_family = family_for_size(predicted_size)
+        dist = {d: 0.0 for d in range(10)}
+        for d in range(10):
+            if d in target_family:
+                dist[d] = 1.0
+            else:
+                dist[d] = 0.15
+
+        # prefer center of family
+        if predicted_size == "SMALL":
+            center_priority = {0: 0.9, 1: 0.95, 2: 1.0, 3: 1.05, 4: 1.0}
+            for d, val in center_priority.items():
+                dist[d] *= val
+        else:
+            center_priority = {5: 0.9, 6: 1.0, 7: 1.05, 8: 1.0, 9: 0.9}
+            for d, val in center_priority.items():
+                dist[d] *= val
+
+        total = sum(dist.values())
+        if total == 0:
+            return {d: 1/10 for d in range(10)}
+        for d in dist:
+            dist[d] /= total
+        return dist
+
+    def _last_digit_bias(self, seq: List[int]) -> Dict[int, float]:
+        dist = {d: 0.0 for d in range(10)}
+        if not seq:
+            return {d: 1/10 for d in range(10)}
+
+        last = seq[-1]
+        for d in range(10):
+            dist[d] = 0.25
+        dist[last] += 1.5
+
+        # near-number stability
+        for d in range(10):
+            if abs(d - last) <= 1:
+                dist[d] += 0.4
+
+        total = sum(dist.values())
+        for d in dist:
+            dist[d] /= total
+        return dist
+
+    def _parity_bias(self, seq: List[int]) -> Dict[int, float]:
+        if not seq:
+            return {d: 1/10 for d in range(10)}
+        even = sum(1 for x in seq if x % 2 == 0)
+        odd = sum(1 for x in seq if x % 2 != 0)
+        dist = {d: 0.0 for d in range(10)}
+        for d in range(10):
+            if d % 2 == 0:
+                dist[d] = 0.55 if even >= odd else 0.45
+            else:
+                dist[d] = 0.55 if odd > even else 0.45
+        total = sum(dist.values())
+        for d in dist:
+            dist[d] /= total
+        return dist
+
+    def _trend_bias(self, seq: List[int]) -> Dict[int, float]:
+        dist = {d: 0.0 for d in range(10)}
+        if len(seq) < 3:
+            return {d: 1/10 for d in range(10)}
+        last_three = seq[-3:]
+        avg = sum(last_three) / 3
+        for d in range(10):
+            dist[d] = 0.5 + (0.15 * (1 - abs(d - avg) / 10.0))
+        total = sum(dist.values())
+        for d in dist:
+            dist[d] /= total
+        return dist
+
+    def predict(self, seq: List[int], predicted_size: str) -> int:
+        if not seq:
+            return random.choice(family_for_size(predicted_size))
+
+        base = self._digit_distribution(seq)
+        suffix = self._suffix_pattern_distribution(seq)
+        family = self._family_bias(predicted_size)
+        last_bias = self._last_digit_bias(seq)
+        parity = self._parity_bias(seq)
+        trend = self._trend_bias(seq)
+
+        combined = {d: 0.0 for d in range(10)}
+        for d in range(10):
+            # weighted merge
+            combined[d] = (
+                base.get(d, 0.0) * 0.25 +
+                suffix.get(d, 0.0) * 0.30 +
+                family.get(d, 0.0) * 0.25 +
+                last_bias.get(d, 0.0) * 0.08 +
+                parity.get(d, 0.0) * 0.06 +
+                trend.get(d, 0.0) * 0.06
+            )
+
+        # Strong anti-collapse rule:
+        # if a digit outside the target family is too high, suppress it
+        target_family = set(family_for_size(predicted_size))
+        for d in range(10):
+            if d not in target_family:
+                combined[d] *= 0.25
+
+        # Avoid collapse to single number
+        winner = max(combined, key=combined.get)
+        return int(winner)
+
+NUMBER_MODEL = AdvancedNumberPredictor()
 
 # ============================================================
 # STATE
@@ -330,7 +482,7 @@ class BotState:
 STATE = BotState()
 
 # ============================================================
-# SQLite STORAGE
+# STORAGE
 # ============================================================
 class Storage:
     def __init__(self, path: str):
@@ -442,102 +594,48 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# PREDICTION ENGINE
+# BUILD PREDICTION
 # ============================================================
-def predict_size(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(history) < CFG.min_history:
-        size = "BIG" if random.random() >= 0.5 else "SMALL"
-        return {
-            "size": size,
-            "logic": "SEED MODE",
-            "confidence": 0.54,
-            "stake": "0.5x",
-            "details": {"mode": "seed"}
-        }
-
-    seq = [x["size"] for x in history]
-    label, prob, features = SCORER.score(seq)
-
-    if label == "BIG":
-        size = "BIG"
-    else:
-        size = "SMALL"
-
-    confidence = clamp(prob, 0.52, 0.96)
-    stake = "3x" if confidence > 0.85 else "2x" if confidence > 0.72 else "1x" if confidence > 0.60 else "0.5x"
-
-    return {
-        "size": size,
-        "logic": f"AI-12-FEATURE ({label} @ {confidence * 100:.1f}%)",
-        "confidence": confidence,
-        "stake": stake,
-        "details": {
-            "features": features,
-            "probability": prob
-        }
-    }
-
-def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
-    valid = family_for_size(size)
-    nums = [x["num"] for x in history if x.get("num") is not None]
-
-    if nums:
-        recent = nums[-40:]
-        counts = Counter([n for n in recent if n in valid])
-        if counts:
-            best_num, best_count = counts.most_common(1)[0]
-            if best_count >= 2:
-                return best_num
-
-    for window in range(3, 7):
-        if len(nums) < window + 2:
-            continue
-        suffix = tuple(nums[-window:])
-        counts = defaultdict(int)
-        for i in range(len(nums)-window):
-            if tuple(nums[i:i+window]) == suffix:
-                counts[nums[i+window]] += 1
-        if counts:
-            best_num, _ = max(counts.items(), key=lambda kv: kv[1])
-            if best_num in valid:
-                return best_num
-
-    if nums:
-        family_counts = Counter([n for n in nums if n in valid])
-        if family_counts:
-            return family_counts.most_common(1)[0][0]
-
-    return random.choice(valid)
-
 def build_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(history) < CFG.min_history:
         size = "BIG" if random.random() >= 0.5 else "SMALL"
-        issue = "1"
+        num = random.choice(family_for_size(size))
         return {
-            "issue": issue,
+            "issue": "1",
             "type": "SIZE",
             "size": size,
-            "num": random.choice(family_for_size(size)),
+            "num": num,
             "raw_conf": 50,
             "logic": "WARM-UP",
             "stake": "0.5x",
             "details": {}
         }
 
+    seq = [x["size"] for x in history]
+    size_pred, prob, features = SIZE_SCORER.score(seq)
+    size = "BIG" if size_pred == "BIG" else "SMALL"
+    num_seq = [x["num"] for x in history if x.get("num") is not None]
+
+    # Number generator fixed
+    target_num = NUMBER_MODEL.predict(num_seq, size)
+
+    confidence = int(prob * 100)
+    stake = "3x" if confidence >= 85 else "2x" if confidence >= 72 else "1x" if confidence >= 60 else "0.5x"
+
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-    s = predict_size(history)
-    size = s["size"]
-    num = choose_number_for_size(size, history)
 
     return {
         "issue": issue,
         "type": "SIZE",
         "size": size,
-        "num": num,
-        "raw_conf": int(s["confidence"] * 100),
-        "logic": s["logic"],
-        "stake": s["stake"],
-        "details": s["details"]
+        "num": target_num,
+        "raw_conf": confidence,
+        "logic": f"AI-12-INPUT ({size} @ {confidence}%)",
+        "stake": stake,
+        "details": {
+            "size_features": features,
+            "size_probability": prob
+        }
     }
 
 # ============================================================
@@ -573,6 +671,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
         issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
         if issue is None:
             continue
+
         key = str(issue)
         if key in seen:
             continue
@@ -585,7 +684,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
         out.append({
             "issue": str(issue),
             "num": num,
-            "size": 1 if num >= 5 else 0,
+            "size": 1 if num >= 5 else 0
         })
 
     out.sort(key=lambda x: int(x["issue"]))
@@ -698,7 +797,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW AI V29 is Running")
+    return web.Response(text="FTW AI V30 is Running")
 
 async def main():
     CFG.validate()
