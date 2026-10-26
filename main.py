@@ -1,9 +1,9 @@
 """
-FTW V20 FULL CODE (SMART RECOVERY + STRICT INVERSION)
+FTW V21 FULL CODE (EDGE BASED INVERSION)
 =================
-- Inverts ONLY if WR < 50% (or Trap detected)
-- Removed blind Loss Rollback (Now rides strong trends during losses)
-- Strict Confidence filtering for Sequence Patterns
+- Edge > 20% = Follow Pattern
+- Edge < 20% = Invert Pattern (Trap / Weak Signal)
+- Smart Recovery (Rides the trend during loss streak)
 - 5 to 14 Size Sequence Tracking
 - Telegram VIP Channel Ready
 """
@@ -38,12 +38,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v20_full.db")
-    cache_file: str = "ftw_v20_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v21_full.db")
+    cache_file: str = "ftw_v21_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V20 SMART ENGINE"
+    bot_name: str = "FTW V21 EDGE ENGINE"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -75,12 +75,12 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v20_full.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v21_full.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v20")
+log = logging.getLogger("ftw_v21")
 
 def h(x: Any) -> str: return html.escape(str(x))
 def safe_int(x, default=0):
@@ -418,7 +418,7 @@ def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
     return None
 
 # ============================================================
-# DEEP UPGRADE: STRONG PATTERN ANALYSIS (STRICT INVERSION)
+# DEEP UPGRADE: EDGE BASED INVERSION
 # ============================================================
 def strong_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seq = [x["size"] for x in history]
@@ -457,24 +457,27 @@ def strong_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, A
             pred = "BIG" if big_prob >= small_prob else "SMALL"
             win_rate = max(big_prob, small_prob)
             
+            # 🆕 EDGE CALCULATION: Difference between Big and Small Probabilities
+            edge = abs(big_prob - small_prob) * 100.0
+            
             is_inverted = False
             
-            # 🆕 USER RULE: Invert ONLY if Win Rate < 50% (Meaning the pattern is extremely weak)
-            if win_rate < 0.50:
+            # 🆕 USER RULE: Invert if Edge < 20% (Meaning WR is < 60%)
+            if edge < 20.0:
                 pred = "SMALL" if pred == "BIG" else "BIG"
                 is_inverted = True
-                confidence = (1.0 - win_rate) * 100.0
+                confidence = 55.0 # Base confidence for inverted trap
             else:
                 confidence = win_rate * 100.0
                 
-            # 🆕 TRAP DETECTION: If WR is good (50-60%), but failed recently, invert it.
-            if len(recent_matches) >= 2 and not is_inverted and win_rate < 0.65:
+            # 🆕 TRAP DETECTION: If Edge is good (>20%), but it failed recently, invert it.
+            if len(recent_matches) >= 2 and not is_inverted:
                 hist_pred = "BIG" if big_prob >= small_prob else "SMALL"
                 fails = sum(1 for res in recent_matches[-2:] if (res == 1 and hist_pred == "SMALL") or (res == 0 and hist_pred == "BIG"))
                 if fails >= 2:
                     pred = "SMALL" if pred == "BIG" else "BIG"
                     is_inverted = True
-                    confidence = 65.0 # Boost confidence for Trap Reversal
+                    confidence = 65.0 
                     
             if confidence >= 10.0:
                 score = confidence + (exact_weight_total * 4.0) + (window * 3.0)
@@ -483,7 +486,8 @@ def strong_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, A
                 candidates.append({
                     "window": window, "pred": pred, "confidence": confidence, 
                     "support": exact_weight_total, "score": score, 
-                    "key": f"EX:{window}:{suffix}", "tag": tag, "win_rate": win_rate * 100
+                    "key": f"EX:{window}:{suffix}", "tag": tag, 
+                    "win_rate": win_rate * 100, "edge": edge
                 })
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -498,7 +502,9 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
     confidence = clamp(best["confidence"] / 100.0, 0.55, 0.95)
     
     STORE.update_pattern_stats(best["key"], 1 if pred == "BIG" else 0)
-    logic_text = f"{best['tag']} EXACT {best['window']}-SEQ (WR: {best['win_rate']:.1f}%)"
+    
+    # 🆕 Displaying both WR and Edge for clarity
+    logic_text = f"{best['tag']} {best['window']}-SEQ (WR:{best['win_rate']:.1f}% | Edge:{best['edge']:.1f}%)"
     
     return {
         "size": pred, "logic": logic_text, "confidence": confidence, 
@@ -611,7 +617,7 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "1x" if confidence >= 0.68 else "0.5x"}
 
 # ============================================================
-# DEEP UPGRADE: SMART RECOVERY (NO BLIND ROLLBACK)
+# SMART RECOVERY (NO BLIND ROLLBACK)
 # ============================================================
 def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     seq = [x["size"] for x in history]
@@ -626,22 +632,18 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     reversal = trend_reversal_signal(history)
     if reversal: return reversal
 
-    # 🆕 SMART RECOVERY (Replaced blind Loss Rollback)
-    # If bot is on a loss streak, DON'T fight the market. Ride the trend.
     if STATE.loss_streak >= 2:
         run = trailing_run(seq)
         if run >= 4:
             last = seq[-1]
             return {"size": "BIG" if last == 1 else "SMALL", "logic": "RECOVERY: RIDING STRONG TREND", "confidence": 0.80, "stake": "1x"}
             
-        # If trend is weak, use controlled recovery
         recent = seq[-6:]
         small_share = sum(1 for v in recent if v == 0) / len(recent)
         big_share = sum(1 for v in recent if v == 1) / len(recent)
         if small_share >= 0.80 and big_share <= 0.20: return {"size": "BIG", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
         if big_share >= 0.80 and small_share <= 0.20: return {"size": "SMALL", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
 
-    # Normal Dragon Riding (Even without loss streak)
     if trailing_run(seq) >= 3:
         last = seq[-1]
         last3, prev3 = seq[-3:], seq[-6:-3]
@@ -718,20 +720,17 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     final_score = fallback["confidence"]
     logic = "HYBRID FALLBACK"
     
-    # 1. Exact Pattern Override
-    if exact and exact["confidence"] >= 0.55: # Minimum threshold
+    if exact and exact["confidence"] >= 0.55:
         final_size = exact["size"]
         final_score = exact["confidence"]
         logic = exact["logic"]
 
-    # 2. Trend Tracker Override (Only if very strong)
     hist = advanced_trend_shift_tracker(history)
     if hist and hist["confidence"] > final_score:
         final_size = hist["size"]
         final_score = hist["confidence"]
         logic = hist["logic"]
 
-    # 3. Reversal Pressure Override
     reversal = trend_reversal_signal(history)
     if reversal and reversal["confidence"] > final_score:
         final_size = reversal["size"]
@@ -914,7 +913,7 @@ async def worker_loop(app, session):
             log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
 
-async def health_check(request): return web.Response(text="FTW V20 is Running")
+async def health_check(request): return web.Response(text="FTW V21 is Running")
 
 async def start_web_server():
     app = web.Application()
