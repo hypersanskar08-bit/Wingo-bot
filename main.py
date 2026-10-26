@@ -1,14 +1,14 @@
 """
-FTW AI V30 FULL CODE
+FTW AI V31 FULL CODE
 ====================
-- Advanced AI size predictor
-- Advanced number predictor
-- 12-feature size model
-- Weighted number distribution engine
-- Exact suffix continuation weighting
-- Family bias + recency bias + pattern bias
-- Trap protection
-- Telegram ready
+- Strongest pattern detector
+- Pattern length: 5..15
+- Match against recent 1000 result history
+- Super advanced trend shift detector
+- Stronger number prediction
+- Telegram bot
+- SQLite tracking
+- API fetch loop
 """
 
 import asyncio
@@ -42,15 +42,15 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v30_full.db")
-    cache_file: str = "ftw_ai_v30_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v31_full.db")
+    cache_file: str = "ftw_ai_v31_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW AI V30"
+    bot_name: str = "FTW AI V31"
     min_history: int = 8
     recent_limit: int = 12
-    max_history_window: int = 2000
+    max_history_window: int = 1000
 
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
@@ -80,12 +80,12 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_ai_v30_full.log", maxBytes=1_000_000, backupCount=3)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_ai_v31_full.log", maxBytes=1_000_000, backupCount=3)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_ai_v30")
+log = logging.getLogger("ftw_ai_v31")
 
 # ============================================================
 # HELPERS
@@ -135,7 +135,301 @@ def family_for_size(size: str) -> List[int]:
     return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
 
 # ============================================================
-# ADVANCED AI SIZE SCORER
+# PATTERN + TREND SHIFT DETECTOR
+# ============================================================
+class PatternDetectorV31:
+    def __init__(self):
+        self.min_window = 5
+        self.max_window = 15
+        self.recent_limit = 1000
+
+    def trailing_run(self, seq: List[int]) -> int:
+        return trailing_run(seq)
+
+    def last_n(self, seq: List[int], n: int) -> List[int]:
+        return seq[-n:] if len(seq) >= n else seq
+
+    def ratio_big(self, seq: List[int], n: int) -> float:
+        if len(seq) < n:
+            return 0.0
+        window = seq[-n:]
+        return (window.count(1) / n) * 2.0 - 1.0
+
+    def alternation_score(self, seq: List[int]) -> float:
+        if len(seq) < 4:
+            return 0.0
+        flips = 0
+        for i in range(1, len(seq)):
+            if seq[i] != seq[i - 1]:
+                flips += 1
+        return (flips / max(1, len(seq) - 1)) * 2.0 - 1.0
+
+    def volatility(self, seq: List[int]) -> float:
+        if len(seq) < 5:
+            return 0.0
+        diffs = [seq[i] - seq[i-1] for i in range(1, len(seq))]
+        avg_abs = sum(abs(d) for d in diffs) / len(diffs)
+        return (avg_abs * 2.0) - 1.0
+
+    def trend_velocity(self, seq: List[int]) -> float:
+        if len(seq) < 6:
+            return 0.0
+        a = seq[-6:-3]
+        b = seq[-3:]
+        avg_a = sum(a) / len(a)
+        avg_b = sum(b) / len(b)
+        return (avg_b - avg_a) * 2.0
+
+    def reversal_pressure(self, seq: List[int]) -> float:
+        if len(seq) < 5:
+            return 0.0
+        last = seq[-1]
+        recent = seq[-5:]
+        same = recent.count(last)
+        opp = recent.count(1 - last)
+        return ((opp - same) / max(1, len(recent))) * 2.0
+
+    def exact_pattern_search(self, seq: List[int], window: int) -> Dict[str, float]:
+        if len(seq) < window + 2:
+            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
+
+        suffix = tuple(seq[-window:])
+        big = 0.0
+        small = 0.0
+        total = 0.0
+
+        # Search recent 1000 only, but in local seq already limited
+        for i in range(len(seq) - window - 1):
+            candidate = tuple(seq[i:i + window])
+            if candidate != suffix:
+                continue
+
+            next_val = seq[i + window]
+            distance = len(seq) - (i + window)
+            weight = max(0.15, 1.0 - (distance / 1000.0))
+            total += weight
+            if next_val == 1:
+                big += weight
+            else:
+                small += weight
+
+        if total == 0:
+            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
+
+        p_big = (big + 1.0) / (total + 2.0)
+        p_small = (small + 1.0) / (total + 2.0)
+
+        return {
+            "BIG": p_big,
+            "SMALL": p_small,
+            "strength": abs(p_big - p_small),
+        }
+
+    def detect_super_pattern(self, seq: List[int]) -> Dict[str, Any]:
+        best = {"window": 0, "pred": "BIG", "confidence": 0.0, "score": 0.0, "details": {}}
+
+        for window in range(self.min_window, self.max_window + 1):
+            if len(seq) < window + 2:
+                continue
+
+            result = self.exact_pattern_search(seq, window)
+            p_big = result["BIG"]
+            p_small = result["SMALL"]
+            strength = result["strength"]
+
+            if strength <= 0.0:
+                continue
+
+            pred = "BIG" if p_big >= p_small else "SMALL"
+            confidence = max(p_big, p_small)
+            score = strength * 100.0 + (window * 2.0)
+
+            if score > best["score"]:
+                best = {
+                    "window": window,
+                    "pred": pred,
+                    "confidence": confidence,
+                    "score": score,
+                    "details": {
+                        "p_big": p_big,
+                        "p_small": p_small,
+                        "strength": strength,
+                    }
+                }
+
+        return best
+
+    def detect_regime(self, seq: List[int]) -> str:
+        if len(seq) < 8:
+            return "neutral"
+
+        run = self.trailing_run(seq)
+        alt = self.alternation_score(seq)
+        vel = self.trend_velocity(seq)
+        last3 = seq[-3:]
+        last5 = seq[-5:]
+
+        # trend up/down
+        if run >= 4 and seq[-1] == 1:
+            return "trend_up"
+        if run >= 4 and seq[-1] == 0:
+            return "trend_down"
+
+        # very strong alternation
+        if alt > 0.45:
+            return "zigzag"
+
+        # switch detection
+        if vel > 0.75 and sum(last3) >= 2:
+            return "shift_up"
+        if vel < -0.75 and sum(last3) <= 1:
+            return "shift_down"
+
+        # if last 5 is balanced
+        if abs(sum(last5) - 2.5) < 1.0:
+            return "balanced"
+
+        return "neutral"
+
+    def detect_trend_shift(self, seq: List[int]) -> Dict[str, Any]:
+        if len(seq) < 12:
+            return {"direction": "neutral", "strength": 0.0, "confidence": 0.0}
+
+        # compare recent 3 vs previous 3
+        recent3 = seq[-3:]
+        prev3 = seq[-6:-3]
+        recent5 = seq[-5:]
+        prev5 = seq[-10:-5]
+
+        recent_big = sum(recent3)
+        prev_big = sum(prev3)
+        recent_big5 = sum(recent5)
+        prev_big5 = sum(prev5)
+
+        delta = recent_big - prev_big
+        delta5 = recent_big5 - prev_big5
+
+        if delta > 0 and delta5 > 0:
+            direction = "up"
+            strength = abs(delta) + abs(delta5) * 0.5
+        elif delta < 0 and delta5 < 0:
+            direction = "down"
+            strength = abs(delta) + abs(delta5) * 0.5
+        else:
+            direction = "neutral"
+            strength = 0.0
+
+        # detect full reversal / shift
+        if self.alternation_score(seq) > 0.45:
+            direction = "zigzag"
+            strength += 1.5
+
+        confidence = clamp((abs(strength) / 8.0), 0.0, 0.95)
+        return {
+            "direction": direction,
+            "strength": strength,
+            "confidence": confidence,
+        }
+
+    def detect(self, seq: List[int]) -> Dict[str, Any]:
+        if not seq:
+            return {
+                "prediction": "BIG",
+                "confidence": 0.50,
+                "regime": "neutral",
+                "pattern": {"window": 0, "pred": "BIG", "confidence": 0.0},
+                "trend_shift": {"direction": "neutral", "strength": 0.0, "confidence": 0.0},
+                "signals": {}
+            }
+
+        # exact pattern search
+        pattern = self.detect_super_pattern(seq)
+        regime = self.detect_regime(seq)
+        trend_shift = self.detect_trend_shift(seq)
+
+        # base scoring
+        score_map = {"BIG": 0.0, "SMALL": 0.0}
+
+        # pattern signal
+        if pattern["pred"] == "BIG":
+            score_map["BIG"] += pattern["confidence"] * 1.9
+        else:
+            score_map["SMALL"] += pattern["confidence"] * 1.9
+
+        # run signal
+        run = self.trailing_run(seq)
+        last = seq[-1]
+        if run >= 3:
+            if last == 1:
+                score_map["BIG"] += 0.9 + min(run * 0.15, 1.1)
+            else:
+                score_map["SMALL"] += 0.9 + min(run * 0.15, 1.1)
+
+        # alternation
+        alt = self.alternation_score(seq)
+        if alt > 0.25:
+            if seq[-1] == 1:
+                score_map["SMALL"] += 0.8 + alt
+            else:
+                score_map["BIG"] += 0.8 + abs(alt)
+        elif alt < -0.25:
+            if seq[-1] == 1:
+                score_map["BIG"] += 0.8 + abs(alt)
+            else:
+                score_map["SMALL"] += 0.8 + abs(alt)
+
+        # trend shift
+        if trend_shift["direction"] == "up":
+            score_map["BIG"] += 0.7 + trend_shift["confidence"] * 1.5
+        elif trend_shift["direction"] == "down":
+            score_map["SMALL"] += 0.7 + trend_shift["confidence"] * 1.5
+        elif trend_shift["direction"] == "zigzag":
+            # in zigzag, don't chase recent side blindly
+            if seq[-1] == 1:
+                score_map["SMALL"] += 0.8
+            else:
+                score_map["BIG"] += 0.8
+
+        # reversal pressure
+        rev = self.reversal_pressure(seq)
+        if rev > 0.5:
+            score_map["SMALL"] += 0.3 + rev * 0.4
+        elif rev < -0.5:
+            score_map["BIG"] += 0.3 + abs(rev) * 0.4
+
+        # final decision
+        final_pred = "BIG" if score_map["BIG"] >= score_map["SMALL"] else "SMALL"
+        total_score = score_map["BIG"] + score_map["SMALL"]
+        confidence = 0.50 if total_score == 0 else abs(score_map["BIG"] - score_map["SMALL"]) / total_score
+
+        # strong trap protection:
+        # if there is a long run and the pattern contradicts, preserve current side
+        if run >= 4 and pattern["confidence"] < 0.60 and trend_shift["direction"] in ("neutral", "zigzag"):
+            if seq[-1] == 1:
+                final_pred = "BIG"
+            else:
+                final_pred = "SMALL"
+
+        confidence = clamp(confidence + 0.42, 0.50, 0.95)
+
+        return {
+            "prediction": final_pred,
+            "confidence": confidence,
+            "regime": regime,
+            "pattern": pattern,
+            "trend_shift": trend_shift,
+            "signals": {
+                "score_map": score_map,
+                "run": run,
+                "alternation": alt,
+                "reversal_pressure": rev,
+            }
+        }
+
+PATTERN_DETECTOR = PatternDetectorV31()
+
+# ============================================================
+# SIZE SCORER (AI)
 # ============================================================
 class AdvancedSizeScorer:
     def __init__(self):
@@ -162,7 +456,7 @@ class AdvancedSizeScorer:
             return 0.0, 0
         side = seq[-1]
         r = 1
-        for i in range(len(seq)-2, -1, -1):
+        for i in range(len(seq) - 2, -1, -1):
             if seq[i] == side:
                 r += 1
             else:
@@ -173,8 +467,7 @@ class AdvancedSizeScorer:
         if len(seq) < n:
             return 0.0
         window = seq[-n:]
-        big_count = window.count(1)
-        return (big_count / n) * 2.0 - 1.0
+        return (window.count(1) / n) * 2.0 - 1.0
 
     def _alternation_score(self, seq: List[int]) -> float:
         if len(seq) < 4:
@@ -265,7 +558,6 @@ class AdvancedSizeScorer:
     def score(self, seq: List[int]) -> Tuple[str, float, Dict[str, float]]:
         if not seq:
             return "BIG", 0.5, {}
-
         features = self.compute_features(seq)
         logit = 0.0
         for name, value in features.items():
@@ -274,8 +566,7 @@ class AdvancedSizeScorer:
         prob = self._sigmoid(logit)
         label = "BIG" if prob >= 0.5 else "SMALL"
 
-        # Trap protection:
-        # do not invert on consensus alone; only prevent overreaction in a strong current streak
+        # Extra protection against false trend chasing
         run_sign, run_len = self._run_length(seq)
         if run_len >= 3 and abs(prob - 0.5) < 0.12:
             if run_sign > 0:
@@ -299,7 +590,6 @@ class AdvancedNumberPredictor:
     def _digit_distribution(self, seq: List[int]) -> Dict[int, float]:
         if not seq:
             return {d: 1/10 for d in range(10)}
-
         counts = Counter(seq)
         total = len(seq)
         dist = {d: 0.0 for d in range(10)}
@@ -307,11 +597,10 @@ class AdvancedNumberPredictor:
             dist[d] = counts.get(d, 0) / total
 
         # recency boost
-        for idx, d in enumerate(reversed(seq[-20:])):
-            weight = 1.0 + (idx / 20.0)
-            dist[d] += 0.06 * weight
+        for idx, d in enumerate(reversed(seq[-25:])):
+            weight = 1.0 + (idx / 25.0)
+            dist[d] += 0.05 * weight
 
-        # normalize
         s = sum(dist.values())
         if s == 0:
             return {d: 1/10 for d in range(10)}
@@ -322,19 +611,16 @@ class AdvancedNumberPredictor:
     def _suffix_pattern_distribution(self, seq: List[int]) -> Dict[int, float]:
         dist = {d: 0.0 for d in range(10)}
         if len(seq) < 3:
-            return dist
+            return {d: 1/10 for d in range(10)}
 
         for window in range(2, min(8, len(seq))):
             suffix = tuple(seq[-window:])
             count = 0
             for i in range(len(seq) - window):
-                if tuple(seq[i:i+window]) == suffix:
+                if tuple(seq[i:i + window]) == suffix:
                     nxt = seq[i + window]
                     count += 1
-                    dist[nxt] += 1.0 / (window * 1.2)
-
-            if count == 0:
-                continue
+                    dist[nxt] += 1.0 / (window * 1.25)
 
         total = sum(dist.values())
         if total == 0:
@@ -344,46 +630,37 @@ class AdvancedNumberPredictor:
         return dist
 
     def _family_bias(self, predicted_size: str) -> Dict[int, float]:
-        target_family = family_for_size(predicted_size)
+        target_family = set(family_for_size(predicted_size))
         dist = {d: 0.0 for d in range(10)}
         for d in range(10):
             if d in target_family:
                 dist[d] = 1.0
             else:
-                dist[d] = 0.15
+                dist[d] = 0.10
 
-        # prefer center of family
         if predicted_size == "SMALL":
-            center_priority = {0: 0.9, 1: 0.95, 2: 1.0, 3: 1.05, 4: 1.0}
-            for d, val in center_priority.items():
+            center = {0: 1.0, 1: 1.05, 2: 1.15, 3: 1.10, 4: 1.0}
+            for d, val in center.items():
                 dist[d] *= val
         else:
-            center_priority = {5: 0.9, 6: 1.0, 7: 1.05, 8: 1.0, 9: 0.9}
-            for d, val in center_priority.items():
+            center = {5: 1.0, 6: 1.15, 7: 1.10, 8: 1.05, 9: 1.0}
+            for d, val in center.items():
                 dist[d] *= val
 
         total = sum(dist.values())
-        if total == 0:
-            return {d: 1/10 for d in range(10)}
         for d in dist:
             dist[d] /= total
         return dist
 
     def _last_digit_bias(self, seq: List[int]) -> Dict[int, float]:
-        dist = {d: 0.0 for d in range(10)}
+        dist = {d: 0.15 for d in range(10)}
         if not seq:
             return {d: 1/10 for d in range(10)}
-
         last = seq[-1]
-        for d in range(10):
-            dist[d] = 0.25
         dist[last] += 1.5
-
-        # near-number stability
         for d in range(10):
             if abs(d - last) <= 1:
-                dist[d] += 0.4
-
+                dist[d] += 0.35
         total = sum(dist.values())
         for d in dist:
             dist[d] /= total
@@ -397,9 +674,9 @@ class AdvancedNumberPredictor:
         dist = {d: 0.0 for d in range(10)}
         for d in range(10):
             if d % 2 == 0:
-                dist[d] = 0.55 if even >= odd else 0.45
+                dist[d] = 0.60 if even >= odd else 0.40
             else:
-                dist[d] = 0.55 if odd > even else 0.45
+                dist[d] = 0.60 if odd > even else 0.40
         total = sum(dist.values())
         for d in dist:
             dist[d] /= total
@@ -409,8 +686,7 @@ class AdvancedNumberPredictor:
         dist = {d: 0.0 for d in range(10)}
         if len(seq) < 3:
             return {d: 1/10 for d in range(10)}
-        last_three = seq[-3:]
-        avg = sum(last_three) / 3
+        avg = sum(seq[-3:]) / 3
         for d in range(10):
             dist[d] = 0.5 + (0.15 * (1 - abs(d - avg) / 10.0))
         total = sum(dist.values())
@@ -424,31 +700,28 @@ class AdvancedNumberPredictor:
 
         base = self._digit_distribution(seq)
         suffix = self._suffix_pattern_distribution(seq)
-        family = self._family_bias(predicted_size)
+        fam = self._family_bias(predicted_size)
         last_bias = self._last_digit_bias(seq)
         parity = self._parity_bias(seq)
         trend = self._trend_bias(seq)
 
         combined = {d: 0.0 for d in range(10)}
         for d in range(10):
-            # weighted merge
             combined[d] = (
                 base.get(d, 0.0) * 0.25 +
                 suffix.get(d, 0.0) * 0.30 +
-                family.get(d, 0.0) * 0.25 +
+                fam.get(d, 0.0) * 0.25 +
                 last_bias.get(d, 0.0) * 0.08 +
                 parity.get(d, 0.0) * 0.06 +
                 trend.get(d, 0.0) * 0.06
             )
 
-        # Strong anti-collapse rule:
-        # if a digit outside the target family is too high, suppress it
         target_family = set(family_for_size(predicted_size))
         for d in range(10):
             if d not in target_family:
-                combined[d] *= 0.25
+                combined[d] *= 0.30
 
-        # Avoid collapse to single number
+        # reduce collapse to single digit
         winner = max(combined, key=combined.get)
         return int(winner)
 
@@ -612,29 +885,43 @@ def build_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     seq = [x["size"] for x in history]
-    size_pred, prob, features = SIZE_SCORER.score(seq)
-    size = "BIG" if size_pred == "BIG" else "SMALL"
+    pattern_result = PATTERN_DETECTOR.detect(seq[-1000:])
+    size_signal, prob, _ = SIZE_SCORER.score(seq)
+
+    # Combine pattern + AI score
+    if pattern_result["prediction"] == size_signal:
+        final_size = size_signal
+        confidence = clamp(prob + (pattern_result["confidence"] * 0.25), 0.50, 0.96)
+    else:
+        # if pattern contradicts AI, use pattern only if trend_shift strong
+        if pattern_result["trend_shift"]["direction"] in ("up", "down", "zigzag") and pattern_result["confidence"] > 0.68:
+            final_size = pattern_result["prediction"]
+            confidence = pattern_result["confidence"]
+        else:
+            final_size = size_signal
+            confidence = clamp(prob * 0.9, 0.50, 0.95)
+
+    # Number prediction
     num_seq = [x["num"] for x in history if x.get("num") is not None]
-
-    # Number generator fixed
-    target_num = NUMBER_MODEL.predict(num_seq, size)
-
-    confidence = int(prob * 100)
-    stake = "3x" if confidence >= 85 else "2x" if confidence >= 72 else "1x" if confidence >= 60 else "0.5x"
+    target_num = NUMBER_MODEL.predict(num_seq, final_size)
 
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
+
+    stake = "3x" if confidence >= 0.85 else "2x" if confidence >= 0.72 else "1x" if confidence >= 0.60 else "0.5x"
 
     return {
         "issue": issue,
         "type": "SIZE",
-        "size": size,
+        "size": final_size,
         "num": target_num,
-        "raw_conf": confidence,
-        "logic": f"AI-12-INPUT ({size} @ {confidence}%)",
+        "raw_conf": int(confidence * 100),
+        "logic": f"PATTERN+AI | regime={pattern_result['regime']} | shift={pattern_result['trend_shift']['direction']}",
         "stake": stake,
         "details": {
-            "size_features": features,
-            "size_probability": prob
+            "size_probability": prob,
+            "pattern": pattern_result,
+            "regime": pattern_result["regime"],
+            "trend_shift": pattern_result["trend_shift"]
         }
     }
 
@@ -661,7 +948,7 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     else:
         items = []
 
-    out = []
+    out: List[Dict[str, Any]] = []
     seen = set()
 
     for item in items:
@@ -720,7 +1007,6 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
             recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> {h(size)} → <b>{h(status)}</b>")
         else:
             recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> {h(size)}")
-
     recent_block = "\n".join(recent_lines) if recent_lines else "➜ no recent results"
 
     return f"""
@@ -797,7 +1083,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW AI V30 is Running")
+    return web.Response(text="FTW AI V31 is Running")
 
 async def main():
     CFG.validate()
