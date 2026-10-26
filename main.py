@@ -28,15 +28,16 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_pattern_miner.db")
-    cache_file: str = "ftw_pattern_miner_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_fix_pattern.db")
+    cache_file: str = "ftw_fix_pattern_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW PATTERN MINER"
+    bot_name: str = "FTW FIX PATTERN"
     min_history: int = 8
     recent_limit: int = 12
     max_history: int = 1000
+    min_repeat: int = 5
 
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
@@ -68,7 +69,7 @@ def setup_logging():
         root.addHandler(stream_handler)
 
         fh = RotatingFileHandler(
-            Path(CFG.log_dir) / "ftw_pattern_miner.log",
+            Path(CFG.log_dir) / "ftw_fix_pattern.log",
             maxBytes=1_000_000,
             backupCount=3
         )
@@ -76,10 +77,10 @@ def setup_logging():
         root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_pattern_miner")
+log = logging.getLogger("ftw_fix_pattern")
 
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 def h(x: Any) -> str:
     return html.escape(str(x))
@@ -267,6 +268,14 @@ class Storage:
                 )
             """)
             c.execute("""
+                CREATE TABLE IF NOT EXISTS pattern_penalties (
+                    pattern_key TEXT PRIMARY KEY,
+                    fail_streak INTEGER DEFAULT 0,
+                    penalty REAL DEFAULT 1.0,
+                    last_seen REAL DEFAULT 0
+                )
+            """)
+            c.execute("""
                 CREATE TABLE IF NOT EXISTS pattern_stats (
                     pattern_key TEXT PRIMARY KEY,
                     hit_count INTEGER DEFAULT 0,
@@ -274,14 +283,6 @@ class Storage:
                     last_seen REAL DEFAULT 0,
                     support REAL DEFAULT 0,
                     confidence REAL DEFAULT 0
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS pattern_penalties (
-                    pattern_key TEXT PRIMARY KEY,
-                    fail_streak INTEGER DEFAULT 0,
-                    penalty REAL DEFAULT 1.0,
-                    last_seen REAL DEFAULT 0
                 )
             """)
 
@@ -358,6 +359,48 @@ class Storage:
             """, (limit,)).fetchall()
         return rows[::-1]
 
+    def get_penalty(self, pattern_key: str) -> float:
+        with self._conn() as c:
+            row = c.execute("""
+                SELECT penalty
+                FROM pattern_penalties
+                WHERE pattern_key=?
+            """, (pattern_key,)).fetchone()
+        if not row:
+            return 1.0
+        return float(row[0])
+
+    def penalize_pattern(self, pattern_key: str, success: bool):
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute("""
+                SELECT fail_streak, penalty
+                FROM pattern_penalties
+                WHERE pattern_key=?
+            """, (pattern_key,)).fetchone()
+            if row is None:
+                fail_streak = 0
+                penalty = 1.0
+            else:
+                fail_streak, penalty = row
+
+            if success:
+                fail_streak = max(0, fail_streak - 1)
+                penalty = min(1.0, penalty + 0.08)
+            else:
+                fail_streak += 1
+                penalty = max(0.10, penalty * 0.75)
+
+            c.execute("""
+                INSERT INTO pattern_penalties
+                (pattern_key, fail_streak, penalty, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(pattern_key) DO UPDATE SET
+                    fail_streak=excluded.fail_streak,
+                    penalty=excluded.penalty,
+                    last_seen=excluded.last_seen
+            """, (pattern_key, fail_streak, penalty, now))
+
     def update_pattern_stats(self, key: str, result: int):
         now = time.time()
         with self._conn() as c:
@@ -408,55 +451,12 @@ class Storage:
         penalty = self.get_penalty(key)
         return base * penalty
 
-    def get_penalty(self, pattern_key: str) -> float:
-        with self._conn() as c:
-            row = c.execute("""
-                SELECT penalty
-                FROM pattern_penalties
-                WHERE pattern_key=?
-            """, (pattern_key,)).fetchone()
-        if not row:
-            return 1.0
-        return float(row[0])
-
-    def penalize_pattern(self, pattern_key: str, success: bool):
-        now = time.time()
-        with self._conn() as c:
-            row = c.execute("""
-                SELECT fail_streak, penalty
-                FROM pattern_penalties
-                WHERE pattern_key=?
-            """, (pattern_key,)).fetchone()
-
-            if row is None:
-                fail_streak = 0
-                penalty = 1.0
-            else:
-                fail_streak, penalty = row
-
-            if success:
-                fail_streak = max(0, fail_streak - 1)
-                penalty = min(1.0, penalty + 0.08)
-            else:
-                fail_streak += 1
-                penalty = max(0.10, penalty * 0.75)
-
-            c.execute("""
-                INSERT INTO pattern_penalties
-                (pattern_key, fail_streak, penalty, last_seen)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(pattern_key) DO UPDATE SET
-                    fail_streak=excluded.fail_streak,
-                    penalty=excluded.penalty,
-                    last_seen=excluded.last_seen
-            """, (pattern_key, fail_streak, penalty, now))
-
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# PATTERN MINER
+# PATTERN MINING
 # ============================================================
-def mine_exact_pattern_stats(history: List[Dict[str, Any]], min_len: int = 5, max_len: int = 12) -> List[Dict[str, Any]]:
+def mine_recent_patterns(history: List[Dict[str, Any]], min_len: int = 5, max_len: int = 12):
     seq = [x["size"] for x in history]
     if len(seq) < min_len + 1:
         return []
@@ -475,15 +475,17 @@ def mine_exact_pattern_stats(history: List[Dict[str, Any]], min_len: int = 5, ma
         for i in range(len(seq) - window):
             key = tuple(seq[i:i + window])
             next_val = seq[i + window]
+
             suffix_counts[key] += 1
             if next_val == 1:
                 next_big[key] += 1
             else:
                 next_small[key] += 1
+
             outcomes_by_key[key].append(next_val)
 
         for key, total in suffix_counts.items():
-            if total < 4:
+            if total < CFG.min_repeat:
                 continue
 
             big_count = next_big.get(key, 0)
@@ -494,7 +496,6 @@ def mine_exact_pattern_stats(history: List[Dict[str, Any]], min_len: int = 5, ma
 
             big_prob = big_count / total_next
             small_prob = small_count / total_next
-
             predicted_side = "BIG" if big_prob >= small_prob else "SMALL"
             confidence = abs(big_prob - small_prob)
             support = total / max(1, len(seq) - window)
@@ -507,6 +508,11 @@ def mine_exact_pattern_stats(history: List[Dict[str, Any]], min_len: int = 5, ma
                 win_rate = sum(1 for v in outcomes if v == 1) / len(outcomes)
             else:
                 win_rate = sum(1 for v in outcomes if v == 0) / len(outcomes)
+
+            if win_rate < 0.60:
+                continue
+            if confidence < 0.20:
+                continue
 
             pattern_key = str(key)
             penalty = STORE.get_penalty(pattern_key)
@@ -524,21 +530,22 @@ def mine_exact_pattern_stats(history: List[Dict[str, Any]], min_len: int = 5, ma
                 "support": support,
                 "total_count": total,
                 "win_rate": win_rate,
+                "penalty": penalty,
                 "raw_score": score,
                 "pattern_key": pattern_key,
-                "penalty": penalty,
             })
 
     results.sort(key=lambda x: (x["win_rate"], x["confidence"], x["total_count"], x["raw_score"]), reverse=True)
     return results
 
-def choose_pattern_from_history(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    patterns = mine_exact_pattern_stats(history, min_len=5, max_len=12)
+def choose_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    patterns = mine_recent_patterns(history, min_len=5, max_len=12)
     if not patterns:
         return None
 
+    best = None
     for p in patterns:
-        if p["total_count"] < 8:
+        if p["total_count"] < CFG.min_repeat:
             continue
         if p["win_rate"] < 0.60:
             continue
@@ -546,16 +553,19 @@ def choose_pattern_from_history(history: List[Dict[str, Any]]) -> Optional[Dict[
             continue
         if p["penalty"] <= 0.25:
             continue
+        best = p
+        break
 
-        return {
-            "size": p["predicted_side"],
-            "logic": f"SEQ {p['length']} | {p['pattern_text']} | total={p['total_count']} | WR={p['win_rate'] * 100:.1f}% | conf={p['confidence'] * 100:.1f}%",
-            "confidence": clamp((p["win_rate"] * 0.7) + (p["confidence"] * 0.7), 0.55, 0.92),
-            "stake": "1x" if p["win_rate"] >= 0.72 else "0.5x",
-            "pattern_key": p["pattern_key"]
-        }
+    if best is None:
+        return None
 
-    return None
+    return {
+        "size": best["predicted_side"],
+        "logic": f"SEQ {best['length']} | {best['pattern_text']} | total={best['total_count']} | WR={best['win_rate'] * 100:.1f}% | conf={best['confidence'] * 100:.1f}%",
+        "confidence": clamp((best["win_rate"] * 0.7) + (best["confidence"] * 0.7), 0.55, 0.92),
+        "stake": "1x" if best["win_rate"] >= 0.72 else "0.5x",
+        "pattern_key": best["pattern_key"],
+    }
 
 # ============================================================
 # TREND / CONTEXT
@@ -739,7 +749,6 @@ def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
 
-    # direct exact number sequence
     for w in range(3, 9):
         if len(history) < w + 1:
             continue
@@ -755,7 +764,6 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 
         if suffix not in counts:
             continue
-
         total = counts[suffix]
         best_num = -1
         best_freq = 0
@@ -790,14 +798,14 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     return random.choice(valid)
 
 # ============================================================
-# FINAL ENSEMBLE
+# ENSEMBLE
 # ============================================================
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    exact = choose_pattern_from_history(history)
+    seq_signal = choose_valid_pattern(history)
     hybrid = hybrid_prediction(history)
 
-    final_size = exact["size"] if exact else hybrid["size"]
-    final_score = exact["confidence"] if exact else hybrid["confidence"]
+    final_size = seq_signal["size"] if seq_signal else hybrid["size"]
+    final_score = seq_signal["confidence"] if seq_signal else hybrid["confidence"]
 
     ctx = context_shift_signal(history)
     if ctx:
@@ -811,7 +819,6 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     final_conf = clamp(final_score, 0.55, 0.94)
 
-    # auto downgrade if recent repeated losses
     recent_fail_count = 0
     if len(STATE.history) >= 8:
         recent_slice = STATE.history[-8:]
@@ -820,7 +827,7 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if recent_fail_count >= 3:
         final_conf = max(0.55, final_conf * 0.75)
 
-    logic = exact["logic"] if exact else "HYBRID + CTX"
+    logic = seq_signal["logic"] if seq_signal else "HYBRID + CTX"
 
     return {
         "size": final_size,
@@ -852,7 +859,6 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
     pred_conf = ensemble["confidence"]
     pred_stake = ensemble["stake"]
 
-    # auto reduction on repeated recent failures
     recent_fail_count = 0
     if len(STATE.history) >= 8:
         recent_slice = STATE.history[-8:]
@@ -1028,15 +1034,10 @@ async def worker_loop(app, session):
                         STATE.win_streak = 0
                         STATE.recovery_mode = STATE.loss_streak >= 2
 
-                    pattern_key = None
                     details = res.get("details", {})
-                    if isinstance(details, dict):
-                        pattern_key = details.get("pattern_key")
-
+                    pattern_key = details.get("pattern_key") if isinstance(details, dict) else None
                     if pattern_key:
                         STORE.penalize_pattern(str(pattern_key), bool(res["win"]))
-
-                    STORE.update_pattern_stats(str(pattern_key) if pattern_key else "GLOBAL", 1 if res["win"] else 0)
 
                     STATE.save_cache()
                     await send_msg(app.bot, format_result(res))
@@ -1052,18 +1053,11 @@ async def worker_loop(app, session):
                     pred = build_prediction(STATE.history, next_issue)
 
                     if pred:
-                        pattern_key = None
-                        if pred.get("logic") and "SEQ" in pred.get("logic", ""):
-                            # if exact sequence used, attach key
-                            # actual key is determined in choose_pattern_from_history earlier
-                            # we only store it if available in detail block
-                            pass
-
-                        after_detail = dict(pred.get("details", {}))
-                        if exact_candidate := choose_pattern_from_history(STATE.history):
-                            after_detail["pattern_key"] = exact_candidate.get("pattern_key")
-
-                        pred["details"] = after_detail
+                        candidate = choose_valid_pattern(STATE.history)
+                        if candidate:
+                            pred["details"] = {"pattern_key": candidate.get("pattern_key")}
+                        else:
+                            pred["details"] = {"pattern_key": None}
 
                         STORE.save_prediction({
                             **pred,
@@ -1081,7 +1075,7 @@ async def worker_loop(app, session):
             await asyncio.sleep(2)
 
 async def health_check(request):
-    return web.Response(text="FTW PATTERN MINER is Running")
+    return web.Response(text="FTW FIX PATTERN is Running")
 
 async def start_web_server():
     app = web.Application()
