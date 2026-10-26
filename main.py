@@ -447,9 +447,9 @@ class Storage:
             return 0.0
         support, confidence, last_seen = row
         age = max(0.0, 1.0 - ((time.time() - float(last_seen)) / 600.0))
-        pattern_score = (support * 0.7 + confidence * 0.3) * (0.5 + age * 0.5)
+        base = (support * 0.7 + confidence * 0.3) * (0.5 + age * 0.5)
         penalty = self.get_pattern_penalty(key)
-        return pattern_score * penalty
+        return base * penalty
 
 STORE = Storage(CFG.db_path)
 
@@ -487,9 +487,6 @@ def pattern_label_from_bits(bits: List[int]) -> str:
 
 def pattern_penalty_factor(pattern_key: str) -> float:
     return STORE.get_pattern_penalty(pattern_key)
-
-def pattern_key_for_suffix(suffix: tuple) -> str:
-    return f"suffix:{suffix}"
 
 def strong_pattern_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     seq = [x["size"] for x in history]
@@ -529,7 +526,9 @@ def strong_pattern_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
             continue
 
         key = f"{window}:{suffix}"
-        adjusted_score = (confidence + support * 100.0 + window * 2.5) * pattern_penalty_factor(key)
+        penalty = pattern_penalty_factor(key)
+        adjusted_score = (confidence + support * 100.0 + window * 2.5) * penalty
+
         scans.append({
             "window": window,
             "pattern_key": key,
@@ -661,6 +660,97 @@ def context_shift_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
                 }
     return None
 
+def trend_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    seq = [x["size"] for x in history]
+    if len(seq) < 3:
+        return {"size": "BIG" if random.random() > 0.5 else "SMALL", "confidence": 0.5}
+
+    hist_ctx = context_shift_signal(history)
+    if hist_ctx:
+        return hist_ctx
+
+    run = trailing_run(seq)
+    last = seq[-1]
+
+    if run >= 3:
+        last3, prev3 = seq[-3:], seq[-6:-3]
+        if len(prev3) == 3:
+            last_same = sum(1 for v in last3 if v == last)
+            prev_same = sum(1 for v in prev3 if v == last)
+            if last_same < prev_same:
+                return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.85}
+        return {"size": "BIG" if last == 1 else "SMALL", "confidence": 0.75}
+
+    return {"size": "BIG" if result_bias(history) >= 0.5 else "SMALL", "confidence": 0.6}
+
+# ============================================================
+# EXACT PATTERN MATCH
+# ============================================================
+def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seq = [x["size"] for x in history]
+    candidates = []
+    for window in range(5, 15):
+        if len(seq) < window + 1:
+            continue
+        suffix = tuple(seq[-window:])
+        counts, next_big, next_small = defaultdict(int), defaultdict(int), defaultdict(int)
+
+        for i in range(len(seq) - window):
+            key = tuple(seq[i:i + window])
+            counts[key] += 1
+            if seq[i + window] == 1:
+                next_big[key] += 1
+            else:
+                next_small[key] += 1
+
+        if suffix not in counts:
+            continue
+
+        total = counts[suffix]
+        big_prob = next_big.get(suffix, 0) / total
+        small_prob = next_small.get(suffix, 0) / total
+
+        support = total / max(1, len(seq) - window)
+        pred = "BIG" if big_prob >= small_prob else "SMALL"
+        confidence = abs(big_prob - small_prob) * 100.0
+
+        if support < 0.02 and confidence < 15:
+            continue
+
+        key = f"{window}:{suffix}"
+        score = confidence + (support * 100.0) + (window * 2.5) + STORE.get_pattern_score(key)
+        candidates.append({
+            "window": window,
+            "suffix": suffix,
+            "pred": pred,
+            "confidence": confidence,
+            "support": support,
+            "score": score,
+            "key": key
+        })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[:12]
+
+def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = exact_pattern_candidates(history)
+    if not candidates:
+        return None
+    best = candidates[0]
+    if best["confidence"] < 15 and best["support"] < 0.05:
+        return None
+
+    pred = best["pred"]
+    confidence = clamp(best["confidence"] / 100.0, 0.55, 0.92)
+    STORE.update_pattern_stats(best["key"], 1 if pred == "BIG" else 0)
+
+    return {
+        "size": pred,
+        "logic": f"EXACT {best['window']}-SEQ PATTERN",
+        "confidence": confidence,
+        "stake": "1x" if confidence >= 0.72 else "0.5x"
+    }
+
 # ============================================================
 # HYBRID / FALLBACK
 # ============================================================
@@ -695,6 +785,7 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     parity = parity_prob(history)
     bias = result_bias(history)
     vol = volatility([x["size"] for x in history], 20)
+
     score = (markov * 0.36) + (bias * 0.28) + (parity * 0.18) + ((1.0 - min(vol, 1.0)) * 0.18)
     size = "BIG" if score >= 0.5 else "SMALL"
     confidence = clamp(max(score, 1.0 - score), 0.55, 0.78)
@@ -787,11 +878,9 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     return random.choice(valid)
 
 # ============================================================
-# AUTO ADAPTING ENSEMBLE
+# AUTO ADAPTIVE ENSEMBLE
 # ============================================================
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    weights = ADAPTIVE.current()
-
     exact = choose_exact_prediction(history)
     hybrid = hybrid_prediction(history)
 
@@ -818,14 +907,17 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         final_size = trend["size"]
         final_score = max(final_score, trend["confidence"])
 
-    # auto adjust by recent performance
-    recent_rate = 0.5
-    if len(STATE.history) >= 10:
-        recent_slice = STATE.history[-10:]
-        wins = sum(1 for x in recent_slice if x.get("status") == "WIN" if False else False)
-    # above is ignored, not used
-
     final_conf = clamp(final_score, 0.55, 0.94)
+
+    # auto-correct if recent repeated losses
+    recent_fail_count = 0
+    if len(STATE.history) >= 8:
+        recent_slice = STATE.history[-8:]
+        recent_fail_count = sum(1 for x in recent_slice if x.get("status") == "LOSS") if recent_slice else 0
+
+    if recent_fail_count >= 3:
+        final_conf = max(0.55, final_conf * 0.75)
+
     logic = "AUTO ADAPTIVE ENSEMBLE"
 
     return {
@@ -835,69 +927,8 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.72 else "0.5x"
     }
 
-# This is required because exact_pattern_candidates earlier is used in choose_exact_prediction
-def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    candidates = []
-    seq = [x["size"] for x in history]
-    for window in range(5, 15):
-        if len(seq) < window + 1:
-            continue
-        suffix = tuple(seq[-window:])
-        counts, next_big, next_small = defaultdict(int), defaultdict(int), defaultdict(int)
-
-        for i in range(len(seq) - window):
-            key = tuple(seq[i:i + window])
-            counts[key] += 1
-            if seq[i + window] == 1:
-                next_big[key] += 1
-            else:
-                next_small[key] += 1
-
-        if suffix not in counts:
-            continue
-
-        total = counts[suffix]
-        big_prob = next_big.get(suffix, 0) / total
-        small_prob = next_small.get(suffix, 0) / total
-        support = total / max(1, len(seq) - window)
-        pred = "BIG" if big_prob >= small_prob else "SMALL"
-        confidence = abs(big_prob - small_prob) * 100.0
-
-        if support < 0.02 and confidence < 15:
-            continue
-
-        pattern_key = f"{window}:{suffix}"
-        penalty = pattern_penalty_factor(pattern_key)
-        adjusted_conf = confidence * penalty
-        score = adjusted_conf + (support * 100.0) + (window * 2.5)
-
-        candidates.append({
-            "window": window,
-            "pred": pred,
-            "confidence": adjusted_conf,
-            "support": support,
-            "score": score,
-            "pattern_key": pattern_key
-        })
-
-    if not candidates:
-        return None
-
-    best = max(candidates, key=lambda x: x["score"])
-    if best["confidence"] < 15 and best["support"] < 0.05:
-        return None
-
-    pred = best["pred"]
-    final_conf = clamp(best["confidence"] / 100.0, 0.55, 0.92)
-    return {
-        "size": pred,
-        "logic": f"ADAPTIVE EXACT {best['window']}-SEQ",
-        "confidence": final_conf,
-        "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.72 else "0.5x"
-    }
-
 # ============================================================
-# BUILD PREDICTION
+# PREDICTION BUILD
 # ============================================================
 def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
     if len(history) < CFG.min_history:
@@ -919,14 +950,11 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
     pred_conf = ensemble["confidence"]
     pred_stake = ensemble["stake"]
 
-    # Auto self-correct:
-    # if recent pattern is bad, confidence and stake reduce automatically
+    # Auto self-correction: repeated failure reduces confidence and stake
     recent_fail_count = 0
     if len(STATE.history) >= 8:
-        recent_rows = STATE.history[-8:]
-        for row in recent_rows:
-            if row.get("status") == "LOSS":
-                recent_fail_count += 1
+        recent_slice = STATE.history[-8:]
+        recent_fail_count = sum(1 for x in recent_slice if x.get("status") == "LOSS") if recent_slice else 0
 
     if recent_fail_count >= 3:
         pred_conf = max(0.55, pred_conf * 0.75)
@@ -1010,6 +1038,9 @@ async def fetch_history(session):
             pass
     return False
 
+# ============================================================
+# FORMAT / SEND
+# ============================================================
 def normalize_recent_row(row: Any):
     if not isinstance(row, (tuple, list)):
         return "", "", "", ""
@@ -1078,6 +1109,7 @@ async def send_msg(bot, text: str, retries: int = 3):
 # ============================================================
 async def worker_loop(app, session):
     last_processed_issue = None
+
     while True:
         try:
             if await fetch_history(session):
