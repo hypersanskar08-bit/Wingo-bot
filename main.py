@@ -28,12 +28,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_recent_pattern.db")
-    cache_file: str = "ftw_recent_pattern_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_final_pattern.db")
+    cache_file: str = "ftw_final_pattern_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW RECENT PATTERN"
+    bot_name: str = "FTW FINAL PATTERN"
     min_history: int = 8
     recent_limit: int = 12
     max_history: int = 1000
@@ -69,7 +69,7 @@ def setup_logging():
         root.addHandler(stream_handler)
 
         fh = RotatingFileHandler(
-            Path(CFG.log_dir) / "ftw_recent_pattern.log",
+            Path(CFG.log_dir) / "ftw_final_pattern.log",
             maxBytes=1_000_000,
             backupCount=3
         )
@@ -77,7 +77,7 @@ def setup_logging():
         root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_recent_pattern")
+log = logging.getLogger("ftw_final_pattern")
 
 # ============================================================
 # HELPERS
@@ -184,20 +184,13 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     ratio = ratio_big(seq, 20)
 
     s = 0.0
-    if regime == "TRAP":
-        s += 0.35
-    if regime == "TREND":
-        s += 0.25
-    if regime == "ALTERNATING":
-        s += 0.30
-    if bp:
-        s += 0.20
-    if run >= 3:
-        s += 0.25
-    if abs(ratio - 0.5) > 0.18:
-        s += 0.15
-    if alt >= 0.6:
-        s += 0.15
+    if regime == "TRAP": s += 0.35
+    if regime == "TREND": s += 0.25
+    if regime == "ALTERNATING": s += 0.30
+    if bp: s += 0.20
+    if run >= 3: s += 0.25
+    if abs(ratio - 0.5) > 0.18: s += 0.15
+    if alt >= 0.6: s += 0.15
     return clamp(min(1.0, s), 0.0, 1.0)
 
 def side_balance(history: List[Dict[str, Any]], window: int = 20) -> float:
@@ -285,6 +278,16 @@ class Storage:
                     confidence REAL DEFAULT 0
                 )
             """)
+            # NAYA TABLE PATTERN MEMORY KE LIYE
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pattern_memory (
+                    pattern_key TEXT PRIMARY KEY,
+                    consec_losses INTEGER DEFAULT 0,
+                    is_flipped INTEGER DEFAULT 0,
+                    total_preds INTEGER DEFAULT 0,
+                    total_wins INTEGER DEFAULT 0
+                )
+            """)
 
     def save_prediction(self, p: Dict[str, Any]):
         with self._conn() as c:
@@ -319,7 +322,8 @@ class Storage:
                 continue
 
             actual_size = "BIG" if act["size"] == 1 else "SMALL"
-            win = (p_size == actual_size) if p_size else True
+            win = (p_size == actual_size) if p_size else False
+            
             if win and p_num == act["num"]:
                 status = "JACK 🏆"
             elif win:
@@ -361,27 +365,15 @@ class Storage:
 
     def get_penalty(self, pattern_key: str) -> float:
         with self._conn() as c:
-            row = c.execute("""
-                SELECT penalty
-                FROM pattern_penalties
-                WHERE pattern_key=?
-            """, (pattern_key,)).fetchone()
-        if not row:
-            return 1.0
-        return float(row[0])
+            row = c.execute("SELECT penalty FROM pattern_penalties WHERE pattern_key=?", (pattern_key,)).fetchone()
+        return float(row[0]) if row else 1.0
 
     def penalize_pattern(self, pattern_key: str, success: bool):
         now = time.time()
         with self._conn() as c:
-            row = c.execute("""
-                SELECT fail_streak, penalty
-                FROM pattern_penalties
-                WHERE pattern_key=?
-            """, (pattern_key,)).fetchone()
-
+            row = c.execute("SELECT fail_streak, penalty FROM pattern_penalties WHERE pattern_key=?", (pattern_key,)).fetchone()
             if row is None:
-                fail_streak = 0
-                penalty = 1.0
+                fail_streak, penalty = 0, 1.0
             else:
                 fail_streak, penalty = row
 
@@ -393,445 +385,297 @@ class Storage:
                 penalty = max(0.10, penalty * 0.75)
 
             c.execute("""
-                INSERT INTO pattern_penalties
-                (pattern_key, fail_streak, penalty, last_seen)
+                INSERT INTO pattern_penalties (pattern_key, fail_streak, penalty, last_seen)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(pattern_key) DO UPDATE SET
-                    fail_streak=excluded.fail_streak,
-                    penalty=excluded.penalty,
-                    last_seen=excluded.last_seen
+                    fail_streak=excluded.fail_streak, penalty=excluded.penalty, last_seen=excluded.last_seen
             """, (pattern_key, fail_streak, penalty, now))
 
-    def update_pattern_stats(self, key: str, result: int):
-        now = time.time()
+    # NAYA TRACKING METHODS
+    def get_pattern_memory(self, key: str) -> Dict[str, Any]:
         with self._conn() as c:
             row = c.execute("""
-                SELECT hit_count, miss_count, last_seen, support, confidence
-                FROM pattern_stats
-                WHERE pattern_key=?
-            """, (key,)).fetchone()
-            if row is None:
-                hit, miss, last_seen, support, confidence = 0, 0, 0.0, 0.0, 0.0
-            else:
-                hit, miss, last_seen, support, confidence = row
-
-            if result == 1:
-                hit += 1
-            else:
-                miss += 1
-
-            total = hit + miss
-            support = (hit / total) if total else 0.0
-            confidence = abs(support - 0.5) * 2.0
-
-            c.execute("""
-                INSERT INTO pattern_stats
-                (pattern_key, hit_count, miss_count, last_seen, support, confidence)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(pattern_key) DO UPDATE SET
-                    hit_count=excluded.hit_count,
-                    miss_count=excluded.miss_count,
-                    last_seen=excluded.last_seen,
-                    support=excluded.support,
-                    confidence=excluded.confidence
-            """, (key, hit, miss, now, support, confidence))
-
-    def get_pattern_score(self, key: str) -> float:
-        with self._conn() as c:
-            row = c.execute("""
-                SELECT support, confidence, last_seen
-                FROM pattern_stats
-                WHERE pattern_key=?
+                SELECT consec_losses, is_flipped, total_preds, total_wins 
+                FROM pattern_memory WHERE pattern_key=?
             """, (key,)).fetchone()
         if not row:
-            return 0.0
-        support, confidence, last_seen = row
-        age = max(0.0, 1.0 - ((time.time() - float(last_seen)) / 600.0))
-        base = (support * 0.7 + confidence * 0.3) * (0.5 + age * 0.5)
-        return base * self.get_penalty(key)
+            return {"consec_losses": 0, "is_flipped": False, "total_preds": 0, "total_wins": 0}
+        return {"consec_losses": row[0], "is_flipped": bool(row[1]), "total_preds": row[2], "total_wins": row[3]}
+
+    def record_pattern_outcome(self, key: str, won: bool):
+        mem = self.get_pattern_memory(key)
+        consec = mem["consec_losses"]
+        is_flipped = mem["is_flipped"]
+        preds = mem["total_preds"] + 1
+        wins = mem["total_wins"] + (1 if won else 0)
+
+        if won:
+            consec = 0
+            is_flipped = False # Jeet gaya toh wapas Normal
+        else:
+            consec += 1
+            if consec >= 2:
+                is_flipped = True # 2 baar lagatar fail = FLIP
+
+        with self._conn() as c:
+            c.execute("""
+                INSERT INTO pattern_memory (pattern_key, consec_losses, is_flipped, total_preds, total_wins)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(pattern_key) DO UPDATE SET
+                    consec_losses=excluded.consec_losses,
+                    is_flipped=excluded.is_flipped,
+                    total_preds=excluded.total_preds,
+                    total_wins=excluded.total_wins
+            """, (key, consec, int(is_flipped), preds, wins))
 
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# RECENT PATTERN MINER
+# BLOCK EXTRACTION & MATCHING LOGIC
 # ============================================================
-def mine_recent_patterns(history: List[Dict[str, Any]], min_len: int = 5, max_len: int = 12):
-    seq = [x["size"] for x in history]
-    if len(seq) < min_len + 1:
+def get_block_candidates(seq_str: str, min_len: int = 5, max_len: int = 16) -> List[str]:
+    # seq_str format: [Oldest] ... [Newest]
+    # Example: "BBSSSBBS" (BB oldest hai, S newest hai)
+    if not seq_str:
         return []
+        
+    # Step 1: Break into blocks (Left to Right = Oldest to Newest)
+    blocks = []
+    current_char = seq_str[0]
+    current_len = 0
+    
+    for c in seq_str:
+        if c == current_char:
+            current_len += 1
+        else:
+            blocks.append(current_char * current_len)
+            current_char = c
+            current_len = 1
+    blocks.append(current_char * current_len)
+    
+    # Step 2: Drop oldest blocks one by one
+    candidates = []
+    for i in range(len(blocks)):
+        candidate = "".join(blocks[i:])
+        # Length 5 se 16 ke beech honi chahiye
+        if min_len <= len(candidate) <= max_len:
+            candidates.append(candidate)
+            
+    return candidates
 
-    results = []
+def exact_size_sequence(history: List[Dict[str, Any]]):
+    seq = [1 if x["size"] == 1 else 0 for x in history[-CFG.max_history:]]
+    if len(seq) < 5:
+        return None
 
-    for window in range(min_len, max_len + 1):
-        if len(seq) < window + 1:
-            continue
+    tail_str = "".join("B" if v == 1 else "S" for v in seq[-16:])
+    candidates = get_block_candidates(tail_str, min_len=5, max_len=16)
 
-        suffix_counts = defaultdict(int)
-        next_big = defaultdict(int)
-        next_small = defaultdict(int)
-        outcomes_by_key = defaultdict(list)
+    for cand in candidates:
+        cand_seq = [1 if c == 'B' else 0 for c in cand]
+        cand_len = len(cand_seq)
 
-        for i in range(len(seq) - window):
-            key = tuple(seq[i:i + window])
-            next_val = seq[i + window]
+        # History me match dhoondho (tail ko chhod kar)
+        match_indices = []
+        for i in range(len(seq) - cand_len):
+            if seq[i:i+cand_len] == cand_seq:
+                match_indices.append(i)
 
-            suffix_counts[key] += 1
-            if next_val == 1:
-                next_big[key] += 1
-            else:
-                next_small[key] += 1
-
-            outcomes_by_key[key].append(next_val)
-
-        for key, total in suffix_counts.items():
-            if total < CFG.min_repeat:
+        if len(match_indices) >= CFG.min_repeat:
+            next_bits = [seq[i + cand_len] for i in match_indices if i + cand_len < len(seq)]
+            if not next_bits:
                 continue
 
-            big_count = next_big.get(key, 0)
-            small_count = next_small.get(key, 0)
-            total_next = big_count + small_count
-            if total_next == 0:
-                continue
+            total = len(next_bits)
+            raw_big = sum(next_bits)
+            raw_small = total - raw_big
 
-            big_prob = big_count / total_next
-            small_prob = small_count / total_next
-            predicted_side = "BIG" if big_prob >= small_prob else "SMALL"
-            confidence = abs(big_prob - small_prob)
-            support = total / max(1, len(seq) - window)
+            # Recency Weighting (Naye results ka weight zyada)
+            decay = 0.85
+            weights = [decay ** (total - 1 - k) for k in range(total)]
+            w_big = sum(w for w, v in zip(weights, next_bits) if v == 1)
+            w_small = sum(w for w, v in zip(weights, next_bits) if v == 0)
+            w_total = w_big + w_small or 1.0
 
-            outcomes = outcomes_by_key.get(key, [])
-            if not outcomes:
-                continue
+            big_prob = w_big / w_total
+            small_prob = w_small / w_total
+            predicted_bit_normal = 1 if big_prob >= small_prob else 0
 
-            if predicted_side == "BIG":
-                win_rate = sum(1 for v in outcomes if v == 1) / len(outcomes)
-            else:
-                win_rate = sum(1 for v in outcomes if v == 0) / len(outcomes)
-
-            if win_rate < 0.60:
-                continue
-            if confidence < 0.20:
-                continue
-
-            pattern_key = str(key)
-            penalty = STORE.get_penalty(pattern_key)
-            score = (win_rate * 0.7) + (confidence * 0.3) + (support * 0.2)
-            score *= penalty
-
-            results.append({
-                "length": window,
-                "pattern": key,
-                "pattern_text": "".join("B" if v == 1 else "S" for v in key),
-                "predicted_side": predicted_side,
+            info = {
+                "length": cand_len,
+                "pattern_text": cand,
+                "predicted_bit_normal": predicted_bit_normal,
+                "total_count": total,
                 "big_prob": big_prob,
                 "small_prob": small_prob,
-                "confidence": confidence,
-                "support": support,
+                "confidence": abs(big_prob - small_prob),
+                "win_rate": max(big_prob, small_prob),
+                "pattern_key": cand,
+            }
+
+            # FLIP LOGIC
+            mem = STORE.get_pattern_memory(cand)
+            if mem["is_flipped"]:
+                info["predicted_bit"] = 1 - predicted_bit_normal
+                info["is_flipped"] = True
+            else:
+                info["predicted_bit"] = predicted_bit_normal
+                info["is_flipped"] = False
+                
+            info["predicted_side"] = "BIG" if info["predicted_bit"] == 1 else "SMALL"
+            return info
+
+    return None
+
+def family_value(num: int) -> Optional[int]:
+    if num in [5, 6, 7, 8, 9]: return 1
+    if num in [0, 1, 2, 3, 4]: return 0
+    return None
+
+def exact_family_sequence(history: List[Dict[str, Any]], min_len: int = 5):
+    seq = [family_value(x["num"]) for x in history[-CFG.max_history:]]
+    seq = [x for x in seq if x is not None]
+    if len(seq) < 5:
+        return None
+
+    tail_str = "".join("B" if v == 1 else "S" for v in seq[-16:])
+    candidates = get_block_candidates(tail_str, min_len=5, max_len=16)
+
+    for cand in candidates:
+        cand_seq = [1 if c == 'B' else 0 for c in cand]
+        cand_len = len(cand_seq)
+
+        match_indices = []
+        for i in range(len(seq) - cand_len):
+            if seq[i:i+cand_len] == cand_seq:
+                match_indices.append(i)
+
+        if len(match_indices) >= CFG.min_repeat:
+            next_bits = [seq[i + cand_len] for i in match_indices if i + cand_len < len(seq)]
+            if not next_bits:
+                continue
+
+            total = len(next_bits)
+            raw_big = sum(next_bits)
+            raw_small = total - raw_big
+
+            decay = 0.85
+            weights = [decay ** (total - 1 - k) for k in range(total)]
+            w_big = sum(w for w, v in zip(weights, next_bits) if v == 1)
+            w_small = sum(w for w, v in zip(weights, next_bits) if v == 0)
+            w_total = w_big + w_small or 1.0
+
+            big_prob = w_big / w_total
+            small_prob = w_small / w_total
+            predicted_bit_normal = 1 if big_prob >= small_prob else 0
+
+            info = {
+                "length": cand_len,
+                "pattern_text": cand,
+                "predicted_bit_normal": predicted_bit_normal,
                 "total_count": total,
-                "win_rate": win_rate,
-                "penalty": penalty,
-                "raw_score": score,
-                "pattern_key": pattern_key,
-            })
+                "big_prob": big_prob,
+                "small_prob": small_prob,
+                "confidence": abs(big_prob - small_prob),
+                "win_rate": max(big_prob, small_prob),
+                "pattern_key": cand,
+            }
 
-    results.sort(key=lambda x: (x["win_rate"], x["confidence"], x["total_count"], x["raw_score"]), reverse=True)
-    return results
+            # FLIP LOGIC
+            mem = STORE.get_pattern_memory(cand)
+            if mem["is_flipped"]:
+                info["predicted_bit"] = 1 - predicted_bit_normal
+                info["is_flipped"] = True
+            else:
+                info["predicted_bit"] = predicted_bit_normal
+                info["is_flipped"] = False
+                
+            info["predicted_side"] = "BIG" if info["predicted_bit"] == 1 else "SMALL"
+            return info
 
-def select_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    patterns = mine_recent_patterns(history, min_len=5, max_len=12)
-    if not patterns:
-        return None
-
-    best = None
-    for p in patterns:
-        if p["total_count"] < CFG.min_repeat:
-            continue
-        if p["win_rate"] < 0.60:
-            continue
-        if p["confidence"] < 0.20:
-            continue
-        if p["penalty"] <= 0.25:
-            continue
-        best = p
-        break
-
-    if best is None:
-        return None
-
-    return {
-        "size": best["predicted_side"],
-        "logic": f"SEQ {best['length']} | {best['pattern_text']} | total={best['total_count']} | WR={best['win_rate'] * 100:.1f}% | conf={best['confidence'] * 100:.1f}%",
-        "confidence": clamp((best["win_rate"] * 0.7) + (best["confidence"] * 0.7), 0.55, 0.92),
-        "stake": "1x" if best["win_rate"] >= 0.72 else "0.5x",
-        "pattern_key": best["pattern_key"],
-    }
-
-# ============================================================
-# TREND / CONTEXT
-# ============================================================
-def trend_phase(history: List[Dict[str, Any]]) -> str:
-    if len(history) < 8:
-        return "COLD"
-    seq = [x["size"] for x in history]
-    run = trailing_run(seq)
-    current_side = seq[-1]
-    recent = seq[-10:]
-    same_share = sum(1 for v in recent if v == current_side) / len(recent)
-
-    last3, prev3 = seq[-3:], seq[-6:-3]
-    if len(last3) == 3 and len(prev3) == 3:
-        last_same = sum(1 for v in last3 if v == current_side)
-        prev_same = sum(1 for v in prev3 if v == current_side)
-        momentum_decay = (last_same < prev_same)
-    else:
-        momentum_decay = False
-
-    if run >= 5 and same_share >= 0.75 and momentum_decay:
-        return "EXHAUSTED"
-    if run >= 4 and same_share >= 0.68:
-        return "DOMINANT"
-    if run >= 2:
-        return "BUILDING"
-    return "COLD"
-
-def momentum_decay_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if len(history) < 8:
-        return None
-    seq = [x["size"] for x in history]
-    phase = trend_phase(history)
-    current_side = seq[-1]
-    recent = seq[-12:]
-    big_share = sum(1 for v in recent if v == 1) / len(recent)
-    small_share = sum(1 for v in recent if v == 0) / len(recent)
-
-    last3, prev3 = seq[-3:], seq[-6:-3]
-    if len(last3) == 3 and len(prev3) == 3:
-        last_same = sum(1 for v in last3 if v == current_side)
-        prev_same = sum(1 for v in prev3 if v == current_side)
-        is_decaying = (last_same < prev_same)
-    else:
-        is_decaying = False
-
-    if phase == "EXHAUSTED" and is_decaying:
-        if current_side == 1 and big_share >= 0.75:
-            return {"size": "SMALL", "logic": "TREND EXHAUSTION: DECAY CONFIRMED", "confidence": 0.92, "stake": "1x"}
-        if current_side == 0 and small_share >= 0.75:
-            return {"size": "BIG", "logic": "TREND EXHAUSTION: DECAY CONFIRMED", "confidence": 0.92, "stake": "1x"}
     return None
 
-def context_shift_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if len(history) < 20:
-        return None
-    seq = [x["size"] for x in history]
-    current_run = trailing_run(seq)
-    current_side = seq[-1]
+def choose_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    exact = exact_size_sequence(history)
+    if exact:
+        penalty = STORE.get_penalty(exact["pattern_key"])
+        if exact["total_count"] >= CFG.min_repeat and penalty > 0.25:
+            flip_text = " [FLIPPED]" if exact.get("is_flipped") else ""
+            return {
+                "size": exact["predicted_side"],
+                "logic": f"SEQ {exact['length']} | {exact['pattern_text']} | n={exact['total_count']} | WR={exact['win_rate']*100:.1f}%{flip_text}",
+                "confidence": clamp((exact["win_rate"] * 0.6) + (exact["confidence"] * 0.8), 0.55, 0.92),
+                "stake": "1x" if exact["win_rate"] >= 0.72 else "0.5x",
+                "pattern_key": exact["pattern_key"],
+            }
 
-    if current_run < 3:
-        return None
+    family = exact_family_sequence(history)
+    if family:
+        penalty = STORE.get_penalty(family["pattern_key"])
+        if family["total_count"] >= CFG.min_repeat and penalty > 0.25:
+            flip_text = " [FLIPPED]" if family.get("is_flipped") else ""
+            return {
+                "size": family["predicted_side"],
+                "logic": f"FAM {family['length']} | {family['pattern_text']} | n={family['total_count']} | WR={family['win_rate']*100:.1f}%{flip_text}",
+                "confidence": clamp((family["win_rate"] * 0.6) + (family["confidence"] * 0.8), 0.55, 0.92),
+                "stake": "1x" if family["win_rate"] >= 0.72 else "0.5x",
+                "pattern_key": family["pattern_key"],
+            }
 
-    for lookback in [5, 4, 3]:
-        context_length = current_run + lookback
-        if len(seq) < context_length + 1:
-            continue
-
-        target_context = tuple(seq[-context_length:])
-        continuation_count = 0
-        break_count = 0
-
-        for i in range(len(seq) - context_length):
-            if tuple(seq[i:i + context_length]) == target_context:
-                next_idx = i + context_length
-                if seq[next_idx] == current_side:
-                    continuation_count += 1
-                else:
-                    break_count += 1
-
-        total = continuation_count + break_count
-        if total >= 3:
-            cont_prob = continuation_count / total
-            break_prob = break_count / total
-
-            if break_prob >= 0.75:
-                return {
-                    "size": "SMALL" if current_side == 1 else "BIG",
-                    "logic": f"CTX SHIFT: {break_prob * 100:.0f}% BREAK",
-                    "confidence": 0.86,
-                    "stake": "1x"
-                }
-            elif cont_prob >= 0.68:
-                return {
-                    "size": "BIG" if current_side == 1 else "SMALL",
-                    "logic": f"CTX CONTINUE: {cont_prob * 100:.0f}% CONT",
-                    "confidence": 0.86,
-                    "stake": "1x"
-                }
     return None
-
-# ============================================================
-# HYBRID / FALLBACK
-# ============================================================
-def markov_prob(history: List[Dict[str, Any]]) -> float:
-    sizes = [x["size"] for x in history]
-    if len(sizes) < 3:
-        return 0.5
-    recent_pair = tuple(sizes[-2:])
-    count, big = 0, 0
-    for i in range(len(sizes) - 2):
-        if tuple(sizes[i:i + 2]) == recent_pair:
-            count += 1
-            if sizes[i + 2] == 1:
-                big += 1
-    return (big / count) if count > 0 else 0.5
-
-def parity_prob(history: List[Dict[str, Any]]) -> float:
-    nums = [x["num"] for x in history[-30:]]
-    if not nums:
-        return 0.5
-    evens = sum(1 for n in nums if n % 2 == 0)
-    return evens / len(nums)
-
-def result_bias(history: List[Dict[str, Any]]) -> float:
-    seq = [x["size"] for x in history[-40:]]
-    if not seq:
-        return 0.5
-    return sum(seq) / len(seq)
-
-def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    markov = markov_prob(history)
-    parity = parity_prob(history)
-    bias = result_bias(history)
-    vol = volatility([x["size"] for x in history], 20)
-
-    score = (markov * 0.36) + (bias * 0.28) + (parity * 0.18) + ((1.0 - min(vol, 1.0)) * 0.18)
-    size = "BIG" if score >= 0.5 else "SMALL"
-    confidence = clamp(max(score, 1.0 - score), 0.55, 0.78)
-
-    return {
-        "size": size,
-        "logic": "HYBRID FALLBACK",
-        "confidence": confidence,
-        "stake": "0.5x" if confidence < 0.68 else "1x"
-    }
-
-# ============================================================
-# NUMBER SELECTION
-# ============================================================
-def family_for_size(size: str) -> List[int]:
-    return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
-
-def is_same_family(num: int, size: str) -> bool:
-    return num in family_for_size(size)
-
-def number_repeat_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    nums = [x["num"] for x in history[-30:]]
-    if not nums:
-        return {"value": 0, "score": 0.0, "logic": "NONE"}
-    most_common_num, most_count = Counter(nums).most_common(1)[0]
-    repeat_ratio = most_count / len(nums)
-    return {"value": most_common_num, "score": repeat_ratio, "logic": "REPEATED_NUMBER" if repeat_ratio >= 0.2 else "NONE"}
-
-def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    nums = [x["num"] for x in history[-12:]]
-    if len(nums) < 3:
-        return {"value": 0, "score": 0.0, "logic": "NONE"}
-    diffs = [abs(nums[i] - nums[i - 1]) for i in range(1, len(nums))]
-    if not diffs:
-        return {"value": 0, "score": 0.0, "logic": "NONE"}
-    avg_gap = sum(diffs) / len(diffs)
-    last_gap = abs(nums[-1] - nums[-2])
-    if avg_gap < 2:
-        return {"value": nums[-1], "score": 0.7, "logic": "LOW_GAP"}
-    if last_gap >= 3:
-        return {"value": max(0, nums[-1] - 1), "score": 0.6, "logic": "GAP_JUMP"}
-    return {"value": 0, "score": 0.0, "logic": "NONE"}
-
-def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
-    valid = family_for_size(size)
-
-    for w in range(3, 9):
-        if len(history) < w + 1:
-            continue
-        nums = [x["num"] for x in history]
-        suffix = tuple(nums[-w:])
-        counts = defaultdict(int)
-        next_counts = defaultdict(int)
-        for i in range(len(nums) - w):
-            key = tuple(nums[i:i + w])
-            counts[key] += 1
-            next_counts[(key, nums[i + w])] += 1
-
-        if suffix not in counts:
-            continue
-        total = counts[suffix]
-        best_num = -1
-        best_freq = 0
-        for (k, num), freq in next_counts.items():
-            if k == suffix and freq > best_freq:
-                best_freq = freq
-                best_num = num
-
-        if best_num != -1:
-            confidence = (best_freq / total) * 100.0
-            if confidence >= 20 and best_num in valid:
-                return best_num
-
-    repeat = number_repeat_score(history)
-    if repeat["score"] >= 0.2 and repeat["value"] in valid:
-        return repeat["value"]
-
-    gap = number_gap_score(history)
-    if gap["score"] > 0.0 and gap["value"] in valid:
-        return gap["value"]
-
-    family_nums = [x["num"] for x in history if is_same_family(x["num"], size)]
-    if family_nums:
-        best_num, _ = Counter(family_nums).most_common(1)[0]
-        if best_num in valid:
-            return best_num
-
-    recent = [x["num"] for x in history[-15:]]
-    if recent and recent[-1] in valid:
-        return recent[-1]
-
-    return random.choice(valid)
 
 # ============================================================
 # FINAL ENSEMBLE
 # ============================================================
+def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    seq = [x["size"] for x in history]
+    if not seq:
+        return {"size": "BIG", "logic": "EMPTY", "confidence": 0.55, "stake": "0.5x"}
+
+    bias = sum(seq) / len(seq)
+    vol = volatility(seq, 20)
+    markov = 0.5
+    if len(seq) >= 2:
+        recent_pair = tuple(seq[-2:])
+        count, big = 0, 0
+        for i in range(len(seq) - 2):
+            if tuple(seq[i:i + 2]) == recent_pair:
+                count += 1
+                if seq[i + 2] == 1:
+                    big += 1
+        if count:
+            markov = big / count
+
+    score = (markov * 0.36) + (bias * 0.28) + ((1.0 - min(vol, 1.0)) * 0.18) + 0.18
+    size = "BIG" if score >= 0.5 else "SMALL"
+    confidence = clamp(max(score, 1.0 - score), 0.55, 0.78)
+    return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "0.5x" if confidence < 0.68 else "1x"}
+
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq_signal = select_valid_pattern(history)
+    seq_signal = choose_valid_pattern(history)
     hybrid = hybrid_prediction(history)
 
     final_size = seq_signal["size"] if seq_signal else hybrid["size"]
     final_score = seq_signal["confidence"] if seq_signal else hybrid["confidence"]
+    pattern_key = seq_signal["pattern_key"] if seq_signal else None
 
-    ctx = context_shift_signal(history)
-    if ctx:
-        final_size = ctx["size"]
-        final_score = max(final_score, ctx["confidence"])
-
-    mom = momentum_decay_signal(history)
-    if mom:
-        final_size = mom["size"]
-        final_score = max(final_score, mom["confidence"])
-
-    final_conf = clamp(final_score, 0.55, 0.94)
-
-    recent_fail_count = 0
-    if len(STATE.history) >= 8:
-        recent_slice = STATE.history[-8:]
-        recent_fail_count = sum(1 for x in recent_slice if x.get("status") == "LOSS") if recent_slice else 0
+    # FIX: recent_fail_count sahi tarike se DB se niklega
+    recent = STORE.recent_outcomes(8)
+    recent_fail_count = sum(1 for _, _, s in recent if "LOSS" in str(s))
 
     if recent_fail_count >= 3:
-        final_conf = max(0.55, final_conf * 0.75)
+        final_conf = max(0.55, final_score * 0.75)
+    else:
+        final_conf = final_score
 
-    logic = seq_signal["logic"] if seq_signal else "HYBRID + CTX"
+    logic = seq_signal["logic"] if seq_signal else "HYBRID + FALLBACK"
 
     return {
         "size": final_size,
         "logic": logic,
-        "confidence": final_conf,
-        "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.72 else "0.5x"
+        "confidence": clamp(final_conf, 0.55, 0.94),
+        "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.72 else "0.5x",
+        "pattern_key": pattern_key,
     }
 
 # ============================================================
@@ -857,16 +701,15 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
     pred_conf = ensemble["confidence"]
     pred_stake = ensemble["stake"]
 
-    recent_fail_count = 0
-    if len(STATE.history) >= 8:
-        recent_slice = STATE.history[-8:]
-        recent_fail_count = sum(1 for x in recent_slice if x.get("status") == "LOSS") if recent_slice else 0
+    recent = STORE.recent_outcomes(8)
+    recent_fail_count = sum(1 for _, _, s in recent if "LOSS" in str(s))
 
     if recent_fail_count >= 3:
         pred_conf = max(0.55, pred_conf * 0.75)
         pred_stake = "0.5x" if pred_conf < 0.75 else "1x"
 
-    final_num = choose_number_for_size(pred_size, history)
+    # FIX: BIG me 5-9, SMALL me 0-4
+    final_num = random.randint(5, 9) if pred_size == "BIG" else random.randint(0, 4)
     final_issue = str(issue)
 
     return {
@@ -881,8 +724,7 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
             "signal_strength": signal_strength(history),
             "regime": detect_regime([x["size"] for x in history]),
             "side_balance": round(side_balance(history, 20), 4),
-            "trend_phase": trend_phase(history),
-            "pattern_key": None
+            "pattern_key": ensemble.get("pattern_key")
         }
     }
 
@@ -895,9 +737,12 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict):
-        if "data" in payload and isinstance(payload["data"], dict):
+        # FIX: Ab {"data": []} bhi parse hoga
+        if isinstance(payload.get("data"), list):
+            items = payload["data"]
+        elif isinstance(payload.get("data"), dict):
             d = payload["data"]
-            items = d.get("list", []) if isinstance(d.get("list"), list) else d if isinstance(d, list) else []
+            items = d.get("list", []) if isinstance(d.get("list"), list) else []
         else:
             items = payload.get("result", payload.get("items", payload.get("history", [])))
     else:
@@ -951,12 +796,8 @@ async def fetch_history(session):
 def normalize_recent_row(row: Any):
     if not isinstance(row, (tuple, list)):
         return "", "", "", ""
-    if len(row) >= 4:
-        return str(row[0]), str(row[1]), str(row[2]), ""
     if len(row) >= 3:
         return str(row[0]), str(row[1]), str(row[2]), ""
-    if len(row) >= 2:
-        return str(row[0]), str(row[1]), "", ""
     return "", "", "", ""
 
 def format_prediction(pred: Dict[str, Any], recent_rows):
@@ -1033,10 +874,12 @@ async def worker_loop(app, session):
                         STATE.recovery_mode = STATE.loss_streak >= 2
 
                     details = res.get("details", {})
-                    if isinstance(details, dict):
-                        pattern_key = details.get("pattern_key")
-                        if pattern_key:
-                            STORE.penalize_pattern(str(pattern_key), bool(res["win"]))
+                    pattern_key = details.get("pattern_key") if isinstance(details, dict) else None
+                    
+                    # PATTERN UPDATE
+                    if pattern_key:
+                        STORE.penalize_pattern(str(pattern_key), bool(res["win"]))
+                        STORE.record_pattern_outcome(str(pattern_key), bool(res["win"]))
 
                     STATE.save_cache()
                     await send_msg(app.bot, format_result(res))
@@ -1050,17 +893,10 @@ async def worker_loop(app, session):
 
                 if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
                     pred = build_prediction(STATE.history, next_issue)
-
-                    if pred:
-                        candidate = select_valid_pattern(STATE.history)
-                        pred["details"] = {"pattern_key": candidate.get("pattern_key") if candidate else None}
-
-                        STORE.save_prediction({
-                            **pred,
-                            "type": "SIZE",
-                            "details": pred.get("details", {})
-                        })
-                        await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
+                    
+                    # FIX: Purana bug theek kiya gaya hai. Ab pattern details overwrite nahi hongi.
+                    STORE.save_prediction({**pred, "type": "SIZE"})
+                    await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
 
                     last_processed_issue = latest_issue
 
@@ -1071,7 +907,7 @@ async def worker_loop(app, session):
             await asyncio.sleep(2)
 
 async def health_check(request):
-    return web.Response(text="FTW RECENT PATTERN is Running")
+    return web.Response(text="FTW FINAL PATTERN is Running")
 
 async def start_web_server():
     app = web.Application()
