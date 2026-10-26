@@ -1,13 +1,13 @@
 """
-FTW AI V32 FULL CODE
+FTW AI V33 FULL CODE
 ====================
-- 100 pattern modes
-- exact number matrix (10x10)
-- pattern length 5..15
-- match against recent 1000 results
-- super-advanced trend shift detector
-- strong anti-trap logic
-- Telegram + SQLite + API fetch
+- pattern length: 3..13
+- exact pattern detection
+- advanced trend shift detector
+- exact number matrix
+- 12-feature AI size model
+- Telegram bot + SQLite + API fetch
+- improved against zigzag / weak trend chasing
 """
 
 import asyncio
@@ -41,12 +41,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v32_full.db")
-    cache_file: str = "ftw_ai_v32_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v33_full.db")
+    cache_file: str = "ftw_ai_v33_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW AI V32"
+    bot_name: str = "FTW AI V33"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
@@ -79,12 +79,12 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_ai_v32_full.log", maxBytes=1_000_000, backupCount=3)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_ai_v33_full.log", maxBytes=1_000_000, backupCount=3)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_ai_v32")
+log = logging.getLogger("ftw_ai_v33")
 
 # ============================================================
 # HELPERS
@@ -103,8 +103,10 @@ def normalize_issue(value: Any) -> Optional[int]:
         return None
     if isinstance(value, str):
         value = value.strip()
-        if value == "": return None
-        if value.isdigit(): return int(value)
+        if value == "":
+            return None
+        if value.isdigit():
+            return int(value)
         digits = "".join(ch for ch in value if ch.isdigit())
         if digits:
             return int(digits)
@@ -120,30 +122,26 @@ def trailing_run(seq: List[int]) -> int:
     if not seq:
         return 0
     last = seq[-1]
-    c = 1
-    for i in range(len(seq)-2, -1, -1):
+    r = 1
+    for i in range(len(seq) - 2, -1, -1):
         if seq[i] == last:
-            c += 1
+            r += 1
         else:
             break
-    return c
+    return r
 
 def family_for_size(size: str) -> List[int]:
     return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
 
 # ============================================================
-# 100 PATTERN MODES
+# STRONG PATTERN DETECTOR (3..13)
 # ============================================================
-class PatternModesV32:
+class PatternDetectorV33:
     def __init__(self):
-        self.max_modes = 100
-        self.min_window = 5
-        self.max_window = 15
+        self.min_window = 3
+        self.max_window = 13
 
-    def trailing_run(self, seq: List[int]) -> int:
-        return trailing_run(seq)
-
-    def window_match_score(self, seq: List[int], window: int) -> Dict[str, float]:
+    def exact_suffix_match(self, seq: List[int], window: int) -> Dict[str, float]:
         if len(seq) < window + 2:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
@@ -153,7 +151,7 @@ class PatternModesV32:
         total_weight = 0.0
 
         for i in range(len(seq) - window - 1):
-            candidate = tuple(seq[i:i+window])
+            candidate = tuple(seq[i:i + window])
             if candidate != suffix:
                 continue
 
@@ -177,7 +175,7 @@ class PatternModesV32:
             "strength": abs(p_big - p_small),
         }
 
-    def reverse_pattern_score(self, seq: List[int], window: int) -> Dict[str, float]:
+    def reverse_suffix_match(self, seq: List[int], window: int) -> Dict[str, float]:
         if len(seq) < window + 2:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
@@ -187,7 +185,7 @@ class PatternModesV32:
         total_weight = 0.0
 
         for i in range(len(seq) - window - 1):
-            candidate = tuple(reversed(seq[i:i+window]))
+            candidate = tuple(reversed(seq[i:i + window]))
             if candidate != suffix:
                 continue
 
@@ -211,35 +209,32 @@ class PatternModesV32:
             "strength": abs(p_big - p_small),
         }
 
-    def alternation_mode(self, seq: List[int], window: int) -> Dict[str, float]:
-        if len(seq) < window + 1:
+    def alternation_mode(self, seq: List[int]) -> Dict[str, float]:
+        if len(seq) < 4:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
-        recent = seq[-window:]
         flips = 0
-        for i in range(1, len(recent)):
-            if recent[i] != recent[i-1]:
+        for i in range(1, len(seq)):
+            if seq[i] != seq[i-1]:
                 flips += 1
+        ratio = flips / max(1, len(seq) - 1)
 
-        ratio = flips / max(1, len(recent)-1)
-        # if alternating, next side likely opposite current
         next_side = 1 - seq[-1]
         if ratio > 0.45:
             if next_side == 1:
-                return {"BIG": 0.72, "SMALL": 0.28, "strength": ratio}
-            return {"BIG": 0.28, "SMALL": 0.72, "strength": ratio}
+                return {"BIG": 0.75, "SMALL": 0.25, "strength": ratio}
+            return {"BIG": 0.25, "SMALL": 0.75, "strength": ratio}
         return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
-    def run_continuation_mode(self, seq: List[int], window: int) -> Dict[str, float]:
-        if len(seq) < window:
+    def run_mode(self, seq: List[int]) -> Dict[str, float]:
+        if not seq:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
         run = trailing_run(seq)
-        last = seq[-1]
-        if run >= 2:
-            if last == 1:
-                return {"BIG": 0.78, "SMALL": 0.22, "strength": min(run / 10.0, 1.0)}
-            return {"BIG": 0.22, "SMALL": 0.78, "strength": min(run / 10.0, 1.0)}
+        if run >= 3:
+            if seq[-1] == 1:
+                return {"BIG": 0.8, "SMALL": 0.2, "strength": min(run / 10.0, 1.0)}
+            return {"BIG": 0.2, "SMALL": 0.8, "strength": min(run / 10.0, 1.0)}
         return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
     def gap_mode(self, seq: List[int], window: int) -> Dict[str, float]:
@@ -247,72 +242,32 @@ class PatternModesV32:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
         recent = seq[-window:]
-        prev = seq[-(window+2):-window]
+        prev = seq[-(window + 2):-window]
         if not prev:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
         recent_big = sum(recent)
         prev_big = sum(prev)
         if recent_big > prev_big:
-            return {"BIG": 0.72, "SMALL": 0.28, "strength": abs(recent_big - prev_big) / max(1, window)}
+            return {"BIG": 0.75, "SMALL": 0.25, "strength": abs(recent_big - prev_big) / max(1, window)}
         if recent_big < prev_big:
-            return {"BIG": 0.28, "SMALL": 0.72, "strength": abs(recent_big - prev_big) / max(1, window)}
+            return {"BIG": 0.25, "SMALL": 0.75, "strength": abs(recent_big - prev_big) / max(1, window)}
         return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
-    def shift_detector_mode(self, seq: List[int], window: int) -> Dict[str, float]:
-        if len(seq) < window + 1:
+    def shift_detector(self, seq: List[int]) -> Dict[str, float]:
+        if len(seq) < 8:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
-        recent = seq[-window:]
-        prev = seq[-(window*2):-window]
+        recent = seq[-3:]
+        prev = seq[-6:-3]
+        recent_big = sum(recent)
+        prev_big = sum(prev)
 
-        if not prev:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        r_big = sum(recent)
-        p_big = sum(prev)
-        if r_big > p_big:
-            return {"BIG": 0.75, "SMALL": 0.25, "strength": abs(r_big - p_big) / max(1, window)}
-        if r_big < p_big:
-            return {"BIG": 0.25, "SMALL": 0.75, "strength": abs(r_big - p_big) / max(1, window)}
+        if recent_big > prev_big:
+            return {"BIG": 0.75, "SMALL": 0.25, "strength": abs(recent_big - prev_big) / 3.0}
+        if recent_big < prev_big:
+            return {"BIG": 0.25, "SMALL": 0.75, "strength": abs(recent_big - prev_big) / 3.0}
         return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-    def mode_set(self, seq: List[int]) -> List[Dict[str, Any]]:
-        results = []
-        mode_index = 0
-
-        for window in range(self.min_window, self.max_window + 1):
-            modes = [
-                ("exact", self.window_match_score(seq, window)),
-                ("reverse", self.reverse_pattern_score(seq, window)),
-                ("alternation", self.alternation_mode(seq, window)),
-                ("run", self.run_continuation_mode(seq, window)),
-                ("gap", self.gap_mode(seq, window)),
-                ("shift", self.shift_detector_mode(seq, window)),
-            ]
-
-            for name, metric in modes:
-                if mode_index >= self.max_modes:
-                    break
-
-                metric = metric.copy()
-                pred = "BIG" if metric["BIG"] >= metric["SMALL"] else "SMALL"
-                results.append({
-                    "id": mode_index,
-                    "name": f"{name}_{window}",
-                    "window": window,
-                    "pred": pred,
-                    "confidence": max(metric["BIG"], metric["SMALL"]),
-                    "strength": metric.get("strength", 0.0),
-                    "big_prob": metric["BIG"],
-                    "small_prob": metric["SMALL"],
-                })
-                mode_index += 1
-
-            if mode_index >= self.max_modes:
-                break
-
-        return results[:self.max_modes]
 
     def detect(self, seq: List[int]) -> Dict[str, Any]:
         if not seq:
@@ -320,18 +275,51 @@ class PatternModesV32:
                 "prediction": "BIG",
                 "confidence": 0.50,
                 "regime": "neutral",
-                "modes": [],
                 "top_mode": None,
+                "modes": [],
             }
 
-        modes = self.mode_set(seq)
+        modes = []
+        for window in range(self.min_window, self.max_window + 1):
+            exact = self.exact_suffix_match(seq, window)
+            reverse = self.reverse_suffix_match(seq, window)
+            gap = self.gap_mode(seq, window)
+            shift = self.shift_detector(seq[-min(len(seq), 20):])
+
+            # combine all to many modes
+            mode_list = [
+                ("exact", exact),
+                ("reverse", reverse),
+                ("gap", gap),
+                ("shift", shift),
+            ]
+
+            for name, metric in mode_list:
+                if metric["strength"] <= 0.0:
+                    continue
+                pred = "BIG" if metric["BIG"] >= metric["SMALL"] else "SMALL"
+                modes.append({
+                    "name": f"{name}_{window}",
+                    "window": window,
+                    "pred": pred,
+                    "confidence": max(metric["BIG"], metric["SMALL"]),
+                    "strength": metric["strength"],
+                })
+
+        # add global modes
+        alt = self.alternation_mode(seq)
+        run = self.run_mode(seq)
+
+        modes.append({"name": "alternation", "window": 0, "pred": "BIG" if alt["BIG"] >= alt["SMALL"] else "SMALL", "confidence": max(alt["BIG"], alt["SMALL"]), "strength": alt["strength"]})
+        modes.append({"name": "run", "window": 0, "pred": "BIG" if run["BIG"] >= run["SMALL"] else "SMALL", "confidence": max(run["BIG"], run["SMALL"]), "strength": run["strength"]})
+
         if not modes:
             return {
                 "prediction": "BIG" if seq[-1] == 1 else "SMALL",
                 "confidence": 0.50,
                 "regime": "neutral",
-                "modes": [],
                 "top_mode": None,
+                "modes": [],
             }
 
         score_map = {"BIG": 0.0, "SMALL": 0.0}
@@ -345,22 +333,19 @@ class PatternModesV32:
         total = score_map["BIG"] + score_map["SMALL"]
         confidence = 0.50 if total == 0 else abs(score_map["BIG"] - score_map["SMALL"]) / total
 
-        # regime detection
-        run = trailing_run(seq)
-        alt = self.alternation_mode(seq, min(len(seq), 8)).get("strength", 0.0)
-        if run >= 4:
+        # regime decision
+        run_len = trailing_run(seq)
+        alt_strength = self.alternation_mode(seq)["strength"]
+        if run_len >= 4:
             regime = "trend"
-        elif alt > 0.45:
+        elif alt_strength > 0.45:
             regime = "zigzag"
         else:
             regime = "balanced"
 
-        # anti-trap: if zigzag + recent opposite not stable, keep side
-        if regime == "zigzag" and len(seq) >= 10:
-            if seq[-1] == 1:
-                final_pred = "SMALL"
-            else:
-                final_pred = "BIG"
+        # anti-trap
+        if regime == "zigzag" and len(seq) >= 8:
+            final_pred = "SMALL" if seq[-1] == 1 else "BIG"
 
         top_mode = max(modes, key=lambda x: x["confidence"] + x["strength"])
 
@@ -368,19 +353,19 @@ class PatternModesV32:
             "prediction": final_pred,
             "confidence": clamp(confidence + 0.42, 0.50, 0.96),
             "regime": regime,
-            "modes": modes[:15],
             "top_mode": top_mode,
+            "modes": modes[:20],
         }
 
-PATTERN_MODES = PatternModesV32()
+PATTERN_DETECTOR = PatternDetectorV33()
 
 # ============================================================
-# SIZE SCORER
+# SIZE SCORER (12 FEATURES)
 # ============================================================
 class AdvancedSizeScorer:
     def __init__(self):
         self.weights = {
-            "recent_size": 1.25,
+            "recent_size": 1.20,
             "run_length": 1.35,
             "last3_big_ratio": 0.95,
             "last5_big_ratio": 0.90,
@@ -402,7 +387,7 @@ class AdvancedSizeScorer:
             return 0.0, 0
         side = seq[-1]
         r = 1
-        for i in range(len(seq)-2, -1, -1):
+        for i in range(len(seq) - 2, -1, -1):
             if seq[i] == side:
                 r += 1
             else:
@@ -420,7 +405,7 @@ class AdvancedSizeScorer:
             return 0.0
         flips = 0
         for i in range(1, len(seq)):
-            if seq[i] != seq[i-1]:
+            if seq[i] != seq[i - 1]:
                 flips += 1
         return (flips / max(1, len(seq)-1)) * 2.0 - 1.0
 
@@ -487,7 +472,7 @@ class AdvancedSizeScorer:
     def compute_features(self, seq: List[int]) -> Dict[str, float]:
         run_sign, run_len = self._run_length(seq)
         return {
-            "recent_size": 1.0 if seq[-1] == 1 else -1.0 if seq[-1] == 0 else 0.0,
+            "recent_size": 1.0 if seq[-1] == 1 else -1.0,
             "run_length": run_sign * min(run_len / 10.0, 1.0),
             "last3_big_ratio": self._big_ratio(seq, 3),
             "last5_big_ratio": self._big_ratio(seq, 5),
@@ -527,195 +512,65 @@ class AdvancedSizeScorer:
 SIZE_SCORER = AdvancedSizeScorer()
 
 # ============================================================
-# EXACT NUMBER MATRIX (10x10)
+# EXACT NUMBER MATRIX
 # ============================================================
 class ExactNumberMatrix:
     def __init__(self):
-        self.matrix = {a: {b: 0.0 for b in range(10)} for a in range(10)}
+        self.trans = {a: {b: 0.0 for b in range(10)} for a in range(10)}
 
-    def update_from_history(self, seq: List[int]):
+    def update(self, seq: List[int]):
         if len(seq) < 2:
             return
+
         for i in range(len(seq) - 1):
             prev = seq[i]
             nxt = seq[i + 1]
-            self.matrix[prev][nxt] += 1.0
+            self.trans[prev][nxt] += 1.0
 
-        # normalize column-like weighting
         for prev in range(10):
-            total = sum(self.matrix[prev].values())
+            total = sum(self.trans[prev].values())
             if total == 0:
                 continue
             for nxt in range(10):
-                self.matrix[prev][nxt] /= total
+                self.trans[prev][nxt] /= total
 
-    def next_distribution(self, last_digit: int, pred_size: str) -> Dict[int, float]:
-        dist = {d: 0.0 for d in range(10)}
-        base = self.matrix.get(last_digit, {d: 1/10 for d in range(10)})
+    def predict(self, seq: List[int], pred_size: str) -> int:
+        if not seq:
+            return random.choice(family_for_size(pred_size))
 
-        # combine with family bias
+        self.update(seq[-1000:])
+
+        last_digit = seq[-1]
+        base = self.trans.get(last_digit, {d: 0.1 for d in range(10)})
+
         target_family = set(family_for_size(pred_size))
+        dist = {d: 0.0 for d in range(10)}
         for d in range(10):
             dist[d] = base.get(d, 0.0) * 0.8
             if d in target_family:
                 dist[d] += 0.35
             else:
-                dist[d] *= 0.25
+                dist[d] *= 0.20
 
-        # center family preference
         if pred_size == "SMALL":
-            center = {0: 1.15, 1: 1.12, 2: 1.18, 3: 1.08, 4: 1.00}
+            center = {0: 1.15, 1: 1.18, 2: 1.20, 3: 1.10, 4: 1.00}
             for d, w in center.items():
                 dist[d] *= w
         else:
-            center = {5: 1.00, 6: 1.18, 7: 1.12, 8: 1.08, 9: 1.00}
+            center = {5: 1.00, 6: 1.18, 7: 1.20, 8: 1.10, 9: 1.00}
             for d, w in center.items():
                 dist[d] *= w
 
         total = sum(dist.values())
         if total == 0:
-            return {d: 1/10 for d in range(10)}
+            return random.choice(family_for_size(pred_size))
         for d in dist:
             dist[d] /= total
-        return dist
 
-    def predict_number(self, seq: List[int], pred_size: str) -> int:
-        if not seq:
-            return random.choice(family_for_size(pred_size))
-
-        self.update_from_history(seq[-2000:])
-        last_digit = seq[-1]
-
-        dist = self.next_distribution(last_digit, pred_size)
-        best_digit = max(dist, key=dist.get)
-        return int(best_digit)
+        winner = max(dist, key=dist.get)
+        return int(winner)
 
 NUMBER_MATRIX = ExactNumberMatrix()
-
-# ============================================================
-# BUILD PREDICTION
-# ============================================================
-def build_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(history) < CFG.min_history:
-        size = "BIG" if random.random() >= 0.5 else "SMALL"
-        num = random.choice(family_for_size(size))
-        return {
-            "issue": "1",
-            "type": "SIZE",
-            "size": size,
-            "num": num,
-            "raw_conf": 50,
-            "logic": "WARM-UP",
-            "stake": "0.5x",
-            "details": {}
-        }
-
-    seq = [x["size"] for x in history]
-    pattern = PATTERN_MODES.detect(seq[-1000:])
-    size_pred, prob, features = SIZE_SCORER.score(seq)
-
-    if pattern["prediction"] == size_pred:
-        final_size = size_pred
-        conf = clamp(prob + pattern["confidence"] * 0.25, 0.50, 0.96)
-    else:
-        if pattern["confidence"] >= 0.68 and pattern["regime"] in ("zigzag", "balanced", "trend"):
-            final_size = pattern["prediction"]
-            conf = pattern["confidence"]
-        else:
-            final_size = size_pred
-            conf = clamp(prob, 0.50, 0.95)
-
-    num_seq = [x["num"] for x in history if x.get("num") is not None]
-    target_num = NUMBER_MATRIX.predict_number(num_seq, final_size)
-
-    issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-    stake = "3x" if conf >= 0.85 else "2x" if conf >= 0.72 else "1x" if conf >= 0.60 else "0.5x"
-
-    return {
-        "issue": issue,
-        "type": "SIZE",
-        "size": final_size,
-        "num": target_num,
-        "raw_conf": int(conf * 100),
-        "logic": f"100-MODE PATTERN + MATRIX | regime={pattern['regime']} | shift={pattern['top_mode']['name'] if pattern['top_mode'] else 'n/a'}",
-        "stake": stake,
-        "details": {
-            "size_probability": prob,
-            "pattern": pattern,
-            "features": features
-        }
-    }
-
-# ============================================================
-# HISTORY PARSE
-# ============================================================
-def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
-    if payload is None:
-        return []
-
-    if isinstance(payload, list):
-        items = payload
-    elif isinstance(payload, dict):
-        if "data" in payload and isinstance(payload["data"], dict):
-            d = payload["data"]
-            if isinstance(d.get("list"), list):
-                items = d["list"]
-            elif isinstance(d, list):
-                items = d
-            else:
-                items = payload.get("result", [])
-        else:
-            items = payload.get("result", [])
-    else:
-        items = []
-
-    out: List[Dict[str, Any]] = []
-    seen = set()
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
-        if issue is None:
-            continue
-
-        key = str(issue)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        num = safe_int(item.get("number", item.get("value", 0)), 0)
-        if num < 0 or num > 9:
-            continue
-
-        out.append({
-            "issue": str(issue),
-            "num": num,
-            "size": 1 if num >= 5 else 0
-        })
-
-    out.sort(key=lambda x: int(x["issue"]))
-    return out
-
-# ============================================================
-# API FETCH
-# ============================================================
-async def fetch_data(session):
-    for url in CFG.api_urls():
-        try:
-            async with session.get(url, timeout=CFG.request_timeout) as response:
-                if response.status != 200:
-                    continue
-                data = await response.json(content_type=None)
-                parsed = parse_history_payload(data)
-                if parsed:
-                    STATE.history = parsed[-CFG.max_history_window:]
-                    STATE.save_cache()
-                    return True
-        except Exception as exc:
-            log.warning("Fetch failed for %s: %s", url, exc)
-    return False
 
 # ============================================================
 # STATE
@@ -857,6 +712,132 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # ============================================================
+# BUILD PREDICTION
+# ============================================================
+def build_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(history) < CFG.min_history:
+        size = "BIG" if random.random() >= 0.5 else "SMALL"
+        num = random.choice(family_for_size(size))
+        return {
+            "issue": "1",
+            "type": "SIZE",
+            "size": size,
+            "num": num,
+            "raw_conf": 50,
+            "logic": "WARM-UP",
+            "stake": "0.5x",
+            "details": {}
+        }
+
+    seq = [x["size"] for x in history]
+    pattern = PATTERN_DETECTOR.detect(seq[-1000:])
+    size_pred, prob, features = SIZE_SCORER.score(seq)
+
+    if pattern["prediction"] == size_pred:
+        final_size = size_pred
+        conf = clamp(prob + pattern["confidence"] * 0.25, 0.50, 0.96)
+    else:
+        if pattern["confidence"] >= 0.68 and pattern["regime"] in ("zigzag", "balanced", "trend"):
+            final_size = pattern["prediction"]
+            conf = pattern["confidence"]
+        else:
+            final_size = size_pred
+            conf = clamp(prob, 0.50, 0.95)
+
+    num_seq = [x["num"] for x in history if x.get("num") is not None]
+    target_num = NUMBER_MATRIX.predict(num_seq, final_size)
+
+    issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
+
+    stake = "3x" if conf >= 0.85 else "2x" if conf >= 0.72 else "1x" if conf >= 0.60 else "0.5x"
+
+    return {
+        "issue": issue,
+        "type": "SIZE",
+        "size": final_size,
+        "num": target_num,
+        "raw_conf": int(conf * 100),
+        "logic": f"PATTERN(3..13) | regime={pattern['regime']} | top={pattern['top_mode']['name'] if pattern['top_mode'] else 'n/a'}",
+        "stake": stake,
+        "details": {
+            "size_probability": prob,
+            "pattern": pattern,
+            "size_features": features
+        }
+    }
+
+# ============================================================
+# HISTORY PARSE
+# ============================================================
+def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], dict):
+            d = payload["data"]
+            if isinstance(d.get("list"), list):
+                items = d["list"]
+            elif isinstance(d, list):
+                items = d
+            else:
+                items = payload.get("result", [])
+        else:
+            items = payload.get("result", [])
+    else:
+        items = []
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
+        if issue is None:
+            continue
+
+        key = str(issue)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        num = safe_int(item.get("number", item.get("value", 0)), 0)
+        if num < 0 or num > 9:
+            continue
+
+        out.append({
+            "issue": str(issue),
+            "num": num,
+            "size": 1 if num >= 5 else 0
+        })
+
+    out.sort(key=lambda x: int(x["issue"]))
+    return out
+
+# ============================================================
+# API FETCH
+# ============================================================
+async def fetch_data(session):
+    for url in CFG.api_urls():
+        try:
+            async with session.get(url, timeout=CFG.request_timeout) as response:
+                if response.status != 200:
+                    continue
+                data = await response.json(content_type=None)
+                parsed = parse_history_payload(data)
+                if parsed:
+                    STATE.history = parsed[-CFG.max_history_window:]
+                    STATE.save_cache()
+                    return True
+        except Exception as exc:
+            log.warning("Fetch failed for %s: %s", url, exc)
+    return False
+
+# ============================================================
 # FORMATTERS
 # ============================================================
 def format_prediction(pred: Dict[str, Any], recent_rows):
@@ -943,7 +924,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW AI V32 is Running")
+    return web.Response(text="FTW AI V33 is Running")
 
 async def main():
     CFG.validate()
