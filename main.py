@@ -1,12 +1,11 @@
 """
-FTW V18 FULL CODE (ULTIMATE FINAL)
+FTW V19 FULL CODE (INVERTED WEAK PATTERNS + TRAP DETECTION)
 =================
-Advanced deep predictor with:
-- Strict Dragon Riding (No blind reversals)
-- Strong Exact Pattern Analysis (100% Match + Recency Weight + Laplace Smoothing)
+- Inverts Sequence Patterns if Win Rate < 60%
+- Detects Pattern Failures (Trap Reversal)
+- Fixes logic string bug (No fake confidence)
+- Strict Dragon Riding (No blind trend reversal)
 - 5 to 14 Size Sequence Tracking
-- Exact Number Sequence Tracking (0-9)
-- Full 1000 history backtesting on startup
 - Telegram VIP Channel Ready
 """
 
@@ -44,12 +43,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v18_full.db")
-    cache_file: str = "ftw_v18_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v19_full.db")
+    cache_file: str = "ftw_v19_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V18 PHASE ENGINE"
+    bot_name: str = "FTW V19 PHASE ENGINE"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -81,12 +80,12 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v18_full.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v19_full.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v18")
+log = logging.getLogger("ftw_v19")
 
 def h(x: Any) -> str: return html.escape(str(x))
 def safe_int(x, default=0):
@@ -394,9 +393,9 @@ def advanced_trend_shift_tracker(history: List[Dict[str, Any]]) -> Optional[Dict
             break_prob = break_count / total
             
             if break_prob >= 0.75:
-                return {"size": "SMALL" if current_side == 1 else "BIG", "logic": f"CTX SHIFT: {break_prob*100:.0f}% Break", "confidence": 0.86, "stake": "1x"}
+                return {"size": "SMALL" if current_side == 1 else "BIG", "logic": f"CTX SHIFT ({break_prob*100:.0f}% Break)", "confidence": 0.86, "stake": "1x"}
             elif cont_prob >= 0.65:
-                return {"size": "BIG" if current_side == 1 else "SMALL", "logic": f"CTX CONTINUE: {cont_prob*100:.0f}% Cont", "confidence": 0.86, "stake": "1x"}
+                return {"size": "BIG" if current_side == 1 else "SMALL", "logic": f"CTX CONTINUE ({cont_prob*100:.0f}% Cont)", "confidence": 0.86, "stake": "1x"}
     return None
 
 def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -420,11 +419,11 @@ def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
         last_same = sum(1 for v in last3 if v == current_side)
         prev_same = sum(1 for v in prev3 if v == current_side)
         if last_same <= prev_same:
-            return {"size": opposite, "logic": "REVERSAL PRESSURE: momentum fading", "confidence": 0.85, "stake": "1x"}
+            return {"size": opposite, "logic": "REVERSAL PRESSURE", "confidence": 0.85, "stake": "1x"}
     return None
 
 # ============================================================
-# STRONG PATTERN ANALYSIS (PURE EXACT + RECENCY WEIGHT)
+# DEEP UPGRADE: STRONG PATTERN ANALYSIS (INVERT WEAK PATTERNS)
 # ============================================================
 def strong_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seq = [x["size"] for x in history]
@@ -439,10 +438,12 @@ def strong_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, A
         exact_small = 0.0
         exact_weight_total = 0.0
         
+        # Recent matches tracking
+        recent_matches = []
+        
         for i in range(total_history - window - 1, -1, -1):
             past_pattern = tuple(seq[i:i + window])
             
-            # 100% Exact Match Only
             if past_pattern == suffix:
                 next_res = seq[i + window]
                 distance_from_end = total_history - (i + window)
@@ -451,20 +452,51 @@ def strong_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, A
                 exact_weight_total += recency_weight
                 if next_res == 1: exact_big += recency_weight
                 else: exact_small += recency_weight
+                
+                # Track recent appearances (last 50 rounds)
+                if distance_from_end <= 50:
+                    recent_matches.append(next_res)
 
         if exact_weight_total >= 1.5:
-            # Laplace Smoothing (Prevents 100% confidence from 1 sample)
             big_prob = (exact_big + 1) / (exact_weight_total + 2)
             small_prob = (exact_small + 1) / (exact_weight_total + 2)
             
             pred = "BIG" if big_prob >= small_prob else "SMALL"
-            confidence = abs(big_prob - small_prob) * 100.0
+            win_rate = max(big_prob, small_prob)
             
+            is_inverted = False
+            
+            # 🆕 RULE 1: Invert if Win Rate < 60% (User Request)
+            if win_rate < 0.60:
+                pred = "SMALL" if pred == "BIG" else "BIG"
+                is_inverted = True
+                confidence = (1.0 - win_rate) * 100.0 # e.g., 55% becomes 45% (Better to invert)
+            else:
+                confidence = win_rate * 100.0
+                
+            # 🆕 RULE 2: Recent Failures (Trap Detection)
+            if len(recent_matches) >= 2:
+                hist_pred = "BIG" if big_prob >= small_prob else "SMALL"
+                # Check if the last 2 matches failed
+                fails = sum(1 for res in recent_matches[-2:] if (res == 1 and hist_pred == "SMALL") or (res == 0 and hist_pred == "BIG"))
+                if fails >= 2 and not is_inverted:
+                    pred = "SMALL" if pred == "BIG" else "BIG"
+                    is_inverted = True
+                    confidence = max(confidence, 65.0) # Trap reversal confidence
+                    
             if confidence >= 10.0:
                 score = confidence + (exact_weight_total * 4.0) + (window * 3.0)
+                
+                # Logic text
+                if is_inverted:
+                    tag = "INVERTED"
+                else:
+                    tag = "STRONG"
+                    
                 candidates.append({
                     "window": window, "pred": pred, "confidence": confidence, 
-                    "support": exact_weight_total, "score": score, "key": f"EX:{window}:{suffix}"
+                    "support": exact_weight_total, "score": score, 
+                    "key": f"EX:{window}:{suffix}", "tag": tag, "win_rate": win_rate * 100
                 })
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -476,13 +508,17 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
         
     best = candidates[0]
     pred = best["pred"]
+    
+    # Confidence is already calculated properly (either direct or inverted)
     confidence = clamp(best["confidence"] / 100.0, 0.55, 0.95)
     
     STORE.update_pattern_stats(best["key"], 1 if pred == "BIG" else 0)
     
+    logic_text = f"{best['tag']} EXACT {best['window']}-SEQ (WR: {best['win_rate']:.1f}%)"
+    
     return {
         "size": pred, 
-        "logic": f"STRONG EXACT {best['window']}-SEQ ({best['confidence']:.1f}%)", 
+        "logic": logic_text, 
         "confidence": confidence, 
         "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
     }
@@ -566,7 +602,7 @@ def trend_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
             last_same = sum(1 for v in last3 if v == last)
             prev_same = sum(1 for v in prev3 if v == last)
             if last_same < prev_same: return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.85}
-        return {"size": "BIG" if last == 1 else "SMALL", "confidence": 0.75} # Follow trend
+        return {"size": "BIG" if last == 1 else "SMALL", "confidence": 0.75} 
 
     return {"size": "BIG" if result_bias(history) >= 0.5 else "SMALL", "confidence": 0.6}
 
@@ -693,27 +729,33 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     exact = choose_exact_prediction(history)
     fallback = hybrid_prediction(history)
-    trend_shift = trend_shift_score(history)
     
-    final_size = exact["size"] if exact else fallback["size"]
-    final_score = exact["confidence"] if exact else 0.55
+    final_size = fallback["size"]
+    final_score = fallback["confidence"]
+    logic = "HYBRID FALLBACK"
+    
+    # 1. Exact Pattern Override (With Inversion)
+    if exact:
+        final_size = exact["size"]
+        final_score = exact["confidence"]
+        logic = exact["logic"]
 
+    # 2. Trend Tracker Override (Only if very strong)
     hist = advanced_trend_shift_tracker(history)
-    if hist:
+    if hist and hist["confidence"] > final_score:
         final_size = hist["size"]
         final_score = hist["confidence"]
-    elif trend_shift["dir"] != "NONE":
-        final_size = trend_shift["pred"]
-        final_score = max(final_score, 0.65 + min(0.30, abs(trend_shift["score"]) * 2.0))
+        logic = hist["logic"]
 
+    # 3. Reversal Pressure Override
     reversal = trend_reversal_signal(history)
-    if reversal:
+    if reversal and reversal["confidence"] > final_score:
         final_size = reversal["size"]
-        final_score = max(final_score, reversal["confidence"])
+        final_score = reversal["confidence"]
+        logic = reversal["logic"]
 
     final_conf = clamp(final_score, 0.55, 0.94)
-    logic = exact["logic"] if exact else "ENSEMBLE: EXACT + TREND SHIFT + HYBRID"
-
+    
     return {"size": final_size, "logic": logic, "confidence": final_conf, "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.68 else "0.5x"}
 
 def generate_prediction() -> Dict[str, Any]:
@@ -888,7 +930,7 @@ async def worker_loop(app, session):
             log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
 
-async def health_check(request): return web.Response(text="FTW V18 is Running")
+async def health_check(request): return web.Response(text="FTW V19 is Running")
 
 async def start_web_server():
     app = web.Application()
