@@ -1,13 +1,13 @@
 """
-FTW AI V33 FULL CODE
+FTW AI V34 FIX
 ====================
-- pattern length: 3..13
-- exact pattern detection
-- advanced trend shift detector
-- exact number matrix
-- 12-feature AI size model
-- Telegram bot + SQLite + API fetch
-- improved against zigzag / weak trend chasing
+- exact pattern only when strong enough
+- pattern length 3..13
+- recent 1000 result matching
+- trend shift detector with strict gate
+- safe fallback when signal weak
+- number prediction via exact next-value distribution
+- Telegram + SQLite + API fetch
 """
 
 import asyncio
@@ -41,12 +41,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v33_full.db")
-    cache_file: str = "ftw_ai_v33_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v34_fix.db")
+    cache_file: str = "ftw_ai_v34_fix_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW AI V33"
+    bot_name: str = "FTW AI V34 FIX"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
@@ -79,12 +79,12 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_ai_v33_full.log", maxBytes=1_000_000, backupCount=3)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_ai_v34_fix.log", maxBytes=1_000_000, backupCount=3)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_ai_v33")
+log = logging.getLogger("ftw_ai_v34")
 
 # ============================================================
 # HELPERS
@@ -134,140 +134,50 @@ def family_for_size(size: str) -> List[int]:
     return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
 
 # ============================================================
-# STRONG PATTERN DETECTOR (3..13)
+# EXACT PATTERN DETECTOR WITH STRICT GATE
 # ============================================================
-class PatternDetectorV33:
+class ExactPatternV34:
     def __init__(self):
         self.min_window = 3
         self.max_window = 13
 
-    def exact_suffix_match(self, seq: List[int], window: int) -> Dict[str, float]:
+    def _pattern_match(self, seq: List[int], window: int) -> Dict[str, float]:
         if len(seq) < window + 2:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
+            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0, "matches": 0}
 
         suffix = tuple(seq[-window:])
         big_total = 0.0
         small_total = 0.0
         total_weight = 0.0
+        matches = 0
 
         for i in range(len(seq) - window - 1):
             candidate = tuple(seq[i:i + window])
             if candidate != suffix:
                 continue
 
+            matches += 1
             next_val = seq[i + window]
             distance = len(seq) - (i + window)
-            weight = max(0.15, 1.0 - (distance / 1000.0))
+            weight = max(0.10, 1.0 - (distance / 1000.0))
             total_weight += weight
             if next_val == 1:
                 big_total += weight
             else:
                 small_total += weight
 
-        if total_weight == 0:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
+        if total_weight == 0 or matches == 0:
+            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0, "matches": 0}
 
         p_big = (big_total + 1.0) / (total_weight + 2.0)
         p_small = (small_total + 1.0) / (total_weight + 2.0)
+
         return {
             "BIG": p_big,
             "SMALL": p_small,
             "strength": abs(p_big - p_small),
+            "matches": matches,
         }
-
-    def reverse_suffix_match(self, seq: List[int], window: int) -> Dict[str, float]:
-        if len(seq) < window + 2:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        suffix = tuple(reversed(seq[-window:]))
-        big_total = 0.0
-        small_total = 0.0
-        total_weight = 0.0
-
-        for i in range(len(seq) - window - 1):
-            candidate = tuple(reversed(seq[i:i + window]))
-            if candidate != suffix:
-                continue
-
-            next_val = seq[i + window]
-            distance = len(seq) - (i + window)
-            weight = max(0.15, 1.0 - (distance / 1000.0))
-            total_weight += weight
-            if next_val == 1:
-                big_total += weight
-            else:
-                small_total += weight
-
-        if total_weight == 0:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        p_big = (big_total + 1.0) / (total_weight + 2.0)
-        p_small = (small_total + 1.0) / (total_weight + 2.0)
-        return {
-            "BIG": p_big,
-            "SMALL": p_small,
-            "strength": abs(p_big - p_small),
-        }
-
-    def alternation_mode(self, seq: List[int]) -> Dict[str, float]:
-        if len(seq) < 4:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        flips = 0
-        for i in range(1, len(seq)):
-            if seq[i] != seq[i-1]:
-                flips += 1
-        ratio = flips / max(1, len(seq) - 1)
-
-        next_side = 1 - seq[-1]
-        if ratio > 0.45:
-            if next_side == 1:
-                return {"BIG": 0.75, "SMALL": 0.25, "strength": ratio}
-            return {"BIG": 0.25, "SMALL": 0.75, "strength": ratio}
-        return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-    def run_mode(self, seq: List[int]) -> Dict[str, float]:
-        if not seq:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        run = trailing_run(seq)
-        if run >= 3:
-            if seq[-1] == 1:
-                return {"BIG": 0.8, "SMALL": 0.2, "strength": min(run / 10.0, 1.0)}
-            return {"BIG": 0.2, "SMALL": 0.8, "strength": min(run / 10.0, 1.0)}
-        return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-    def gap_mode(self, seq: List[int], window: int) -> Dict[str, float]:
-        if len(seq) < window + 2:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        recent = seq[-window:]
-        prev = seq[-(window + 2):-window]
-        if not prev:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        recent_big = sum(recent)
-        prev_big = sum(prev)
-        if recent_big > prev_big:
-            return {"BIG": 0.75, "SMALL": 0.25, "strength": abs(recent_big - prev_big) / max(1, window)}
-        if recent_big < prev_big:
-            return {"BIG": 0.25, "SMALL": 0.75, "strength": abs(recent_big - prev_big) / max(1, window)}
-        return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-    def shift_detector(self, seq: List[int]) -> Dict[str, float]:
-        if len(seq) < 8:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
-
-        recent = seq[-3:]
-        prev = seq[-6:-3]
-        recent_big = sum(recent)
-        prev_big = sum(prev)
-
-        if recent_big > prev_big:
-            return {"BIG": 0.75, "SMALL": 0.25, "strength": abs(recent_big - prev_big) / 3.0}
-        if recent_big < prev_big:
-            return {"BIG": 0.25, "SMALL": 0.75, "strength": abs(recent_big - prev_big) / 3.0}
-        return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0}
 
     def detect(self, seq: List[int]) -> Dict[str, Any]:
         if not seq:
@@ -276,107 +186,95 @@ class PatternDetectorV33:
                 "confidence": 0.50,
                 "regime": "neutral",
                 "top_mode": None,
-                "modes": [],
+                "strong": False,
             }
 
-        modes = []
+        best = None
+        best_score = -1.0
+
         for window in range(self.min_window, self.max_window + 1):
-            exact = self.exact_suffix_match(seq, window)
-            reverse = self.reverse_suffix_match(seq, window)
-            gap = self.gap_mode(seq, window)
-            shift = self.shift_detector(seq[-min(len(seq), 20):])
+            result = self._pattern_match(seq, window)
+            strength = result["strength"]
+            matches = result["matches"]
+            if matches == 0:
+                continue
 
-            # combine all to many modes
-            mode_list = [
-                ("exact", exact),
-                ("reverse", reverse),
-                ("gap", gap),
-                ("shift", shift),
-            ]
+            # strict gate: only accept if pattern is actually strong enough
+            if strength < 0.12:
+                continue
 
-            for name, metric in mode_list:
-                if metric["strength"] <= 0.0:
-                    continue
-                pred = "BIG" if metric["BIG"] >= metric["SMALL"] else "SMALL"
-                modes.append({
-                    "name": f"{name}_{window}",
+            pred = "BIG" if result["BIG"] >= result["SMALL"] else "SMALL"
+            score = strength * 100.0 + (matches * 3.0) + (window * 2.5)
+
+            if score > best_score:
+                best_score = score
+                best = {
                     "window": window,
                     "pred": pred,
-                    "confidence": max(metric["BIG"], metric["SMALL"]),
-                    "strength": metric["strength"],
-                })
+                    "big_prob": result["BIG"],
+                    "small_prob": result["SMALL"],
+                    "strength": strength,
+                    "matches": matches,
+                    "confidence": max(result["BIG"], result["SMALL"]),
+                }
 
-        # add global modes
-        alt = self.alternation_mode(seq)
-        run = self.run_mode(seq)
-
-        modes.append({"name": "alternation", "window": 0, "pred": "BIG" if alt["BIG"] >= alt["SMALL"] else "SMALL", "confidence": max(alt["BIG"], alt["SMALL"]), "strength": alt["strength"]})
-        modes.append({"name": "run", "window": 0, "pred": "BIG" if run["BIG"] >= run["SMALL"] else "SMALL", "confidence": max(run["BIG"], run["SMALL"]), "strength": run["strength"]})
-
-        if not modes:
+        if best is None:
+            # safe fallback
+            last = seq[-1]
             return {
-                "prediction": "BIG" if seq[-1] == 1 else "SMALL",
-                "confidence": 0.50,
+                "prediction": "BIG" if last == 1 else "SMALL",
+                "confidence": 0.55,
                 "regime": "neutral",
                 "top_mode": None,
-                "modes": [],
+                "strong": False,
             }
 
-        score_map = {"BIG": 0.0, "SMALL": 0.0}
-        for mode in modes:
-            if mode["pred"] == "BIG":
-                score_map["BIG"] += mode["confidence"] * (1.0 + mode["strength"])
+        # trend shift check
+        if len(seq) >= 6:
+            recent3 = seq[-3:]
+            prev3 = seq[-6:-3]
+            recent_big = sum(recent3)
+            prev_big = sum(prev3)
+
+            if recent_big > prev_big + 1:
+                regime = "trend_up"
+            elif recent_big < prev_big - 1:
+                regime = "trend_down"
             else:
-                score_map["SMALL"] += mode["confidence"] * (1.0 + mode["strength"])
-
-        final_pred = "BIG" if score_map["BIG"] >= score_map["SMALL"] else "SMALL"
-        total = score_map["BIG"] + score_map["SMALL"]
-        confidence = 0.50 if total == 0 else abs(score_map["BIG"] - score_map["SMALL"]) / total
-
-        # regime decision
-        run_len = trailing_run(seq)
-        alt_strength = self.alternation_mode(seq)["strength"]
-        if run_len >= 4:
-            regime = "trend"
-        elif alt_strength > 0.45:
-            regime = "zigzag"
+                regime = "balanced"
         else:
             regime = "balanced"
 
-        # anti-trap
-        if regime == "zigzag" and len(seq) >= 8:
-            final_pred = "SMALL" if seq[-1] == 1 else "BIG"
-
-        top_mode = max(modes, key=lambda x: x["confidence"] + x["strength"])
-
+        # anti-chase rule: if exact pattern is strong enough, trust it
+        # otherwise don't force a prediction
         return {
-            "prediction": final_pred,
-            "confidence": clamp(confidence + 0.42, 0.50, 0.96),
+            "prediction": best["pred"],
+            "confidence": clamp(best["confidence"], 0.50, 0.90),
             "regime": regime,
-            "top_mode": top_mode,
-            "modes": modes[:20],
+            "top_mode": best,
+            "strong": True,
         }
 
-PATTERN_DETECTOR = PatternDetectorV33()
+PATTERN_V34 = ExactPatternV34()
 
 # ============================================================
-# SIZE SCORER (12 FEATURES)
+# 12-FEATURE SIZE SCORER
 # ============================================================
-class AdvancedSizeScorer:
+class SizeScorerV34:
     def __init__(self):
         self.weights = {
             "recent_size": 1.20,
-            "run_length": 1.35,
-            "last3_big_ratio": 0.95,
-            "last5_big_ratio": 0.90,
-            "alternation": 0.85,
-            "pattern_repeat": 1.10,
-            "trend_velocity": 0.95,
+            "run_length": 1.30,
+            "last3_big_ratio": 0.90,
+            "last5_big_ratio": 0.85,
+            "alternation": 0.75,
+            "pattern_repeat": 1.00,
+            "trend_velocity": 0.90,
             "volatility": 0.45,
-            "reversal_pressure": 0.90,
-            "consensus": 0.80,
+            "reversal_pressure": 0.85,
+            "consensus": 0.75,
             "entropy": 0.30,
-            "regime_bias": 1.20,
+            "regime_bias": 1.10,
         }
 
     def _sigmoid(self, x: float) -> float:
@@ -387,7 +285,7 @@ class AdvancedSizeScorer:
             return 0.0, 0
         side = seq[-1]
         r = 1
-        for i in range(len(seq) - 2, -1, -1):
+        for i in range(len(seq)-2, -1, -1):
             if seq[i] == side:
                 r += 1
             else:
@@ -405,7 +303,7 @@ class AdvancedSizeScorer:
             return 0.0
         flips = 0
         for i in range(1, len(seq)):
-            if seq[i] != seq[i - 1]:
+            if seq[i] != seq[i-1]:
                 flips += 1
         return (flips / max(1, len(seq)-1)) * 2.0 - 1.0
 
@@ -498,30 +396,29 @@ class AdvancedSizeScorer:
         prob = self._sigmoid(logit)
         label = "BIG" if prob >= 0.5 else "SMALL"
 
-        run_sign, run_len = self._run_length(seq)
-        if run_len >= 3 and abs(prob - 0.5) < 0.12:
-            if run_sign > 0:
+        # hard gate: if uncertainty is too weak, do not over-predict
+        if abs(prob - 0.5) < 0.08:
+            if seq[-1] == 1:
                 label = "BIG"
-                prob = 0.66
+                prob = 0.55
             else:
                 label = "SMALL"
-                prob = 0.34
+                prob = 0.45
 
-        return label, clamp(prob, 0.50, 0.96), features
+        return label, clamp(prob, 0.50, 0.94), features
 
-SIZE_SCORER = AdvancedSizeScorer()
+SIZE_SCORER = SizeScorerV34()
 
 # ============================================================
-# EXACT NUMBER MATRIX
+# EXACT NEXT VALUE MATRIX
 # ============================================================
-class ExactNumberMatrix:
+class ExactNextNumberMatrix:
     def __init__(self):
         self.trans = {a: {b: 0.0 for b in range(10)} for a in range(10)}
 
     def update(self, seq: List[int]):
         if len(seq) < 2:
             return
-
         for i in range(len(seq) - 1):
             prev = seq[i]
             nxt = seq[i + 1]
@@ -538,39 +435,40 @@ class ExactNumberMatrix:
         if not seq:
             return random.choice(family_for_size(pred_size))
 
-        self.update(seq[-1000:])
+        self.update(seq[-2000:])
 
         last_digit = seq[-1]
         base = self.trans.get(last_digit, {d: 0.1 for d in range(10)})
 
         target_family = set(family_for_size(pred_size))
-        dist = {d: 0.0 for d in range(10)}
+        score = {d: 0.0 for d in range(10)}
+
         for d in range(10):
-            dist[d] = base.get(d, 0.0) * 0.8
+            score[d] = base.get(d, 0.0) * 0.8
             if d in target_family:
-                dist[d] += 0.35
+                score[d] += 0.35
             else:
-                dist[d] *= 0.20
+                score[d] *= 0.18
 
         if pred_size == "SMALL":
-            center = {0: 1.15, 1: 1.18, 2: 1.20, 3: 1.10, 4: 1.00}
+            center = {0: 1.12, 1: 1.18, 2: 1.10, 3: 1.06, 4: 1.00}
             for d, w in center.items():
-                dist[d] *= w
+                score[d] *= w
         else:
-            center = {5: 1.00, 6: 1.18, 7: 1.20, 8: 1.10, 9: 1.00}
+            center = {5: 1.00, 6: 1.18, 7: 1.12, 8: 1.08, 9: 1.00}
             for d, w in center.items():
-                dist[d] *= w
+                score[d] *= w
 
-        total = sum(dist.values())
+        total = sum(score.values())
         if total == 0:
             return random.choice(family_for_size(pred_size))
-        for d in dist:
-            dist[d] /= total
 
-        winner = max(dist, key=dist.get)
-        return int(winner)
+        for d in score:
+            score[d] /= total
 
-NUMBER_MATRIX = ExactNumberMatrix()
+        return int(max(score, key=score.get))
+
+NUMBER_MATRIX = ExactNextNumberMatrix()
 
 # ============================================================
 # STATE
@@ -578,7 +476,6 @@ NUMBER_MATRIX = ExactNumberMatrix()
 class BotState:
     def __init__(self):
         self.history: List[Dict[str, Any]] = []
-        self.last_prediction: Optional[Dict[str, Any]] = None
 
     def save_cache(self):
         try:
@@ -730,39 +627,39 @@ def build_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     seq = [x["size"] for x in history]
-    pattern = PATTERN_DETECTOR.detect(seq[-1000:])
-    size_pred, prob, features = SIZE_SCORER.score(seq)
+    pattern = PATTERN_V34.detect(seq[-1000:])
+    ai_size, ai_prob, ai_features = SIZE_SCORER.score(seq)
 
-    if pattern["prediction"] == size_pred:
-        final_size = size_pred
-        conf = clamp(prob + pattern["confidence"] * 0.25, 0.50, 0.96)
+    # Strong gate
+    if pattern["strong"] and pattern["prediction"] == ai_size:
+        final_size = ai_size
+        confidence = clamp(ai_prob + pattern["confidence"] * 0.20, 0.50, 0.94)
+    elif pattern["strong"] and pattern["prediction"] != ai_size:
+        final_size = pattern["prediction"]
+        confidence = pattern["confidence"]
     else:
-        if pattern["confidence"] >= 0.68 and pattern["regime"] in ("zigzag", "balanced", "trend"):
-            final_size = pattern["prediction"]
-            conf = pattern["confidence"]
-        else:
-            final_size = size_pred
-            conf = clamp(prob, 0.50, 0.95)
+        # safe fallback
+        final_size = ai_size
+        confidence = clamp(ai_prob, 0.50, 0.75)
 
     num_seq = [x["num"] for x in history if x.get("num") is not None]
     target_num = NUMBER_MATRIX.predict(num_seq, final_size)
 
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-
-    stake = "3x" if conf >= 0.85 else "2x" if conf >= 0.72 else "1x" if conf >= 0.60 else "0.5x"
+    stake = "3x" if confidence >= 0.85 else "2x" if confidence >= 0.72 else "1x" if confidence >= 0.60 else "0.5x"
 
     return {
         "issue": issue,
         "type": "SIZE",
         "size": final_size,
         "num": target_num,
-        "raw_conf": int(conf * 100),
-        "logic": f"PATTERN(3..13) | regime={pattern['regime']} | top={pattern['top_mode']['name'] if pattern['top_mode'] else 'n/a'}",
+        "raw_conf": int(confidence * 100),
+        "logic": f"STRICT PATTERN + AI | regime={pattern['regime']} | strong={pattern['strong']}",
         "stake": stake,
         "details": {
-            "size_probability": prob,
             "pattern": pattern,
-            "size_features": features
+            "size_probability": ai_prob,
+            "size_features": ai_features
         }
     }
 
@@ -924,7 +821,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW AI V33 is Running")
+    return web.Response(text="FTW AI V34 FIX is Running")
 
 async def main():
     CFG.validate()
