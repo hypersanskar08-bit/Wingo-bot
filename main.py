@@ -1,16 +1,17 @@
 """
-FTW V43 FULL CODE
+FTW V45 FULL CODE
 =================
-Deep upgrade with exact-suffix pattern mining:
-- current suffix match only
-- long patterns with repeats < 5 are ignored
-- highest edge is the main decision comparator
-- exact suffix prediction using recent sequence
+Deep upgrade with exact full-tail tracking:
+- exact contiguous suffix matching only
+- no half-run / midpoint tracking
+- long pattern repeat guard: repeats < 5 ignored
+- weak pattern fallback: opposite side
+- strong pattern rule: edge >= 25 or win rate >= 75
 - regime detection
 - anti-trap / anti-bias guards
 - walk-forward telemetry
 - 2-level target progression
-- Telegram ready, but safe console fallback
+- Telegram ready, console fallback
 """
 
 import asyncio
@@ -46,12 +47,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v43.db")
-    cache_file: str = "ftw_v43_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v45.db")
+    cache_file: str = "ftw_v45_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     timeout: float = 15.0
-    bot_name: str = "FTW V43 ENGINE"
+    bot_name: str = "FTW V45 ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
@@ -90,7 +91,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v43.log",
+        Path(CFG.log_dir) / "ftw_v45.log",
         maxBytes=1_000_000,
         backupCount=3
     )
@@ -98,7 +99,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v43")
+log = logging.getLogger("ftw_v45")
 
 
 def h(x: Any) -> str:
@@ -391,7 +392,7 @@ REGIME = RegimeDetector()
 # ============================================================
 # EXACT PATTERN ENGINE
 # ============================================================
-class PatternEngineV43:
+class PatternEngineV45:
     def __init__(self):
         self.min_window = 5
         self.max_window = 15
@@ -500,16 +501,13 @@ class PatternEngineV43:
             "top_mode": best
         }
 
-PATTERN_ENGINE = PatternEngineV43()
+PATTERN_ENGINE = PatternEngineV45()
 
 
 # ============================================================
-# FIXED: exact suffix pattern selection
-# Rules:
-# - current suffix match only
-# - if long pattern length >= 10 and repeats < 5 => ignore
-# - choose highest edge first
-# - if tie -> higher win rate
+# FIXED: exact contiguous suffix matching only
+# NO midpoint half-run matching
+# NO partial match
 # ============================================================
 def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) -> Optional[Dict[str, Any]]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
@@ -526,6 +524,7 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
         next_counts = defaultdict(int)
         total_matches = 0
 
+        # exact full contiguous suffix matching only
         for i in range(len(seq) - L):
             pat = tuple(seq[i:i + L])
             if pat != current_suffix:
@@ -538,7 +537,7 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
         if total_matches == 0:
             continue
 
-        # this is the crucial rule
+        # long patterns require stronger repeats
         if L >= 10 and total_matches < 5:
             continue
 
@@ -548,8 +547,9 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
         edge = abs((next_count / total_follow) - 0.5) * 200.0
         support = (total_matches / max(1, len(seq) - L)) * 100.0
 
-        if support < 2.0 and win_rate < 60.0:
-            continue
+        # valid pattern rules:
+        # repeats >= 5 and (edge >= 25 OR win_rate >= 75)
+        valid = total_matches >= 5 and (edge >= 25.0 or win_rate >= 75.0)
 
         pattern_str = "".join("B" if v == 1 else "S" for v in current_suffix)
 
@@ -561,21 +561,43 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
             "win_rate": round(win_rate, 2),
             "edge": round(edge, 2),
             "support": round(support, 2),
-            "score": (edge * 2.0) + (win_rate * 0.8) + (total_matches * 2.5),
+            "valid": valid,
+            "score": (edge * 2.5) + (win_rate * 0.8) + (total_matches * 2.0),
         })
 
     if not candidates:
         return None
 
-    # exact priority is highest edge first
-    candidates.sort(key=lambda x: (x["edge"], x["win_rate"], x["score"]), reverse=True)
-    return candidates[0]
+    valid_candidates = [c for c in candidates if c["valid"]]
+    if valid_candidates:
+        valid_candidates.sort(key=lambda x: (x["edge"], x["win_rate"], x["score"]), reverse=True)
+        return valid_candidates[0]
+
+    # weak candidate fallback: opposite side safer
+    weak_candidates = [c for c in candidates if c["repeats"] >= 5 and c["edge"] < 25.0 and c["win_rate"] < 75.0]
+    if weak_candidates:
+        weak_candidates.sort(key=lambda x: (x["edge"], x["win_rate"]), reverse=True)
+        chosen = weak_candidates[0]
+        return {
+            "pattern": chosen["pattern"],
+            "length": chosen["length"],
+            "repeats": chosen["repeats"],
+            "next_side": "SMALL" if chosen["next_side"] == "BIG" else "BIG",
+            "win_rate": chosen["win_rate"],
+            "edge": chosen["edge"],
+            "support": chosen["support"],
+            "valid": False,
+            "opposite_fallback": True,
+            "score": chosen["score"]
+        }
+
+    return None
 
 
 # ============================================================
 # SIZE MODEL
 # ============================================================
-class SizeModelV43:
+class SizeModelV45:
     def __init__(self):
         self.weights = {
             "recent_size": 1.2,
@@ -620,7 +642,7 @@ class SizeModelV43:
         for i in range(1, len(seq)):
             if seq[i] != seq[i - 1]:
                 flips += 1
-        return (flips / max(1, len(seq)-1)) * 2.0 - 1.0
+        return (flips / max(1, len(seq) - 1)) * 2.0 - 1.0
 
     def _pattern_repeat(self, seq: List[int]) -> float:
         if len(seq) < 6:
@@ -628,9 +650,9 @@ class SizeModelV43:
         suffix = tuple(seq[-5:])
         matches = 0
         for i in range(len(seq) - 5):
-            if tuple(seq[i:i+5]) == suffix:
+            if tuple(seq[i:i + 5]) == suffix:
                 matches += 1
-        return max(-1.0, min(1.0, (matches / max(1, len(seq)-5)) * 2.0 - 1.0))
+        return max(-1.0, min(1.0, (matches / max(1, len(seq) - 5)) * 2.0 - 1.0))
 
     def _trend_velocity(self, seq: List[int]) -> float:
         if len(seq) < 6:
@@ -720,7 +742,7 @@ class SizeModelV43:
 
         return pred, clamp(prob, 0.50, 0.94), feats
 
-SIZE_MODEL = SizeModelV43()
+SIZE_MODEL = SizeModelV45()
 
 
 # ============================================================
@@ -934,7 +956,7 @@ WALK = WalkForwardEngine()
 
 
 # ============================================================
-# FINAL ENSEMBLE WITH EXACT SUFFIX PATTERN
+# FINAL ENSEMBLE
 # ============================================================
 def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
@@ -949,6 +971,7 @@ def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict
         }
 
     exact_pattern = best_exact_suffix_pattern(history, max_len=15)
+
     pattern_catalog = []
     if exact_pattern:
         pattern_catalog.append(exact_pattern)
@@ -958,9 +981,14 @@ def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict
 
     mined_side = None
     mined_conf = 0.0
+
     if exact_pattern:
-        mined_side = exact_pattern["next_side"]
-        mined_conf = clamp(exact_pattern["win_rate"] / 100.0, 0.50, 0.92)
+        if exact_pattern.get("opposite_fallback"):
+            mined_side = exact_pattern["next_side"]
+            mined_conf = 0.60
+        else:
+            mined_side = exact_pattern["next_side"]
+            mined_conf = clamp(exact_pattern["win_rate"] / 100.0, 0.50, 0.92)
 
     recovered = recovery_logic(history)
     if recovered:
@@ -1277,7 +1305,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V43 is Running")
+    return web.Response(text="FTW V45 is Running")
 
 async def start_server():
     app = web.Application()
