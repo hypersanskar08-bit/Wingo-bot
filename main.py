@@ -1,11 +1,13 @@
 """
-FTW V16 FULL CODE (STRICT DRAGON RIDING - NO BLIND REVERSAL)
+FTW V18 FULL CODE (ULTIMATE FINAL)
 =================
-- Removed Anti-Bias Guard (It was forcing wrong reversals)
-- Fixed Trend Exhaustion (Now only reverses on true momentum decay)
-- Increased Contextual Shift threshold to 75% (Stops fake reversals)
-- 5 to 14 Size Pattern Tracking
-- Exact Number Sequence Tracking
+Advanced deep predictor with:
+- Strict Dragon Riding (No blind reversals)
+- Strong Exact Pattern Analysis (100% Match + Recency Weight + Laplace Smoothing)
+- 5 to 14 Size Sequence Tracking
+- Exact Number Sequence Tracking (0-9)
+- Full 1000 history backtesting on startup
+- Telegram VIP Channel Ready
 """
 
 import asyncio
@@ -32,18 +34,22 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
+    # ⚠️ यहाँ अपना नया बॉट टोकन डालें
     telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
+    
+    # ⚠️ यहाँ अपनी VIP Channel की ID डालें (जो -100 से शुरू होती है)
     chat_id_raw: str = os.environ.get("CHAT_ID", "-1004485961768")
+    
     source_api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v16_full.db")
-    cache_file: str = "ftw_v16_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v18_full.db")
+    cache_file: str = "ftw_v18_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V16 PHASE ENGINE"
+    bot_name: str = "FTW V18 PHASE ENGINE"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -70,20 +76,23 @@ def setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v16_full.log", maxBytes=1_000_000, backupCount=2)
+
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v18_full.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v16")
+log = logging.getLogger("ftw_v18")
 
 def h(x: Any) -> str: return html.escape(str(x))
 def safe_int(x, default=0):
     try: return int(x)
     except: return default
+
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None: return None
     if isinstance(value, str):
@@ -94,6 +103,7 @@ def normalize_issue(value: Any) -> Optional[int]:
         if digits: return int(digits)
     try: return int(value)
     except: return None
+
 def clamp(v: float, low: float, high: float) -> float: return max(low, min(high, v))
 
 def trailing_run(seq: List[int]) -> int:
@@ -168,8 +178,6 @@ def side_balance(history: List[Dict[str, Any]], window: int = 20) -> float:
     small_share = sum(1 for v in seq if v == 0) / len(seq)
     big_share = sum(1 for v in seq if v == 1) / len(seq)
     return small_share - big_share
-
-# ❌ BIAS GUARD REMOVED - It was forcing blind reversals and causing losses.
 
 # ============================================================
 # STATE & STORAGE
@@ -315,7 +323,7 @@ class AdaptiveWeights:
 ADAPTIVE = AdaptiveWeights()
 
 # ============================================================
-# TREND PHASE & FIXED EXHAUSTION
+# TREND PHASE & STRICT DRAGON RIDING
 # ============================================================
 def trend_phase(history: List[Dict[str, Any]]) -> str:
     if len(history) < 8: return "COLD"
@@ -346,7 +354,6 @@ def trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     big_share = sum(1 for v in recent if v == 1) / len(recent)
     small_share = sum(1 for v in recent if v == 0) / len(recent)
     
-    # 🔥 FIX: We need actual Momentum Decay to reverse, not just a long trend.
     last3, prev3 = seq[-3:], seq[-6:-3]
     is_decaying = False
     if len(last3) == 3 and len(prev3) == 3:
@@ -354,17 +361,13 @@ def trend_exhaustion(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         prev_same = sum(1 for v in prev3 if v == current_side)
         is_decaying = (last_same < prev_same)
 
-    # Only reverse if trend is EXHAUSTED and actually decaying
     if phase == "EXHAUSTED" and is_decaying:
         if current_side == 1 and big_share >= 0.75: return {"size": "SMALL", "logic": "TREND EXHAUSTION: DECAY CONFIRMED", "confidence": 0.92, "stake": "1x"}
         if current_side == 0 and small_share >= 0.75: return {"size": "BIG", "logic": "TREND EXHAUSTION: DECAY CONFIRMED", "confidence": 0.92, "stake": "1x"}
-    
-    # Note: Removed the DOMINANT fatigue logic. It was causing blind reversal losses.
     return None
 
 def advanced_trend_shift_tracker(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(history) < 20: return None
-    
     seq = [x["size"] for x in history]
     current_run = trailing_run(seq)
     current_side = seq[-1]
@@ -386,11 +389,10 @@ def advanced_trend_shift_tracker(history: List[Dict[str, Any]]) -> Optional[Dict
                 else: break_count += 1
                 
         total = continuation_count + break_count
-        if total >= 3: # Needs at least 3 historical matches to be reliable
+        if total >= 3:
             cont_prob = continuation_count / total
             break_prob = break_count / total
             
-            # 🔥 FIX: Increased threshold to 75% to prevent fake reversals
             if break_prob >= 0.75:
                 return {"size": "SMALL" if current_side == 1 else "BIG", "logic": f"CTX SHIFT: {break_prob*100:.0f}% Break", "confidence": 0.86, "stake": "1x"}
             elif cont_prob >= 0.65:
@@ -417,49 +419,81 @@ def trend_reversal_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
     if len(last3) == 3 and len(prev3) == 3:
         last_same = sum(1 for v in last3 if v == current_side)
         prev_same = sum(1 for v in prev3 if v == current_side)
-        if last_same < prev_same:
+        if last_same <= prev_same:
             return {"size": opposite, "logic": "REVERSAL PRESSURE: momentum fading", "confidence": 0.85, "stake": "1x"}
     return None
 
 # ============================================================
-# PATTERN LIBRARY & STAT MODELS
+# STRONG PATTERN ANALYSIS (PURE EXACT + RECENCY WEIGHT)
 # ============================================================
-def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def strong_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seq = [x["size"] for x in history]
     candidates = []
+    total_history = len(seq)
+    
     for window in range(5, 15):
-        if len(seq) < window + 1: continue
+        if total_history < window + 3: continue
+        
         suffix = tuple(seq[-window:])
-        counts, next_big, next_small = defaultdict(int), defaultdict(int), defaultdict(int)
+        exact_big = 0.0
+        exact_small = 0.0
+        exact_weight_total = 0.0
+        
+        for i in range(total_history - window - 1, -1, -1):
+            past_pattern = tuple(seq[i:i + window])
+            
+            # 100% Exact Match Only
+            if past_pattern == suffix:
+                next_res = seq[i + window]
+                distance_from_end = total_history - (i + window)
+                recency_weight = max(0.2, 1.0 - (distance_from_end / total_history))
+                
+                exact_weight_total += recency_weight
+                if next_res == 1: exact_big += recency_weight
+                else: exact_small += recency_weight
 
-        for i in range(len(seq) - window):
-            key = tuple(seq[i:i + window])
-            counts[key] += 1
-            if seq[i + window] == 1: next_big[key] += 1
-            else: next_small[key] += 1
-
-        if suffix not in counts: continue
-
-        total = counts[suffix]
-        big_prob = next_big.get(suffix, 0) / total
-        small_prob = next_small.get(suffix, 0) / total
-        support = total / max(1, len(seq) - window)
-        pred = "BIG" if big_prob >= small_prob else "SMALL"
-        confidence = abs(big_prob - small_prob) * 100.0
-
-        if support < 0.02 and confidence < 15: continue
-        key = f"{window}:{suffix}"
-        score = confidence + (support * 100.0) + (window * 2.0) + STORE.get_pattern_score(key) * 25.0
-        candidates.append({"window": window, "suffix": suffix, "pred": pred, "confidence": confidence, "support": support, "score": score, "key": key})
+        if exact_weight_total >= 1.5:
+            # Laplace Smoothing (Prevents 100% confidence from 1 sample)
+            big_prob = (exact_big + 1) / (exact_weight_total + 2)
+            small_prob = (exact_small + 1) / (exact_weight_total + 2)
+            
+            pred = "BIG" if big_prob >= small_prob else "SMALL"
+            confidence = abs(big_prob - small_prob) * 100.0
+            
+            if confidence >= 10.0:
+                score = confidence + (exact_weight_total * 4.0) + (window * 3.0)
+                candidates.append({
+                    "window": window, "pred": pred, "confidence": confidence, 
+                    "support": exact_weight_total, "score": score, "key": f"EX:{window}:{suffix}"
+                })
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates[:12]
+    return candidates[:3]
+
+def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = strong_pattern_candidates(history)
+    if not candidates: return None
+        
+    best = candidates[0]
+    pred = best["pred"]
+    confidence = clamp(best["confidence"] / 100.0, 0.55, 0.95)
+    
+    STORE.update_pattern_stats(best["key"], 1 if pred == "BIG" else 0)
+    
+    return {
+        "size": pred, 
+        "logic": f"STRONG EXACT {best['window']}-SEQ ({best['confidence']:.1f}%)", 
+        "confidence": confidence, 
+        "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
+    }
 
 def exact_number_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     nums = [x["num"] for x in history]
     candidates = []
+    
     for window in range(3, 9):
         if len(nums) < window + 1: continue
+        
         suffix = tuple(nums[-window:])
         counts = defaultdict(int)
         next_counts = defaultdict(int)
@@ -489,22 +523,10 @@ def exact_number_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any
         score = confidence + (support * 100.0) + (window * 3.0)
         
         candidates.append({
-            "window": window, "num": best_num, "confidence": confidence, "support": support, "score": score,
-            "logic": f"NUM SEQ {window}:{suffix} => {best_num}"
+            "window": window, "num": best_num, "confidence": confidence, "support": support, "score": score
         })
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates
-
-def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    candidates = exact_pattern_candidates(history)
-    if not candidates: return None
-    best = candidates[0]
-    if best["confidence"] < 12 and best["support"] < 0.04: return None
-    pred = best["pred"]
-    confidence = clamp(best["confidence"] / 100.0, 0.55, 0.92)
-    
-    STORE.update_pattern_stats(best["key"], 1 if pred == "BIG" else 0)
-    return {"size": pred, "logic": f"EXACT {best['window']}-SEQ PATTERN", "confidence": confidence, "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"}
 
 def markov_prob(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -596,7 +618,6 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         if small_share >= 0.75 and big_share <= 0.25: return {"size": "BIG", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
         if big_share >= 0.75 and small_share <= 0.25: return {"size": "SMALL", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
 
-    # Pure Dragon Riding (Follow the current trend)
     if trailing_run(seq) >= 3:
         last = seq[-1]
         last3, prev3 = seq[-3:], seq[-6:-3]
@@ -606,7 +627,7 @@ def recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
             if last_same < prev_same: 
                 return {"size": "SMALL" if last == 1 else "BIG", "logic": "TREND DECAY REVERSAL", "confidence": 0.88, "stake": "1x"}
                 
-        return {"size": "BIG" if last == 1 else "SMALL", "logic": "DRAGON RIDING (FOLLOWING TREND)", "confidence": 0.80, "stake": "1x"}
+        return {"size": "BIG" if last == 1 else "SMALL", "logic": "DRAGON RIDING", "confidence": 0.80, "stake": "1x"}
 
     if len(recent) >= 4:
         r_small, r_big = sum(1 for v in recent if v == 0), sum(1 for v in recent if v == 1)
@@ -622,22 +643,22 @@ def is_same_family(num: int, size: str) -> bool: return num in family_for_size(s
 
 def number_repeat_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     nums = [x["num"] for x in history[-30:]]
-    if not nums: return {"value": 0, "score": 0.0, "logic": "NONE"}
+    if not nums: return {"value": 0, "score": 0.0}
     most_common_num, most_count = Counter(nums).most_common(1)[0]
     repeat_ratio = most_count / len(nums)
-    if repeat_ratio >= 0.2: return {"value": most_common_num, "score": repeat_ratio, "logic": "REPEATED_NUMBER"}
-    return {"value": 0, "score": 0.0, "logic": "NONE"}
+    if repeat_ratio >= 0.2: return {"value": most_common_num, "score": repeat_ratio}
+    return {"value": 0, "score": 0.0}
 
 def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     nums = [x["num"] for x in history[-12:]]
-    if len(nums) < 3: return {"value": 0, "score": 0.0, "logic": "NONE"}
+    if len(nums) < 3: return {"value": 0, "score": 0.0}
     diffs = [abs(nums[i] - nums[i - 1]) for i in range(1, len(nums))]
-    if not diffs: return {"value": 0, "score": 0.0, "logic": "NONE"}
+    if not diffs: return {"value": 0, "score": 0.0}
     avg_gap = sum(diffs) / len(diffs)
     last_gap = abs(nums[-1] - nums[-2])
-    if avg_gap < 2: return {"value": nums[-1], "score": 0.7, "logic": "LOW_GAP"}
-    if last_gap >= 3: return {"value": max(0, nums[-1] - 1), "score": 0.6, "logic": "GAP_JUMP"}
-    return {"value": 0, "score": 0.0, "logic": "NONE"}
+    if avg_gap < 2: return {"value": nums[-1], "score": 0.7}
+    if last_gap >= 3: return {"value": max(0, nums[-1] - 1), "score": 0.6}
+    return {"value": 0, "score": 0.0}
 
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
@@ -690,8 +711,6 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         final_size = reversal["size"]
         final_score = max(final_score, reversal["confidence"])
 
-    # ❌ Removed bias_guard call here
-
     final_conf = clamp(final_score, 0.55, 0.94)
     logic = exact["logic"] if exact else "ENSEMBLE: EXACT + TREND SHIFT + HYBRID"
 
@@ -712,8 +731,6 @@ def generate_prediction() -> Dict[str, Any]:
         ensemble = weighted_ensemble(history)
         pred_size, pred_logic, pred_conf, pred_stake = ensemble["size"], ensemble["logic"], ensemble["confidence"], ensemble["stake"]
 
-    # ❌ Removed bias_guard here
-    
     final_num = choose_number_for_size(pred_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
@@ -871,7 +888,7 @@ async def worker_loop(app, session):
             log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
 
-async def health_check(request): return web.Response(text="FTW V16 FULL is Running")
+async def health_check(request): return web.Response(text="FTW V18 is Running")
 
 async def start_web_server():
     app = web.Application()
