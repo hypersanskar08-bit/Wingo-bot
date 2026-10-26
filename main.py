@@ -1,16 +1,16 @@
 """
-FTW V42 FULL CODE
+FTW V43 FULL CODE
 =================
-Fixed version:
-- exact suffix match prediction
-- current recent sequence decides next side
-- no global repeat bias as primary predictor
-- exact pattern engine 5..15
+Deep upgrade with exact-suffix pattern mining:
+- current suffix match only
+- long patterns with repeats < 5 are ignored
+- highest edge is the main decision comparator
+- exact suffix prediction using recent sequence
 - regime detection
 - anti-trap / anti-bias guards
 - walk-forward telemetry
 - 2-level target progression
-- Telegram-ready, console fallback
+- Telegram ready, but safe console fallback
 """
 
 import asyncio
@@ -46,12 +46,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v42.db")
-    cache_file: str = "ftw_v42_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v43.db")
+    cache_file: str = "ftw_v43_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     timeout: float = 15.0
-    bot_name: str = "FTW V42 ENGINE"
+    bot_name: str = "FTW V43 ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
@@ -90,7 +90,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v42.log",
+        Path(CFG.log_dir) / "ftw_v43.log",
         maxBytes=1_000_000,
         backupCount=3
     )
@@ -98,7 +98,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v42")
+log = logging.getLogger("ftw_v43")
 
 
 def h(x: Any) -> str:
@@ -248,8 +248,7 @@ class Storage:
 
     def prediction_exists(self, issue: str) -> bool:
         with self._conn() as c:
-            row = c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
-            return row is not None
+            return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
 
     def resolve_pending(self, history_by_issue):
         resolved = []
@@ -392,7 +391,7 @@ REGIME = RegimeDetector()
 # ============================================================
 # EXACT PATTERN ENGINE
 # ============================================================
-class PatternEngineV42:
+class PatternEngineV43:
     def __init__(self):
         self.min_window = 5
         self.max_window = 15
@@ -501,12 +500,16 @@ class PatternEngineV42:
             "top_mode": best
         }
 
-PATTERN_ENGINE = PatternEngineV42()
+PATTERN_ENGINE = PatternEngineV43()
 
 
 # ============================================================
 # FIXED: exact suffix pattern selection
-# This is the actual fix for the bug you mentioned.
+# Rules:
+# - current suffix match only
+# - if long pattern length >= 10 and repeats < 5 => ignore
+# - choose highest edge first
+# - if tie -> higher win rate
 # ============================================================
 def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) -> Optional[Dict[str, Any]]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
@@ -535,17 +538,21 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
         if total_matches == 0:
             continue
 
+        # this is the crucial rule
+        if L >= 10 and total_matches < 5:
+            continue
+
         next_side, next_count = max(next_counts.items(), key=lambda kv: kv[1])
         total_follow = sum(next_counts.values())
         win_rate = (next_count / total_follow) * 100.0
         edge = abs((next_count / total_follow) - 0.5) * 200.0
         support = (total_matches / max(1, len(seq) - L)) * 100.0
 
-        # gate: current suffix must have actual support
         if support < 2.0 and win_rate < 60.0:
             continue
 
         pattern_str = "".join("B" if v == 1 else "S" for v in current_suffix)
+
         candidates.append({
             "pattern": pattern_str,
             "length": L,
@@ -554,20 +561,21 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
             "win_rate": round(win_rate, 2),
             "edge": round(edge, 2),
             "support": round(support, 2),
-            "score": (total_matches * 3.0) + (win_rate * 0.7) + (edge * 0.8),
+            "score": (edge * 2.0) + (win_rate * 0.8) + (total_matches * 2.5),
         })
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    # exact priority is highest edge first
+    candidates.sort(key=lambda x: (x["edge"], x["win_rate"], x["score"]), reverse=True)
     return candidates[0]
 
 
 # ============================================================
 # SIZE MODEL
 # ============================================================
-class SizeModelV42:
+class SizeModelV43:
     def __init__(self):
         self.weights = {
             "recent_size": 1.2,
@@ -712,7 +720,7 @@ class SizeModelV42:
 
         return pred, clamp(prob, 0.50, 0.94), feats
 
-SIZE_MODEL = SizeModelV42()
+SIZE_MODEL = SizeModelV43()
 
 
 # ============================================================
@@ -941,7 +949,6 @@ def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict
         }
 
     exact_pattern = best_exact_suffix_pattern(history, max_len=15)
-
     pattern_catalog = []
     if exact_pattern:
         pattern_catalog.append(exact_pattern)
@@ -1270,7 +1277,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V42 is Running")
+    return web.Response(text="FTW V43 is Running")
 
 async def start_server():
     app = web.Application()
