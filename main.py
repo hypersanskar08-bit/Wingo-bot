@@ -1,16 +1,15 @@
 """
-FTW V45 FULL CODE
+FTW V46 FULL CODE
 =================
-Deep upgrade with exact full-tail tracking:
-- exact contiguous suffix matching only
-- no half-run / midpoint tracking
-- long pattern repeat guard: repeats < 5 ignored
-- weak pattern fallback: opposite side
-- strong pattern rule: edge >= 25 or win rate >= 75
+Deep upgrade with exact full-section tracking:
+- full boundary-aligned section detection only
+- no midpoint / half-run matching
+- long patterns with repeats < 5 are ignored
+- if weak pattern: opposite side fallback
+- exact section match priority
+- minimal strong rule: edge >= 25 or win_rate >= 75
 - regime detection
-- anti-trap / anti-bias guards
-- walk-forward telemetry
-- 2-level target progression
+- anti-trap / anti-bias
 - Telegram ready, console fallback
 """
 
@@ -47,12 +46,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v45.db")
-    cache_file: str = "ftw_v45_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v46.db")
+    cache_file: str = "ftw_v46_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     timeout: float = 15.0
-    bot_name: str = "FTW V45 ENGINE"
+    bot_name: str = "FTW V46 ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
@@ -91,7 +90,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v45.log",
+        Path(CFG.log_dir) / "ftw_v46.log",
         maxBytes=1_000_000,
         backupCount=3
     )
@@ -99,7 +98,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v45")
+log = logging.getLogger("ftw_v46")
 
 
 def h(x: Any) -> str:
@@ -319,35 +318,6 @@ class Storage:
                     created_at=excluded.created_at
             """, (draw_index, pnl, balance, target1, target2, win_count, loss_count, time.time()))
 
-    def update_module_state(self, module_name: str, score: float, weight: float, hit_rate: float, confidence: float):
-        with self._conn() as c:
-            c.execute("""
-                INSERT INTO modules (module_name, score, weight, hit_rate, confidence, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(module_name) DO UPDATE SET
-                    score=excluded.score,
-                    weight=excluded.weight,
-                    hit_rate=excluded.hit_rate,
-                    confidence=excluded.confidence,
-                    updated_at=excluded.updated_at
-            """, (module_name, score, weight, hit_rate, confidence, time.time()))
-
-    def module_status(self, module_name: str) -> Dict[str, float]:
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT score, weight, hit_rate, confidence FROM modules WHERE module_name=?",
-                (module_name,)
-            ).fetchone()
-        if not row:
-            return {"score": 0.0, "weight": 0.0, "hit_rate": 0.0, "confidence": 0.0}
-        score, weight, hit_rate, confidence = row
-        return {
-            "score": float(score),
-            "weight": float(weight),
-            "hit_rate": float(hit_rate),
-            "confidence": float(confidence),
-        }
-
 STORE = Storage(CFG.db_path)
 
 
@@ -371,7 +341,6 @@ class RegimeDetector:
     def detect(self, seq: List[int]) -> str:
         if len(seq) < 8:
             return "neutral"
-
         run = trailing_run(seq)
         alt = self.alternation_score(seq, 10)
         ratio = self.ratio_big(seq, 10)
@@ -390,179 +359,82 @@ REGIME = RegimeDetector()
 
 
 # ============================================================
-# EXACT PATTERN ENGINE
+# SECTION-BASED PATTERN TRACKING
 # ============================================================
-class PatternEngineV45:
-    def __init__(self):
-        self.min_window = 5
-        self.max_window = 15
+def split_sections(seq: List[int]) -> List[Tuple[int, int]]:
+    if not seq:
+        return []
 
-    def _score_suffix(self, seq: List[int], window: int) -> Dict[str, Any]:
-        if len(seq) < window + 2:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0, "matches": 0}
+    sections: List[Tuple[int, int]] = []
+    start = 0
+    current = seq[0]
 
-        suffix = tuple(seq[-window:])
-        big_total = 0.0
-        small_total = 0.0
-        total_weight = 0.0
-        matches = 0
+    for i in range(1, len(seq)):
+        if seq[i] != current:
+            sections.append((current, i - start))
+            current = seq[i]
+            start = i
 
-        for i in range(len(seq) - window - 1):
-            cand = tuple(seq[i:i + window])
-            if cand != suffix:
-                continue
-            matches += 1
-            next_val = seq[i + window]
-            dist = len(seq) - (i + window)
-            weight = max(0.15, 1.0 - (dist / 1000.0))
-            total_weight += weight
-            if next_val == 1:
-                big_total += weight
-            else:
-                small_total += weight
-
-        if total_weight == 0 or matches == 0:
-            return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0, "matches": 0}
-
-        p_big = (big_total + 1.0) / (total_weight + 2.0)
-        p_small = (small_total + 1.0) / (total_weight + 2.0)
-        strength = abs(p_big - p_small)
-
-        return {
-            "BIG": p_big,
-            "SMALL": p_small,
-            "strength": strength,
-            "matches": matches
-        }
-
-    def detect(self, seq: List[int]) -> Dict[str, Any]:
-        if not seq:
-            return {
-                "prediction": "BIG",
-                "confidence": 0.50,
-                "regime": "neutral",
-                "strong": False,
-                "top_mode": None
-            }
-
-        best = None
-        best_score = -1.0
-
-        for window in range(self.min_window, self.max_window + 1):
-            result = self._score_suffix(seq, window)
-            strength = result["strength"]
-            matches = result["matches"]
-
-            if matches == 0 or strength < 0.12:
-                continue
-
-            support = matches / max(1, len(seq) - window)
-            if support < 0.04:
-                continue
-
-            pred = "BIG" if result["BIG"] >= result["SMALL"] else "SMALL"
-            score = strength * 100.0 + support * 100.0 + matches * 4.0 + window * 2.0
-
-            if score > best_score:
-                best_score = score
-                best = {
-                    "window": window,
-                    "pred": pred,
-                    "strength": strength,
-                    "matches": matches,
-                    "support": support,
-                    "confidence": max(result["BIG"], result["SMALL"])
-                }
-
-        if best is None:
-            last = seq[-1]
-            return {
-                "prediction": "BIG" if last == 1 else "SMALL",
-                "confidence": 0.55,
-                "regime": REGIME.detect(seq),
-                "strong": False,
-                "top_mode": None
-            }
-
-        regime = REGIME.detect(seq)
-
-        if regime == "zigzag" and len(seq) >= 8:
-            final_pred = "SMALL" if seq[-1] == 1 else "BIG"
-            final_conf = 0.62
-        else:
-            final_pred = best["pred"]
-            final_conf = clamp(best["confidence"], 0.50, 0.92)
-
-        return {
-            "prediction": final_pred,
-            "confidence": final_conf,
-            "regime": regime,
-            "strong": True,
-            "top_mode": best
-        }
-
-PATTERN_ENGINE = PatternEngineV45()
+    sections.append((current, len(seq) - start))
+    return sections
 
 
-# ============================================================
-# FIXED: exact contiguous suffix matching only
-# NO midpoint half-run matching
-# NO partial match
-# ============================================================
-def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) -> Optional[Dict[str, Any]]:
+def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: int = 6) -> Optional[Dict[str, Any]]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
     if len(seq) < 6:
         return None
 
+    current_signature = split_sections(seq)
+    total_sections = len(current_signature)
+    if total_sections < 2:
+        return None
+
     candidates = []
 
-    for L in range(5, max_len + 1):
-        if len(seq) < L + 1:
-            continue
+    for section_count in range(2, min(max_section_count, total_sections) + 1):
+        tail = current_signature[-section_count:]
 
-        current_suffix = tuple(seq[-L:])
         next_counts = defaultdict(int)
-        total_matches = 0
+        matches = 0
 
-        # exact full contiguous suffix matching only
-        for i in range(len(seq) - L):
-            pat = tuple(seq[i:i + L])
-            if pat != current_suffix:
+        for i in range(total_sections - section_count):
+            prev = current_signature[i:i + section_count]
+            if prev != tail:
                 continue
+            matches += 1
+            if i + section_count < total_sections:
+                nxt = current_signature[i + section_count]
+                next_counts[nxt] += 1
 
-            total_matches += 1
-            nxt = seq[i + L]
-            next_counts[nxt] += 1
-
-        if total_matches == 0:
+        if matches == 0:
             continue
 
-        # long patterns require stronger repeats
-        if L >= 10 and total_matches < 5:
+        # strong rules
+        if section_count >= 4 and matches < 5:
             continue
 
-        next_side, next_count = max(next_counts.items(), key=lambda kv: kv[1])
+        next_key, next_count = max(next_counts.items(), key=lambda kv: kv[1]) if next_counts else (None, 0)
+        if next_key is None:
+            continue
+
         total_follow = sum(next_counts.values())
         win_rate = (next_count / total_follow) * 100.0
         edge = abs((next_count / total_follow) - 0.5) * 200.0
-        support = (total_matches / max(1, len(seq) - L)) * 100.0
 
-        # valid pattern rules:
-        # repeats >= 5 and (edge >= 25 OR win_rate >= 75)
-        valid = total_matches >= 5 and (edge >= 25.0 or win_rate >= 75.0)
-
-        pattern_str = "".join("B" if v == 1 else "S" for v in current_suffix)
+        valid = matches >= 5 and (edge >= 25.0 or win_rate >= 75.0)
+        next_val, _ = next_key
+        next_side = "BIG" if next_val == 1 else "SMALL"
 
         candidates.append({
-            "pattern": pattern_str,
-            "length": L,
-            "repeats": total_matches,
-            "next_side": "BIG" if next_side == 1 else "SMALL",
+            "pattern": tail,
+            "section_count": section_count,
+            "repeats": matches,
+            "next_section": next_key,
+            "next_side": next_side,
             "win_rate": round(win_rate, 2),
             "edge": round(edge, 2),
-            "support": round(support, 2),
             "valid": valid,
-            "score": (edge * 2.5) + (win_rate * 0.8) + (total_matches * 2.0),
+            "score": (edge * 2.5) + (win_rate * 0.8) + (matches * 2.0),
         })
 
     if not candidates:
@@ -573,19 +445,18 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
         valid_candidates.sort(key=lambda x: (x["edge"], x["win_rate"], x["score"]), reverse=True)
         return valid_candidates[0]
 
-    # weak candidate fallback: opposite side safer
     weak_candidates = [c for c in candidates if c["repeats"] >= 5 and c["edge"] < 25.0 and c["win_rate"] < 75.0]
     if weak_candidates:
         weak_candidates.sort(key=lambda x: (x["edge"], x["win_rate"]), reverse=True)
         chosen = weak_candidates[0]
         return {
             "pattern": chosen["pattern"],
-            "length": chosen["length"],
+            "section_count": chosen["section_count"],
             "repeats": chosen["repeats"],
+            "next_section": chosen["next_section"],
             "next_side": "SMALL" if chosen["next_side"] == "BIG" else "BIG",
             "win_rate": chosen["win_rate"],
             "edge": chosen["edge"],
-            "support": chosen["support"],
             "valid": False,
             "opposite_fallback": True,
             "score": chosen["score"]
@@ -597,7 +468,7 @@ def best_exact_suffix_pattern(history: List[Dict[str, Any]], max_len: int = 15) 
 # ============================================================
 # SIZE MODEL
 # ============================================================
-class SizeModelV45:
+class SizeModelV46:
     def __init__(self):
         self.weights = {
             "recent_size": 1.2,
@@ -742,7 +613,7 @@ class SizeModelV45:
 
         return pred, clamp(prob, 0.50, 0.94), feats
 
-SIZE_MODEL = SizeModelV45()
+SIZE_MODEL = SizeModelV46()
 
 
 # ============================================================
@@ -813,12 +684,7 @@ def recovery_logic(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     last = seq[-1]
 
     if run >= 4 and len(seq) >= 8:
-        return {
-            "size": "SMALL" if last == 1 else "BIG",
-            "logic": "RUN FATIGUE",
-            "confidence": 0.85,
-            "stake": "1x"
-        }
+        return {"size": "SMALL" if last == 1 else "BIG", "logic": "RUN FATIGUE", "confidence": 0.85, "stake": "1x"}
 
     recent = seq[-6:]
     big_share = sum(1 for v in recent if v == 1) / len(recent)
@@ -914,30 +780,10 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 # ============================================================
 class WalkForwardEngine:
     def __init__(self):
-        self.window_size = 250
-        self.train_window = 120
-        self.validate_window = 30
         self.balance = 0.0
         self.pnl = 0.0
         self.target1 = 0.0
         self.target2 = 0.0
-
-    def update(self, actual_size: str, prediction_size: str, stake_value: float):
-        delta = 1.0 if prediction_size == actual_size else -1.0
-        self.pnl += delta * stake_value
-        self.balance += delta * stake_value
-        self.target1 = self.balance * 0.15
-        self.target2 = self.balance * 0.30
-
-        STORE.log_draw_telemetry(
-            draw_index=int(time.time() * 1000),
-            pnl=self.pnl,
-            balance=self.balance,
-            target1=self.target1,
-            target2=self.target2,
-            win_count=max(0, int(self.balance / max(1.0, abs(stake_value)))),
-            loss_count=max(0, int(abs(self.pnl) / max(1.0, abs(stake_value))))
-        )
 
     def target_breakdown(self) -> Dict[str, float]:
         return {
@@ -946,19 +792,19 @@ class WalkForwardEngine:
         }
 
     def walk_forward_score(self, history: List[Dict[str, Any]]) -> Dict[str, float]:
-        if len(history) < self.train_window:
-            return {"score": 0.50, "window": self.train_window}
+        if len(history) < 120:
+            return {"score": 0.50, "window": 120}
         ratio = min(1.0, len(history) / 5000.0)
         score = 0.62 + ratio * 0.28
-        return {"score": score, "window": self.train_window}
+        return {"score": score, "window": 120}
 
 WALK = WalkForwardEngine()
 
 
 # ============================================================
-# FINAL ENSEMBLE
+# FINAL ENSEMBLE: exact boundary section match
 # ============================================================
-def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def weighted_ensemble_section(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
 
     if len(seq) < CFG.min_history:
@@ -970,25 +816,22 @@ def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict
             "pattern_catalog": []
         }
 
-    exact_pattern = best_exact_suffix_pattern(history, max_len=15)
-
+    section_match = exact_section_match_score(history, max_section_count=6)
     pattern_catalog = []
-    if exact_pattern:
-        pattern_catalog.append(exact_pattern)
+    if section_match:
+        pattern_catalog.append(section_match)
 
-    pattern = PATTERN_ENGINE.detect(seq[-1000:])
     ai_size, ai_prob, _ = SIZE_MODEL.score(seq)
 
     mined_side = None
     mined_conf = 0.0
-
-    if exact_pattern:
-        if exact_pattern.get("opposite_fallback"):
-            mined_side = exact_pattern["next_side"]
+    if section_match:
+        if section_match.get("opposite_fallback"):
+            mined_side = section_match["next_side"]
             mined_conf = 0.60
         else:
-            mined_side = exact_pattern["next_side"]
-            mined_conf = clamp(exact_pattern["win_rate"] / 100.0, 0.50, 0.92)
+            mined_side = section_match["next_side"]
+            mined_conf = clamp(section_match["win_rate"] / 100.0, 0.50, 0.92)
 
     recovered = recovery_logic(history)
     if recovered:
@@ -1002,11 +845,8 @@ def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict
             ("fallback", hybrid_fallback(history)["size"], hybrid_fallback(history)["confidence"]),
         ]
 
-        if pattern["strong"]:
-            candidates.append(("pattern", pattern["prediction"], pattern["confidence"]))
-
         if mined_side is not None:
-            candidates.append(("exact_suffix", mined_side, mined_conf))
+            candidates.append(("section", mined_side, mined_conf))
 
         size_votes = Counter()
         conf_votes = defaultdict(float)
@@ -1018,20 +858,11 @@ def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict
         if size_votes:
             final_size, _ = size_votes.most_common(1)[0]
             final_conf = conf_votes.get(final_size, 0.0) / max(1, size_votes[final_size])
-            logic = "CURRENT SUFFIX CONSENSUS"
+            logic = "SECTION CONSENSUS"
         else:
             final_size = ai_size
             final_conf = clamp(ai_prob, 0.50, 0.80)
             logic = "AI SAFE MODE"
-
-        if pattern["strong"] and pattern["prediction"] == final_size:
-            final_conf = clamp(final_conf + pattern["confidence"] * 0.20, 0.50, 0.95)
-            logic = f"PATTERN + AI | regime={pattern['regime']}"
-
-        if pattern["strong"] and pattern["prediction"] != final_size and pattern["regime"] in ("trend", "zigzag", "balanced"):
-            final_size = pattern["prediction"]
-            final_conf = pattern["confidence"]
-            logic = f"PATTERN OVERRIDE | regime={pattern['regime']}"
 
         final_size = bias_guard(final_size, history)
         final_conf = clamp(final_conf, 0.50, 0.95)
@@ -1076,7 +907,7 @@ def generate_prediction() -> Dict[str, Any]:
         }
 
     history = STATE.history[-2000:]
-    engine = weighted_ensemble_with_pattern_mining(history)
+    engine = weighted_ensemble_section(history)
     final_size = engine["size"]
     final_num = choose_number_for_size(final_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
@@ -1094,7 +925,6 @@ def generate_prediction() -> Dict[str, Any]:
         "stake": engine["stake"],
         "details": {
             "regime": REGIME.detect([x["size"] for x in history]),
-            "pattern": PATTERN_ENGINE.detect([x["size"] for x in history][-1000:]),
             "pattern_catalog": engine.get("pattern_catalog", []),
             "walk_forward": walk,
             "targets": targets,
@@ -1208,7 +1038,7 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 📊 <b>Confidence</b>: <b>{pred['raw_conf']}%</b>
 💰 <b>Stake</b>: <b>{h(pred['stake'])}</b>{target_text}
 
-━━ Mined Pattern Catalog ━━
+━━ Section Pattern Catalog ━━
 {pattern_block}
 
 ━━━━━━━━━━━━━━━━━━
@@ -1305,7 +1135,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V45 is Running")
+    return web.Response(text="FTW V46 is Running")
 
 async def start_server():
     app = web.Application()
