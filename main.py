@@ -1,12 +1,15 @@
 """
-FTW V28 — SUPER ADVANCED PREDICTOR
-==================================
-- Multi-model regime-aware ensemble
-- Pattern priority with anti-trap consensus logic
-- Better number prediction using distribution + sequence memory
-- Dynamic confidence and stake
-- Telegram-ready output
-- Safer and cleaner than V27
+FTW AI V29 FULL SCRIPT
+=====================
+Advanced AI predictor with:
+- 12 model inputs
+- weighted scoring
+- trap protection
+- momentum + pattern + reversal logic
+- number prediction
+- Telegram bot
+- SQLite result tracking
+- API fetch loop
 """
 
 import asyncio
@@ -14,12 +17,13 @@ import gc
 import html
 import json
 import logging
+import math
 import os
 import random
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,12 +43,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v28_super_advanced.db")
-    cache_file: str = "ftw_v28_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_ai_v29_full.db")
+    cache_file: str = "ftw_ai_v29_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V28 SUPER ADVANCED"
+    bot_name: str = "FTW AI V29"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 2000
@@ -69,6 +73,7 @@ CFG = Config()
 # ============================================================
 def setup_logging():
     Path(CFG.log_dir).mkdir(parents=True, exist_ok=True)
+
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -78,7 +83,7 @@ def setup_logging():
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v28_super_advanced.log",
+        Path(CFG.log_dir) / "ftw_ai_v29_full.log",
         maxBytes=1_000_000,
         backupCount=3,
     )
@@ -86,7 +91,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v28")
+log = logging.getLogger("ftw_ai_v29")
 
 # ============================================================
 # UTILITIES
@@ -125,22 +130,177 @@ def trailing_run(seq: List[int]) -> int:
         return 0
     last = seq[-1]
     c = 1
-    for i in range(len(seq) - 2, -1, -1):
+    for i in range(len(seq)-2, -1, -1):
         if seq[i] == last:
             c += 1
         else:
             break
     return c
 
-def sequence_similarity(a: List[int], b: List[int]) -> float:
-    if not a or not b:
-        return 0.0
-    n = min(len(a), len(b))
-    same = sum(1 for i in range(n) if a[i] == b[i])
-    return same / n
-
 def family_for_size(size: str) -> List[int]:
     return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
+
+# ============================================================
+# AI SCORER
+# ============================================================
+class AdvancedAIScorer:
+    def __init__(self):
+        self.weights = {
+            "recent_size": 1.25,
+            "run_length": 1.35,
+            "last3_big_ratio": 0.95,
+            "last5_big_ratio": 0.90,
+            "alternation": 0.85,
+            "pattern_repeat": 1.10,
+            "trend_velocity": 0.95,
+            "volatility": 0.45,
+            "reversal_pressure": 0.90,
+            "consensus": 0.80,
+            "entropy": 0.30,
+            "regime_bias": 1.20,
+        }
+
+    def _sigmoid(self, x: float) -> float:
+        return 1.0 / (1.0 + math.exp(-x))
+
+    def _recent_size_bias(self, seq: List[int]) -> float:
+        if not seq:
+            return 0.0
+        return 1.0 if seq[-1] == 1 else -1.0
+
+    def _run_length(self, seq: List[int]) -> Tuple[float, int]:
+        if not seq:
+            return 0.0, 0
+        side = seq[-1]
+        r = 1
+        for i in range(len(seq)-2, -1, -1):
+            if seq[i] == side:
+                r += 1
+            else:
+                break
+        return (1.0 if side == 1 else -1.0), r
+
+    def _big_ratio(self, seq: List[int], n: int) -> float:
+        if len(seq) < n:
+            return 0.0
+        window = seq[-n:]
+        big_count = window.count(1)
+        return (big_count / n) * 2.0 - 1.0
+
+    def _alternation_score(self, seq: List[int]) -> float:
+        if len(seq) < 4:
+            return 0.0
+        flips = 0
+        for i in range(1, len(seq)):
+            if seq[i] != seq[i-1]:
+                flips += 1
+        return (flips / max(1, len(seq)-1)) * 2.0 - 1.0
+
+    def _pattern_repeat(self, seq: List[int]) -> float:
+        if len(seq) < 6:
+            return 0.0
+        suffix = tuple(seq[-5:])
+        matches = 0
+        for i in range(len(seq) - 5):
+            if tuple(seq[i:i+5]) == suffix:
+                matches += 1
+        return max(-1.0, min(1.0, (matches / max(1, len(seq)-5)) * 2.0 - 1.0))
+
+    def _trend_velocity(self, seq: List[int]) -> float:
+        if len(seq) < 6:
+            return 0.0
+        a = seq[-6:-3]
+        b = seq[-3:]
+        avg_a = sum(a) / len(a)
+        avg_b = sum(b) / len(b)
+        return (avg_b - avg_a) * 2.0
+
+    def _volatility(self, seq: List[int]) -> float:
+        if len(seq) < 5:
+            return 0.0
+        diffs = [seq[i] - seq[i-1] for i in range(1, len(seq))]
+        avg_abs = sum(abs(d) for d in diffs) / len(diffs)
+        return (avg_abs * 2.0) - 1.0
+
+    def _reversal_pressure(self, seq: List[int]) -> float:
+        if len(seq) < 5:
+            return 0.0
+        last = seq[-1]
+        recent = seq[-5:]
+        same = recent.count(last)
+        opp = recent.count(1 - last)
+        return ((opp - same) / max(1, len(recent))) * 2.0
+
+    def _consensus(self, seq: List[int]) -> float:
+        if len(seq) < 3:
+            return 0.0
+        recent = seq[-3:]
+        big_share = recent.count(1) / len(recent)
+        return (big_share * 2.0) - 1.0
+
+    def _entropy(self, seq: List[int]) -> float:
+        if not seq:
+            return 0.0
+        total = len(seq)
+        counts = {0: seq.count(0), 1: seq.count(1)}
+        entropy = 0.0
+        for val in counts.values():
+            p = val / total
+            if p > 0:
+                entropy -= p * math.log2(p)
+        return (entropy / 1.0) * 2.0 - 1.0
+
+    def _regime_bias(self, seq: List[int]) -> float:
+        if len(seq) < 6:
+            return 0.0
+        side_bias = sum(seq[-6:]) / 6.0
+        return (side_bias * 2.0) - 1.0
+
+    def compute_features(self, seq: List[int]) -> Dict[str, float]:
+        run_sign, run_len = self._run_length(seq)
+        return {
+            "recent_size": self._recent_size_bias(seq),
+            "run_length": run_sign * min(run_len / 10.0, 1.0),
+            "last3_big_ratio": self._big_ratio(seq, 3),
+            "last5_big_ratio": self._big_ratio(seq, 5),
+            "alternation": self._alternation_score(seq),
+            "pattern_repeat": self._pattern_repeat(seq),
+            "trend_velocity": self._trend_velocity(seq),
+            "volatility": self._volatility(seq),
+            "reversal_pressure": self._reversal_pressure(seq),
+            "consensus": self._consensus(seq),
+            "entropy": self._entropy(seq),
+            "regime_bias": self._regime_bias(seq),
+        }
+
+    def score(self, seq: List[int]) -> Tuple[str, float, Dict[str, float]]:
+        if not seq:
+            return "BIG", 0.5, {}
+
+        features = self.compute_features(seq)
+        logit = 0.0
+        for name, value in features.items():
+            logit += self.weights[name] * value
+
+        final_prob = self._sigmoid(logit)
+        label = "BIG" if final_prob >= 0.5 else "SMALL"
+
+        # Trap protection:
+        # only invert when run is weak and multiple conflicting signals exist
+        run_sign, run_len = self._run_length(seq)
+        if run_len >= 2:
+            # strong current-side run should not be beaten by weak consensus alone
+            if features["consensus"] > 0.4 and abs(final_prob - 0.5) < 0.10:
+                if label == "BIG":
+                    label = "SMALL"
+                    final_prob = 0.35
+                else:
+                    label = "BIG"
+                    final_prob = 0.65
+
+        return label, final_prob, features
+
+SCORER = AdvancedAIScorer()
 
 # ============================================================
 # STATE
@@ -148,9 +308,6 @@ def family_for_size(size: str) -> List[int]:
 class BotState:
     def __init__(self):
         self.history: List[Dict[str, Any]] = []
-        self.loss_streak = 0
-        self.win_streak = 0
-        self.recovery_mode = False
         self.last_prediction: Optional[Dict[str, Any]] = None
 
     def save_cache(self):
@@ -173,7 +330,7 @@ class BotState:
 STATE = BotState()
 
 # ============================================================
-# SQLite STORE
+# SQLite STORAGE
 # ============================================================
 class Storage:
     def __init__(self, path: str):
@@ -206,7 +363,7 @@ class Storage:
     def save_prediction(self, p: Dict[str, Any]):
         with self._conn() as c:
             c.execute("""
-                INSERT OR IGNORE INTO predictions 
+                INSERT OR IGNORE INTO predictions
                 (issue, pred_type, size, num, logic, details, stake, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -287,276 +444,104 @@ STORE = Storage(CFG.db_path)
 # ============================================================
 # PREDICTION ENGINE
 # ============================================================
-def sequence_based_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if len(history) < 12:
-        return None
-
-    seq = [x["size"] for x in history]
-    total = len(seq)
-    current_live = "BIG" if seq[-1] == 1 else "SMALL"
-
-    best = None
-    best_score = -1.0
-
-    for window in range(4, 14):
-        if total < window + 4:
-            continue
-
-        suffix = tuple(seq[-window:])
-        positive_weight = 0.0
-        negative_weight = 0.0
-        total_match_weight = 0.0
-
-        lookback = min(total, 300)
-        for i in range(total - window - 1, total - lookback, -1):
-            candidate = tuple(seq[i:i + window])
-            if candidate != suffix:
-                continue
-
-            next_val = seq[i + window]
-            recency = max(0.1, 1.0 - ((total - (i + window)) / 100.0))
-            total_match_weight += recency
-            if next_val == 1:
-                positive_weight += recency
-            else:
-                negative_weight += recency
-
-        if total_match_weight < 2.0:
-            continue
-
-        p_big = (positive_weight + 1.0) / (total_match_weight + 2.0)
-        p_small = (negative_weight + 1.0) / (total_match_weight + 2.0)
-
-        pred = "BIG" if p_big >= p_small else "SMALL"
-        edge = abs(p_big - p_small) * 100.0
-        confidence = max(0.55, min(0.96, max(p_big, p_small)))
-
-        # Anti-trap guard: if current run is strong and pattern points opposite
-        if trailing_run(seq) >= 2 and pred != current_live and edge < 18.0:
-            continue
-
-        score = edge + (window * 2.5) + (total_match_weight * 3.0)
-        if score > best_score:
-            best_score = score
-            best = {
-                "size": pred,
-                "logic": f"PATTERN {window}-SEQ (edge {edge:.1f}%)",
-                "confidence": confidence,
-                "stake": "2x" if edge > 25 else "1x" if edge > 15 else "0.5x",
-            }
-
-    return best
-
-def momentum_model(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if len(history) < 6:
-        return None
-
-    seq = [x["size"] for x in history]
-    current = seq[-1]
-    run = trailing_run(seq)
-    last3 = seq[-3:]
-    last5 = seq[-5:]
-
-    big_count = sum(1 for v in last3 if v == 1)
-    small_count = sum(1 for v in last3 if v == 0)
-
-    if run >= 4:
-        pred = "BIG" if current == 1 else "SMALL"
-        return {
-            "size": pred,
-            "logic": f"RUN MOMENTUM (run={run})",
-            "confidence": 0.82 if run >= 5 else 0.74,
-            "stake": "2x" if run >= 5 else "1x",
-        }
-
-    # alternation bias
-    alt = abs(big_count - small_count)
-    if alt == 0 and len(last5) == 5:
-        pred = "BIG" if sum(last5) >= 3 else "SMALL"
-        return {
-            "size": pred,
-            "logic": "REGIME BIAS",
-            "confidence": 0.68,
-            "stake": "1x",
-        }
-
-    return None
-
-def voting_consensus(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    seq = [x["size"] for x in history]
-    total = len(seq)
-    if total < 12:
-        return None
-
-    big_vote = 0.0
-    small_vote = 0.0
-
-    # check many windows
-    for window in range(4, 14):
-        if total < window + 4:
-            continue
-        suffix = tuple(seq[-window:])
-        pos, neg, wt = 0.0, 0.0, 0.0
-
-        lookback = min(total, 300)
-        for i in range(total - window - 1, total - lookback, -1):
-            candidate = tuple(seq[i:i + window])
-            if candidate != suffix:
-                continue
-            next_val = seq[i + window]
-            recency = max(0.1, 1.0 - ((total - (i + window)) / 100.0))
-            wt += recency
-            if next_val == 1:
-                pos += recency
-            else:
-                neg += recency
-
-        if wt < 2.0:
-            continue
-
-        p_big = (pos + 1.0) / (wt + 2.0)
-        p_small = (neg + 1.0) / (wt + 2.0)
-
-        edge = abs(p_big - p_small) * 100.0
-        if p_big >= p_small:
-            big_vote += edge
-        else:
-            small_vote += edge
-
-    if big_vote + small_vote == 0:
-        return None
-
-    if big_vote > small_vote:
-        final_pred = "BIG"
-        final_vote = (big_vote / (big_vote + small_vote)) * 100.0
-    else:
-        final_pred = "SMALL"
-        final_vote = (small_vote / (big_vote + small_vote)) * 100.0
-
-    # anti-trap inversion when consensus is too high
-    if final_vote >= 75.0:
-        inverted = "SMALL" if final_pred == "BIG" else "BIG"
-        return {
-            "size": inverted,
-            "logic": f"TRAP INVERTED ({final_vote:.1f}% consensus)",
-            "confidence": 0.80,
-            "stake": "1x",
-        }
-
-    if final_vote >= 60.0:
-        return {
-            "size": final_pred,
-            "logic": f"CONSENSUS VOTE ({final_vote:.1f}% consensus)",
-            "confidence": 0.72,
-            "stake": "1x",
-        }
-
-    return None
-
-def smart_fallback(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq = [x["size"] for x in history]
-    if len(seq) < 3:
-        return {"size": "BIG", "logic": "SEED FALLBACK", "confidence": 0.55, "stake": "0.5x"}
-
-    last3 = seq[-3:]
-    ones = sum(last3)
-
-    if ones >= 2:
-        return {"size": "BIG", "logic": "SMART FALLBACK (recent BIG bias)", "confidence": 0.65, "stake": "0.5x"}
-    return {"size": "SMALL", "logic": "SMART FALLBACK (recent SMALL bias)", "confidence": 0.65, "stake": "0.5x"}
-
 def predict_size(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    models = [
-        sequence_based_pattern(history),
-        momentum_model(history),
-        voting_consensus(history),
-    ]
+    if len(history) < CFG.min_history:
+        size = "BIG" if random.random() >= 0.5 else "SMALL"
+        return {
+            "size": size,
+            "logic": "SEED MODE",
+            "confidence": 0.54,
+            "stake": "0.5x",
+            "details": {"mode": "seed"}
+        }
 
-    valid = [m for m in models if m is not None]
-    if not valid:
-        return smart_fallback(history)
+    seq = [x["size"] for x in history]
+    label, prob, features = SCORER.score(seq)
 
-    # choose highest confidence model
-    best = max(valid, key=lambda x: x["confidence"])
-    # if multiple strong models agree, add bonus
-    agreement = sum(1 for m in valid if m["size"] == best["size"])
-    if agreement >= 2:
-        best["confidence"] = clamp(best["confidence"] + 0.07, 0.55, 0.97)
-        best["stake"] = "2x" if best["stake"] == "1x" else "2x" if best["stake"] == "0.5x" else "3x"
+    if label == "BIG":
+        size = "BIG"
+    else:
+        size = "SMALL"
 
-    return best
+    confidence = clamp(prob, 0.52, 0.96)
+    stake = "3x" if confidence > 0.85 else "2x" if confidence > 0.72 else "1x" if confidence > 0.60 else "0.5x"
 
-def choose_number_for_size(size: str, history: List[Dict[str, Any]], target_issue: Optional[str] = None) -> int:
+    return {
+        "size": size,
+        "logic": f"AI-12-FEATURE ({label} @ {confidence * 100:.1f}%)",
+        "confidence": confidence,
+        "stake": stake,
+        "details": {
+            "features": features,
+            "probability": prob
+        }
+    }
+
+def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
     nums = [x["num"] for x in history if x.get("num") is not None]
 
-    # 1) exact number frequency in recent window
-    recent = nums[-60:]
-    recent_valid = [n for n in recent if n in valid]
-    if recent_valid:
-        c = Counter(recent_valid)
-        best_num, best_count = c.most_common(1)[0]
-        if best_count >= 2:
-            return best_num
+    if nums:
+        recent = nums[-40:]
+        counts = Counter([n for n in recent if n in valid])
+        if counts:
+            best_num, best_count = counts.most_common(1)[0]
+            if best_count >= 2:
+                return best_num
 
-    # 2) repeated sequence continuation
-    for window in range(3, 8):
+    for window in range(3, 7):
         if len(nums) < window + 2:
             continue
         suffix = tuple(nums[-window:])
         counts = defaultdict(int)
-        for i in range(len(nums) - window):
-            if tuple(nums[i:i + window]) == suffix:
-                counts[nums[i + window]] += 1
+        for i in range(len(nums)-window):
+            if tuple(nums[i:i+window]) == suffix:
+                counts[nums[i+window]] += 1
         if counts:
-            chosen, freq = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
-            if chosen in valid and freq >= 1:
-                return chosen
+            best_num, _ = max(counts.items(), key=lambda kv: kv[1])
+            if best_num in valid:
+                return best_num
 
-    # 3) weighted family pattern by frequency
-    family_counts = Counter([n for n in nums if n in valid])
-    if family_counts:
-        chosen, _ = family_counts.most_common(1)[0]
-        return chosen
+    if nums:
+        family_counts = Counter([n for n in nums if n in valid])
+        if family_counts:
+            return family_counts.most_common(1)[0][0]
 
-    # 4) smart random family choice with bias to center numbers
-    center_bias = [5, 6, 7, 8, 9] if size == "BIG" else [1, 2, 3, 4, 0]
-    return random.choice(center_bias)
+    return random.choice(valid)
 
 def build_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(history) < CFG.min_history:
-        issue = "1"
         size = "BIG" if random.random() >= 0.5 else "SMALL"
-        num = choose_number_for_size(size, history, issue)
+        issue = "1"
         return {
             "issue": issue,
             "type": "SIZE",
             "size": size,
-            "num": num,
-            "raw_conf": 45,
-            "logic": "WARMING UP",
+            "num": random.choice(family_for_size(size)),
+            "raw_conf": 50,
+            "logic": "WARM-UP",
             "stake": "0.5x",
             "details": {}
         }
 
-    size_signal = predict_size(history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
-    target_size = size_signal["size"]
-    target_num = choose_number_for_size(target_size, history, issue)
+    s = predict_size(history)
+    size = s["size"]
+    num = choose_number_for_size(size, history)
 
     return {
         "issue": issue,
         "type": "SIZE",
-        "size": target_size,
-        "num": target_num,
-        "raw_conf": int(size_signal["confidence"] * 100),
-        "logic": size_signal["logic"],
-        "stake": size_signal["stake"],
-        "details": {"model": size_signal["logic"], "confidence": size_signal["confidence"]}
+        "size": size,
+        "num": num,
+        "raw_conf": int(s["confidence"] * 100),
+        "logic": s["logic"],
+        "stake": s["stake"],
+        "details": s["details"]
     }
 
 # ============================================================
-# HISTORY PARSING
+# HISTORY PARSE
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -625,6 +610,9 @@ async def fetch_data(session):
             log.warning("Fetch failed for %s: %s", url, exc)
     return False
 
+# ============================================================
+# FORMATTERS
+# ============================================================
 def format_prediction(pred: Dict[str, Any], recent_rows):
     recent_lines = []
     for r in recent_rows[-CFG.recent_limit:]:
@@ -683,18 +671,7 @@ async def worker_loop(app, session):
         try:
             if await fetch_data(session):
                 history_by_issue = {str(x["issue"]): x for x in STATE.history}
-                resolved = STORE.resolve_pending(history_by_issue)
-
-                for res in resolved:
-                    if res["win"]:
-                        STATE.win_streak += 1
-                        STATE.loss_streak = 0
-                        STATE.recovery_mode = False
-                    else:
-                        STATE.loss_streak += 1
-                        STATE.win_streak = 0
-                        STATE.recovery_mode = STATE.loss_streak >= 2
-
+                for res in STORE.resolve_pending(history_by_issue):
                     await send_msg(app.bot, format_result(res))
 
                 if not STATE.history:
@@ -721,7 +698,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V28 SUPER ADVANCED is Running")
+    return web.Response(text="FTW AI V29 is Running")
 
 async def main():
     CFG.validate()
@@ -730,8 +707,8 @@ async def main():
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
     await app.initialize()
     await app.start()
-    bot_info = await app.bot.get_me()
-    log.info("Bot started: %s", bot_info.username)
+    me = await app.bot.get_me()
+    log.info("Bot started: %s", me.username)
 
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
