@@ -28,12 +28,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v17_pro_patterns.db")
-    cache_file: str = "ftw_v17_patterns_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_strict_signal.db")
+    cache_file: str = "ftw_strict_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V17 PATTERN ENGINE"
+    bot_name: str = "FTW STRICT SIGNAL"
     min_history: int = 8
     recent_limit: int = 12
     max_history: int = 2000
@@ -68,7 +68,7 @@ def setup_logging():
         root.addHandler(stream_handler)
 
         fh = RotatingFileHandler(
-            Path(CFG.log_dir) / "ftw_v17_pro_patterns.log",
+            Path(CFG.log_dir) / "ftw_strict_signal.log",
             maxBytes=1_000_000,
             backupCount=3
         )
@@ -76,7 +76,7 @@ def setup_logging():
         root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v17_patterns")
+log = logging.getLogger("ftw_strict_signal")
 
 # ============================================================
 # UTIL
@@ -133,7 +133,7 @@ def volatility(seq: List[int], window: int = 20) -> float:
     if len(seq) < 2:
         return 0.0
     arr = seq[-window:]
-    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
+    diffs = [abs(arr[i] - arr[i - 1)] for i in range(1, len(arr))]
     return sum(diffs) / max(1, len(diffs))
 
 def ratio_big(seq: List[int], window: int = 20) -> float:
@@ -358,7 +358,6 @@ class Storage:
                 FROM pattern_stats
                 WHERE pattern_key=?
             """, (key,)).fetchone()
-
             if row is None:
                 hit, miss, last_seen, support, confidence = 0, 0, 0.0, 0.0, 0.0
             else:
@@ -368,7 +367,6 @@ class Storage:
                 hit += 1
             else:
                 miss += 1
-
             total = hit + miss
             support = (hit / total) if total else 0.0
             confidence = abs(support - 0.5) * 2.0
@@ -401,56 +399,38 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# RISK MANAGER
+# STRICT SIGNAL FILTER
 # ============================================================
-class RiskManager:
-    def __init__(self):
-        self.recent: List[float] = []
+def is_noisy(history: List[Dict[str, Any]]) -> bool:
+    if len(history) < 12:
+        return False
+    seq = [x["size"] for x in history]
+    regime = detect_regime(seq)
+    return regime in ("COLD", "CHOPPY", "ALTERNATING")
 
-    def update(self, win: bool):
-        self.recent.append(1.0 if win else 0.0)
-        if len(self.recent) > 30:
-            self.recent = self.recent[-30:]
-
-    def rate(self) -> float:
-        if not self.recent:
-            return 0.5
-        return sum(self.recent) / len(self.recent)
-
-    def stake_for(self, confidence: float, signal_strength_value: float, loss_streak: int) -> str:
-        conf = clamp(confidence, 0.0, 1.0)
-        quality = (conf + signal_strength_value) / 2.0
-
-        if loss_streak >= 3:
-            if quality < 0.68:
-                return "0.5x"
-            return "1x"
-        if quality >= 0.82:
-            return "2x"
-        if quality >= 0.70:
-            return "1x"
-        if quality >= 0.60:
-            return "0.5x"
-        return "0.25x"
-
-    def should_block(self, confidence: float, signal_strength_value: float, history: List[Dict[str, Any]]) -> bool:
-        if len(history) < CFG.min_history:
-            return False
-        if confidence < 0.62 and signal_strength_value < 0.42:
-            return True
-
-        seq = [x["size"] for x in history]
-        if len(seq) >= 8:
-            run = trailing_run(seq)
-            alt = alternating_score(seq, 10)
-            if run >= 4 and alt < 0.35 and confidence < 0.7:
-                return True
+def should_send_prediction(history: List[Dict[str, Any]], signal: Optional[Dict[str, Any]], confidence: float) -> bool:
+    if signal is None:
+        return False
+    if confidence < 0.75:
+        return False
+    if is_noisy(history):
         return False
 
-RISK = RiskManager()
+    pattern_count = 0
+    seq = [x["size"] for x in history]
+    if len(seq) >= 8:
+        run = trailing_run(seq)
+        if run >= 4:
+            pattern_count += 1
+
+    # signal must be stronger than a weak heuristic
+    if pattern_count == 0 and confidence < 0.82:
+        return False
+
+    return True
 
 # ============================================================
-# PATTERN ANALYZER (USEFUL PATTERN LAYER)
+# PATTERN ANALYZER
 # ============================================================
 def pattern_label_from_bits(bits: List[int]) -> str:
     return "".join("B" if b == 1 else "S" for b in bits)
@@ -465,7 +445,6 @@ def safe_pattern_candidates(history: List[Dict[str, Any]], min_len: int = 5, max
     for length in range(min_len, max_len + 1):
         if len(seq) < length + 1:
             continue
-
         suffix = tuple(seq[-length:])
         counts = defaultdict(int)
         next_big = defaultdict(int)
@@ -483,7 +462,7 @@ def safe_pattern_candidates(history: List[Dict[str, Any]], min_len: int = 5, max
             continue
 
         repeats = counts[suffix]
-        if repeats < 2:
+        if repeats < 3:
             continue
 
         small_count = next_small.get(suffix, 0)
@@ -494,7 +473,6 @@ def safe_pattern_candidates(history: List[Dict[str, Any]], min_len: int = 5, max
 
         small_ratio = (small_count / total_next) * 100.0
         big_ratio = (big_count / total_next) * 100.0
-
         next_side = "SMALL" if small_ratio >= big_ratio else "BIG"
         win_ratio = max(small_ratio, big_ratio)
         edge = abs(small_ratio - big_ratio)
@@ -507,8 +485,6 @@ def safe_pattern_candidates(history: List[Dict[str, Any]], min_len: int = 5, max
             "next": next_side,
             "win_ratio": round(win_ratio, 1),
             "edge": round(edge, 1),
-            "small_ratio": round(small_ratio, 1),
-            "big_ratio": round(big_ratio, 1),
         })
 
     result = []
@@ -519,55 +495,26 @@ def safe_pattern_candidates(history: List[Dict[str, Any]], min_len: int = 5, max
     result.sort(key=lambda x: (x["length"], -x["repeats"], -x["edge"]))
     return result
 
-def pattern_detector(history: List[Dict[str, Any]], min_len: int = 5, max_len: int = 15, top_n: int = 3):
-    rows = safe_pattern_candidates(history, min_len=min_len, max_len=max_len, top_n=top_n)
-    if not rows:
-        return []
-
-    filtered = []
-    for r in rows:
-        if r["repeats"] >= 3 and r["edge"] >= 15:
-            filtered.append(r)
-
-    filtered.sort(key=lambda x: (x["repeats"], x["edge"]), reverse=True)
-    return filtered
-
 def strong_pattern_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    patterns = pattern_detector(history, min_len=5, max_len=15, top_n=3)
-    if not patterns:
+    rows = safe_pattern_candidates(history, min_len=5, max_len=15, top_n=3)
+    if not rows:
         return None
 
-    best = patterns[0]
-    side = best["next"]
+    best = rows[0]
+    if best["repeats"] < 3 or best["edge"] < 20:
+        return None
 
-    if best["repeats"] >= 3 and best["edge"] >= 15:
-        return {
-            "size": side,
-            "logic": f"PATTERN {best['length']} | {best['pattern_text']} | Repeats: {best['repeats']} | WR: {best['win_ratio']}% | Edge: {best['edge']}%",
-            "confidence": clamp(best["edge"] / 100.0, 0.60, 0.90),
-            "stake": "1x" if best["edge"] >= 25 else "0.5x"
-        }
-    return None
-
-def print_pattern_report(history: List[Dict[str, Any]], max_lengths: int = 15):
-    rows = pattern_detector(history, min_len=5, max_len=max_lengths, top_n=3)
-    if not rows:
-        print("No pattern signal found.")
-        return
-
-    print("")
-    print("=== PATTERN REPORT ===")
-    last_length = None
-    for idx, r in enumerate(rows[:15], 1):
-        if r["length"] != last_length:
-            print(f"--- LENGTH {r['length']} PATTERNS (Top 3) ---")
-            last_length = r["length"]
-        print(f"Pattern: {r['pattern_text']} | Repeats: {r['repeats']} | Next: {r['next']} (WR: {r['win_ratio']}% | Edge: {r['edge']}%)")
-    print("====================")
-    print("")
+    return {
+        "size": best["next"],
+        "logic": f"PATTERN {best['length']} | {best['pattern_text']} | Repeats: {best['repeats']} | WR: {best['win_ratio']}% | Edge: {best['edge']}%",
+        "confidence": clamp(best["edge"] / 100.0, 0.75, 0.9),
+        "stake": "1x" if best["edge"] >= 25 else "0.5x",
+        "repeats": best["repeats"],
+        "edge": best["edge"]
+    }
 
 # ============================================================
-# TREND PHASE / MOMENTUM
+# CONTEXT SHIFT / TREND
 # ============================================================
 def trend_phase(history: List[Dict[str, Any]]) -> str:
     if len(history) < 8:
@@ -614,19 +561,9 @@ def momentum_decay_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
 
     if phase == "EXHAUSTED" and is_decaying:
         if current_side == 1 and big_share >= 0.75:
-            return {
-                "size": "SMALL",
-                "logic": "TREND EXHAUSTION: DECAY CONFIRMED",
-                "confidence": 0.92,
-                "stake": "1x"
-            }
+            return {"size": "SMALL", "logic": "TREND EXHAUSTION: DECAY CONFIRMED", "confidence": 0.92, "stake": "1x"}
         if current_side == 0 and small_share >= 0.75:
-            return {
-                "size": "BIG",
-                "logic": "TREND EXHAUSTION: DECAY CONFIRMED",
-                "confidence": 0.92,
-                "stake": "1x"
-            }
+            return {"size": "BIG", "logic": "TREND EXHAUSTION: DECAY CONFIRMED", "confidence": 0.92, "stake": "1x"}
     return None
 
 def context_shift_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -662,23 +599,13 @@ def context_shift_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
             break_prob = break_count / total
 
             if break_prob >= 0.75:
-                return {
-                    "size": "SMALL" if current_side == 1 else "BIG",
-                    "logic": f"CTX SHIFT: {break_prob * 100:.0f}% BREAK",
-                    "confidence": 0.86,
-                    "stake": "1x"
-                }
+                return {"size": "SMALL" if current_side == 1 else "BIG", "logic": f"CTX SHIFT: {break_prob * 100:.0f}% BREAK", "confidence": 0.86, "stake": "1x"}
             elif cont_prob >= 0.68:
-                return {
-                    "size": "BIG" if current_side == 1 else "SMALL",
-                    "logic": f"CTX CONTINUE: {cont_prob * 100:.0f}% CONT",
-                    "confidence": 0.86,
-                    "stake": "1x"
-                }
+                return {"size": "BIG" if current_side == 1 else "SMALL", "logic": f"CTX CONTINUE: {cont_prob * 100:.0f}% CONT", "confidence": 0.86, "stake": "1x"}
     return None
 
 # ============================================================
-# EXACT PATTERN MATCHING
+# EXACT PATTERN MATCH
 # ============================================================
 def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seq = [x["size"] for x in history]
@@ -713,15 +640,7 @@ def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, An
 
         key = f"{window}:{suffix}"
         score = confidence + (support * 100.0) + (window * 2.0) + STORE.get_pattern_score(key) * 25.0
-        candidates.append({
-            "window": window,
-            "suffix": suffix,
-            "pred": pred,
-            "confidence": confidence,
-            "support": support,
-            "score": score,
-            "key": key
-        })
+        candidates.append({"window": window, "suffix": suffix, "pred": pred, "confidence": confidence, "support": support, "score": score, "key": key})
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:12]
@@ -730,9 +649,8 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
     candidates = exact_pattern_candidates(history)
     if not candidates:
         return None
-
     best = candidates[0]
-    if best["confidence"] < 12 and best["support"] < 0.04:
+    if best["confidence"] < 15 and best["support"] < 0.05:
         return None
 
     pred = best["pred"]
@@ -742,11 +660,11 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
         "size": pred,
         "logic": f"EXACT {best['window']}-SEQ PATTERN",
         "confidence": confidence,
-        "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
+        "stake": "1x" if confidence >= 0.72 else "0.5x"
     }
 
 # ============================================================
-# MARKOV / HYBRID FALLBACK
+# HYBRID / FALLBACK
 # ============================================================
 def markov_prob(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
@@ -783,10 +701,10 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     score = (markov * 0.36) + (bias * 0.28) + (parity * 0.18) + ((1.0 - min(vol, 1.0)) * 0.18)
     size = "BIG" if score >= 0.5 else "SMALL"
     confidence = clamp(max(score, 1.0 - score), 0.55, 0.78)
-    return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "1x" if confidence >= 0.68 else "0.5x"}
+    return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "0.5x" if confidence < 0.68 else "1x"}
 
 # ============================================================
-# NUMBER FAMILY
+# NUMBER CHOICE
 # ============================================================
 def family_for_size(size: str) -> List[int]:
     return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
@@ -820,8 +738,7 @@ def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
 
-    # Exact number candidate
-    num_candidates = []
+    # strong exact number match only
     for w in range(3, 9):
         if len(history) < w + 1:
             continue
@@ -861,13 +778,6 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
         if best_num in valid:
             return best_num
 
-    if family_nums:
-        even_count = sum(1 for n in family_nums if n % 2 == 0)
-        odd_count = sum(1 for n in family_nums if n % 2 != 0)
-        pool = [n for n in valid if n % 2 == (0 if even_count > odd_count else 1)]
-        if pool:
-            return random.choice(pool)
-
     recent = [x["num"] for x in history[-15:]]
     if recent and recent[-1] in valid:
         return recent[-1]
@@ -875,7 +785,7 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     return random.choice(valid)
 
 # ============================================================
-# FINAL ENSEMBLE
+# FINAL ENSEMBLE WITH HARD GATE
 # ============================================================
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     exact = choose_exact_prediction(history)
@@ -885,60 +795,43 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     final_score = exact["confidence"] if exact else 0.55
 
     pattern_signal = strong_pattern_signal(history)
-    if pattern_signal:
+    if pattern_signal and should_send_prediction(history, pattern_signal, pattern_signal["confidence"]):
         final_size = pattern_signal["size"]
         final_score = max(final_score, pattern_signal["confidence"])
 
     ctx = context_shift_signal(history)
-    if ctx:
+    if ctx and should_send_prediction(history, ctx, ctx["confidence"]):
         final_size = ctx["size"]
         final_score = max(final_score, ctx["confidence"])
 
     mom = momentum_decay_signal(history)
-    if mom:
+    if mom and should_send_prediction(history, mom, mom["confidence"]):
         final_size = mom["size"]
         final_score = max(final_score, mom["confidence"])
 
-    trend = trend_signal(history)
-    if trend:
-        final_size = trend["size"]
-        final_score = max(final_score, trend["confidence"])
-
     final_conf = clamp(final_score, 0.55, 0.94)
-    logic = exact["logic"] if exact else "ENSEMBLE: PATTERN + CONTEXT + HYBRID"
+    logic = exact["logic"] if exact else "STRICT ENSEMBLE: PATTERN + CONTEXT + HYBRID"
+
+    # strict skip
+    if final_conf < 0.75:
+        return {
+            "size": "BIG" if result_bias(history) >= 0.5 else "SMALL",
+            "logic": "SKIP: LOW CONFIDENCE",
+            "confidence": 0.70,
+            "stake": "0.25x",
+            "skip": True
+        }
 
     return {
         "size": final_size,
         "logic": logic,
         "confidence": final_conf,
-        "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.68 else "0.5x"
+        "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.75 else "0.5x",
+        "skip": False
     }
 
-def trend_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq = [x["size"] for x in history]
-    if len(seq) < 3:
-        return {"size": "BIG" if random.random() > 0.5 else "SMALL", "confidence": 0.5}
-
-    hist_ctx = context_shift_signal(history)
-    if hist_ctx:
-        return hist_ctx
-
-    run = trailing_run(seq)
-    last = seq[-1]
-
-    if run >= 3:
-        last3, prev3 = seq[-3:], seq[-6:-3]
-        if len(prev3) == 3:
-            last_same = sum(1 for v in last3 if v == last)
-            prev_same = sum(1 for v in prev3 if v == last)
-            if last_same < prev_same:
-                return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.85}
-        return {"size": "BIG" if last == 1 else "SMALL", "confidence": 0.75}
-
-    return {"size": "BIG" if result_bias(history) >= 0.5 else "SMALL", "confidence": 0.6}
-
 # ============================================================
-# FINAL PREDICTION BUILD
+# PREDICTION BUILD
 # ============================================================
 def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
     if len(history) < CFG.min_history:
@@ -955,16 +848,13 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
         }
 
     ensemble = weighted_ensemble(history)
+    if ensemble.get("skip", False):
+        return None
+
     pred_size = ensemble["size"]
     pred_logic = ensemble["logic"]
     pred_conf = ensemble["confidence"]
     pred_stake = ensemble["stake"]
-
-    if RISK.should_block(pred_conf, signal_strength(history), history):
-        pred_size = "BIG" if result_bias(history) >= 0.5 else "SMALL"
-        pred_logic = "RISK FILTER: BLOCKED LOW SIGNAL"
-        pred_conf = 0.62
-        pred_stake = "0.5x"
 
     final_num = choose_number_for_size(pred_size, history)
     final_issue = str(issue)
@@ -986,7 +876,7 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
     }
 
 # ============================================================
-# PARSE HISTORY FROM API
+# PARSE HISTORY / FETCH
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -1006,25 +896,18 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     for item in items:
         if not isinstance(item, dict):
             continue
-
         issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
         if issue is None:
             continue
-
         num = safe_int(item.get("number", item.get("value", 0)), 0)
         if not (0 <= num <= 9):
             continue
-
         key = str(issue)
         if key in seen:
             continue
         seen.add(key)
 
-        out.append({
-            "issue": key,
-            "num": num,
-            "size": 1 if num >= 5 else 0
-        })
+        out.append({"issue": key, "num": num, "size": 1 if num >= 5 else 0})
 
     out.sort(key=lambda x: int(x["issue"]))
     return out
@@ -1045,7 +928,7 @@ async def fetch_history(session):
     return False
 
 # ============================================================
-# DISPLAY / FORMAT
+# FORMAT / SEND
 # ============================================================
 def normalize_recent_row(row: Any):
     if not isinstance(row, (tuple, list)):
@@ -1098,11 +981,7 @@ async def send_msg(bot, text: str, retries: int = 3):
     for attempt in range(retries):
         try:
             await asyncio.wait_for(
-                bot.send_message(
-                    chat_id=CFG.parse_chat_id(),
-                    text=text,
-                    parse_mode="HTML"
-                ),
+                bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML"),
                 timeout=CFG.request_timeout
             )
             return True
@@ -1115,7 +994,6 @@ async def send_msg(bot, text: str, retries: int = 3):
 # ============================================================
 async def worker_loop(app, session):
     last_processed_issue = None
-
     while True:
         try:
             if await fetch_history(session):
@@ -1131,7 +1009,6 @@ async def worker_loop(app, session):
                         STATE.win_streak = 0
                         STATE.recovery_mode = STATE.loss_streak >= 2
 
-                    RISK.update(res["win"])
                     STATE.save_cache()
                     await send_msg(app.bot, format_result(res))
 
@@ -1160,7 +1037,7 @@ async def worker_loop(app, session):
             await asyncio.sleep(2)
 
 async def health_check(request):
-    return web.Response(text="FTW V17 PATTERN ENGINE is Running")
+    return web.Response(text="FTW STRICT SIGNAL is Running")
 
 async def start_web_server():
     app = web.Application()
@@ -1173,8 +1050,6 @@ async def start_web_server():
 async def main():
     CFG.validate()
     STATE.load_cache()
-
-    print_pattern_report(STATE.history if STATE.history else [], max_lengths=15)
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
     await app.initialize()
