@@ -8,9 +8,10 @@ import random
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
@@ -66,7 +67,7 @@ def setup_logging():
         stream_handler.setFormatter(formatter)
         root.addHandler(stream_handler)
 
-        fh = logging.handlers.RotatingFileHandler(
+        fh = RotatingFileHandler(
             Path(CFG.log_dir) / "ftw_v17_pro.log",
             maxBytes=1_000_000,
             backupCount=3
@@ -420,7 +421,6 @@ class RiskManager:
         conf = clamp(confidence, 0.0, 1.0)
         quality = (conf + signal_strength_value) / 2.0
 
-        # Hard risk gate: if weak signal or streak is bad, reduce size
         if loss_streak >= 3:
             if quality < 0.68:
                 return "0.5x"
@@ -439,7 +439,7 @@ class RiskManager:
             return False
         if confidence < 0.62 and signal_strength_value < 0.42:
             return True
-        # Extra anti-blind reversal guard:
+
         seq = [x["size"] for x in history]
         if len(seq) >= 8:
             run = trailing_run(seq)
@@ -735,7 +735,7 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "1x" if confidence >= 0.68 else "0.5x"}
 
 # ============================================================
-# NUMBER FAMILY HEAD
+# NUMBER FAMILY
 # ============================================================
 def family_for_size(size: str) -> List[int]:
     return [5, 6, 7, 8, 9] if size == "BIG" else [0, 1, 2, 3, 4]
@@ -859,7 +859,6 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
     pred_conf = ensemble["confidence"]
     pred_stake = ensemble["stake"]
 
-    # IMPORTANT HARD FILTER:
     if RISK.should_block(pred_conf, signal_strength(history), history):
         pred_size = "BIG" if result_bias(history) >= 0.5 else "SMALL"
         pred_logic = "RISK FILTER: BLOCKED LOW SIGNAL"
