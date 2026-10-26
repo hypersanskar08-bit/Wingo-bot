@@ -1,10 +1,10 @@
 """
-FTW V26 FULL CODE (CONTRARIAN TRAP ENGINE)
+FTW V27 FULL CODE (ANTI-LOSS ENGINE)
 =================
-- Deep Voting is BACK with Trap Inversion (>75% Consensus = Invert)
-- Ultra Strong Pattern Detection (Regime Guard prevents fake reversals)
-- ADV Dragon Riding (Momentum + Fake-Out Protection)
-- Invert Rule: WR <= 56%
+- REMOVED HYBRID FALLBACK (It was predicting blindly)
+- Added SMART FALLBACK (Follows last 3 periods)
+- Pattern gets Highest Priority
+- Deep Voting Inverts if Consensus > 75% (Trap)
 - Telegram VIP Channel Ready
 """
 
@@ -38,12 +38,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v26_full.db")
-    cache_file: str = "ftw_v26_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v27_full.db")
+    cache_file: str = "ftw_v27_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V26 TRAP ENGINE"
+    bot_name: str = "FTW V27 ANTI-LOSS"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -75,12 +75,12 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v26_full.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v27_full.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v26")
+log = logging.getLogger("ftw_v27")
 
 def h(x: Any) -> str: return html.escape(str(x))
 def safe_int(x, default=0):
@@ -118,7 +118,6 @@ class BotState:
         self.loss_streak = 0
         self.win_streak = 0
         self.recovery_mode = False
-        self.fake_breakouts = 0
 
     def save_cache(self):
         try:
@@ -202,7 +201,7 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# 1. ADVANCED TREND ENGINE (DRAGON RIDING)
+# 1. ADVANCED TREND ENGINE (WITH TRAP PROTECTION)
 # ============================================================
 def advanced_trend_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(history) < 12: return None
@@ -211,7 +210,8 @@ def advanced_trend_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str,
     current_side = seq[-1]
     run = trailing_run(seq)
     
-    if run < 3: return None
+    # 🆕 TRAP PROTECTION: Don't predict on Run:3. Run:3 is often a trap.
+    if run < 4: return None
     
     last3 = seq[-3:]
     prev3 = seq[-6:-3]
@@ -219,13 +219,8 @@ def advanced_trend_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str,
     prev_same = sum(1 for v in prev3 if v == current_side)
     momentum = last_same - prev_same
     
-    if len(seq) > 8:
-        if seq[-1] == seq[-3] and seq[-2] != seq[-1]:
-            STATE.fake_breakouts += 1
-        else:
-            STATE.fake_breakouts = max(0, STATE.fake_breakouts - 1)
-            
-    if momentum >= 1 or run >= 4:
+    # Only ride if momentum is positive or heavy run
+    if momentum >= 1 or run >= 5:
         return {
             "size": "BIG" if current_side == 1 else "SMALL",
             "logic": f"ADV DRAGON (Run:{run} | Mom:{momentum})",
@@ -293,9 +288,9 @@ def get_best_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
                 edge = 100.0 - edge
                 win_rate = 1.0 - win_rate
                 
+            # Regime Guard
             if current_run >= 2 and pred != current_live_side:
-                if edge < 35.0:
-                    continue 
+                if edge < 35.0: continue 
 
             score = edge + (exact_weight_total * 2.0) + (window * 2.0)
             
@@ -358,7 +353,7 @@ def deep_voting_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
     final_pred = "BIG" if big_votes > small_votes else "SMALL"
     vote_percentage = (max(big_votes, small_votes) / total_votes) * 100.0
     
-    # 🆕 CONTRARIAN LOGIC: Invert if Consensus is too high (Trap Alert)
+    # Contrarian Logic (Trap Alert)
     if vote_percentage >= 75.0:
         inverted_pred = "SMALL" if final_pred == "BIG" else "BIG"
         return {
@@ -377,14 +372,27 @@ def deep_voting_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
     return None
 
 # ============================================================
+# 4. SMART FALLBACK (REPLACED HYBRID)
+# ============================================================
+def smart_fallback(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    seq = [x["size"] for x in history]
+    last_3 = seq[-3:] if len(seq) >= 3 else seq
+    
+    if len(last_3) < 3:
+        return {"size": "BIG", "logic": "SMART FALLBACK", "confidence": 0.55, "stake": "0.5x"}
+        
+    ones = sum(last_3)
+    
+    if ones == 3: return {"size": "BIG", "logic": "SMART FALLBACK (3 BIGs)", "confidence": 0.65, "stake": "0.5x"}
+    if ones == 0: return {"size": "SMALL", "logic": "SMART FALLBACK (3 SMALLs)", "confidence": 0.65, "stake": "0.5x"}
+    if ones == 2: return {"size": "BIG", "logic": "SMART FALLBACK (2 BIGs)", "confidence": 0.60, "stake": "0.5x"}
+    if ones == 1: return {"size": "SMALL", "logic": "SMART FALLBACK (2 SMALLs)", "confidence": 0.60, "stake": "0.5x"}
+    
+    return {"size": "BIG", "logic": "SMART FALLBACK", "confidence": 0.55, "stake": "0.5x"}
+
+# ============================================================
 # ENSEMBLE & MAIN GENERATION
 # ============================================================
-def hybrid_fallback(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq = [x["size"] for x in history]
-    bias = sum(seq[-20:]) / 20.0 if len(seq) >= 20 else 0.5
-    size = "BIG" if bias >= 0.5 else "SMALL"
-    return {"size": size, "logic": "HYBRID FALLBACK", "confidence": 0.60, "stake": "0.5x"}
-
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
         n = random.randint(0, 9)
@@ -392,25 +400,26 @@ def generate_prediction() -> Dict[str, Any]:
 
     history = STATE.history[-2000:]
     
-    trend = advanced_trend_analysis(history)
+    # Get all engines
     pattern = get_best_pattern(history)
+    trend = advanced_trend_analysis(history)
+    voting = deep_voting_analysis(history)
     
     final_res = None
     
-    if trend and trend["confidence"] >= 0.88:
-        final_res = trend 
-    elif pattern and pattern["confidence"] >= 0.75:
-        final_res = pattern 
+    # 🆕 PRIORITY LOGIC (Pattern is King now)
+    # 1. If strong pattern exists, use it.
+    if pattern and pattern["confidence"] >= 0.60:
+        final_res = pattern
+    # 2. If strong trend exists, use it.
     elif trend:
         final_res = trend
-    elif pattern:
-        final_res = pattern
+    # 3. If voting has a strong signal, use it.
+    elif voting:
+        final_res = voting
+    # 4. Safe fallback
     else:
-        voting = deep_voting_analysis(history)
-        if voting:
-            final_res = voting
-        else:
-            final_res = hybrid_fallback(history)
+        final_res = smart_fallback(history)
 
     final_size = final_res["size"]
     final_num = choose_number_for_size(final_size, history)
@@ -554,7 +563,7 @@ async def worker_loop(app, session):
             log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
 
-async def health_check(request): return web.Response(text="FTW V26 is Running")
+async def health_check(request): return web.Response(text="FTW V27 is Running")
 
 async def main():
     CFG.validate()
