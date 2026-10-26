@@ -1,14 +1,17 @@
 """
-FTW V40 - Deep Upgrade
-=====================
-- Strong exact pattern engine 3..15
-- Strict confidence gating
-- Regime detection: trend / zigzag / trap / balanced / neutral
-- Walk-forward telemetry
-- 250 draw telemetry
+FTW V41 FULL CODE
+=================
+Deep upgrade with:
+- mined historical pattern catalog
+- pattern length 5..15
+- next-side probability + repeats + win-rate + edge
+- exact pattern engine
+- regime detection
+- anti-trap / anti-bias logic
+- walk-forward telemetry
 - 2-level target progression
-- Telegram ready but safe fallback to console
-- Works even if API payload shape is slightly different
+- Telegram ready, but safe console fallback
+- works even if API output shape is slightly different
 """
 
 import asyncio
@@ -44,12 +47,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v40.db")
-    cache_file: str = "ftw_v40_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v41.db")
+    cache_file: str = "ftw_v41_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     timeout: float = 15.0
-    bot_name: str = "FTW V40 ENGINE"
+    bot_name: str = "FTW V41 ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
@@ -88,7 +91,7 @@ def setup_logging():
     root.addHandler(stream)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v40.log",
+        Path(CFG.log_dir) / "ftw_v41.log",
         maxBytes=1_000_000,
         backupCount=3
     )
@@ -96,7 +99,7 @@ def setup_logging():
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v40")
+log = logging.getLogger("ftw_v41")
 
 
 def h(x: Any) -> str:
@@ -349,14 +352,14 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# REGIME DETECTION
+# REGIME DETECTOR
 # ============================================================
 class RegimeDetector:
     def alternation_score(self, seq: List[int], window: int = 12) -> float:
         if len(seq) < 2:
             return 0.0
         arr = seq[-window:]
-        changes = sum(1 for i in range(1, len(arr)) if arr[i] != arr[i-1])
+        changes = sum(1 for i in range(1, len(arr)) if arr[i] != arr[i - 1])
         return changes / max(1, len(arr) - 1)
 
     def ratio_big(self, seq: List[int], window: int = 20) -> float:
@@ -389,7 +392,7 @@ REGIME = RegimeDetector()
 # ============================================================
 # EXACT PATTERN ENGINE
 # ============================================================
-class PatternEngineV40:
+class PatternEngineV41:
     def __init__(self):
         self.min_window = 3
         self.max_window = 15
@@ -498,13 +501,13 @@ class PatternEngineV40:
             "top_mode": best
         }
 
-PATTERN_ENGINE = PatternEngineV40()
+PATTERN_ENGINE = PatternEngineV41()
 
 
 # ============================================================
 # SIZE MODEL
 # ============================================================
-class SizeModelV40:
+class SizeModelV41:
     def __init__(self):
         self.weights = {
             "recent_size": 1.2,
@@ -557,7 +560,7 @@ class SizeModelV40:
         suffix = tuple(seq[-5:])
         matches = 0
         for i in range(len(seq) - 5):
-            if tuple(seq[i:i+5]) == suffix:
+            if tuple(seq[i:i + 5]) == suffix:
                 matches += 1
         return max(-1.0, min(1.0, (matches / max(1, len(seq)-5)) * 2.0 - 1.0))
 
@@ -649,11 +652,11 @@ class SizeModelV40:
 
         return pred, clamp(prob, 0.50, 0.94), feats
 
-SIZE_MODEL = SizeModelV40()
+SIZE_MODEL = SizeModelV41()
 
 
 # ============================================================
-# NUMBER MATRIX
+# EXACT NUMBER MATRIX
 # ============================================================
 class ExactNumberMatrix:
     def __init__(self):
@@ -756,7 +759,103 @@ def bias_guard(pred_size: str, history: List[Dict[str, Any]]) -> str:
 
 
 # ============================================================
-# FALLBACK
+# PATTERN MINING / HISTORY CATALOG
+# ============================================================
+def mine_pattern_catalog(history: List[Dict[str, Any]], max_len: int = 15, top_n: int = 5) -> List[Dict[str, Any]]:
+    """
+    Mine repeated suffix patterns from past history.
+    Each pattern returns:
+      - pattern string
+      - length
+      - repeats
+      - next_side
+      - win_rate
+      - edge
+      - support
+    """
+    if not history:
+        return []
+
+    seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
+    if len(seq) < 6:
+        return []
+
+    results = []
+
+    for L in range(5, max_len + 1):
+        if len(seq) < L + 2:
+            continue
+
+        pattern_counts = defaultdict(int)
+        next_counts = defaultdict(Counter)
+
+        for i in range(len(seq) - L):
+            pat = tuple(seq[i:i + L])
+            nxt = seq[i + L]
+            pattern_counts[pat] += 1
+            next_counts[pat][nxt] += 1
+
+        if not pattern_counts:
+            continue
+
+        for pat, repeats in pattern_counts.items():
+            if repeats < 2:
+                continue
+
+            next_dist = next_counts.get(pat, Counter())
+            if not next_dist:
+                continue
+
+            next_side, next_count = next_dist.most_common(1)[0]
+            total_follow = sum(next_dist.values())
+            win_rate = (next_count / total_follow) * 100.0
+            edge = abs((next_count / total_follow) - 0.5) * 200.0
+
+            if next_count < 2:
+                continue
+
+            pattern_str = "".join("B" if v == 1 else "S" for v in pat)
+            results.append({
+                "pattern": pattern_str,
+                "length": L,
+                "repeats": repeats,
+                "next_side": "BIG" if next_side == 1 else "SMALL",
+                "win_rate": round(win_rate, 2),
+                "edge": round(edge, 2),
+                "support": round((repeats / max(1, len(seq) - L)) * 100.0, 2),
+            })
+
+    results.sort(key=lambda x: (x["repeats"], x["win_rate"], x["edge"]), reverse=True)
+    return results[:top_n]
+
+
+def score_pattern_catalog(history: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+    catalog = mine_pattern_catalog(history, max_len=15, top_n=top_n)
+    scored = []
+
+    for item in catalog:
+        score = (item["repeats"] * 3.0) + (item["win_rate"] * 0.7) + (item["edge"] * 0.8)
+        scored.append({
+            "pattern": item["pattern"],
+            "length": item["length"],
+            "repeats": item["repeats"],
+            "next_side": item["next_side"],
+            "win_rate": item["win_rate"],
+            "edge": item["edge"],
+            "support": item["support"],
+            "score": round(score, 2),
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored
+
+
+def pattern_mining_debug(history: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+    return score_pattern_catalog(history, top_n=top_n)
+
+
+# ============================================================
+# HYBRID FALLBACK
 # ============================================================
 def hybrid_fallback(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [x["size"] for x in history]
@@ -817,7 +916,7 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 
 
 # ============================================================
-# WALK-FORWARD TELEMETRY
+# WALK FORWARD + TARGETS
 # ============================================================
 class WalkForwardEngine:
     def __init__(self):
@@ -863,13 +962,40 @@ WALK = WalkForwardEngine()
 
 
 # ============================================================
-# FINAL ENSEMBLE
+# FINAL ENSEMBLE WITH PATTERN CATALOG
 # ============================================================
-def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq = [x["size"] for x in history]
+def weighted_ensemble_with_pattern_mining(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
 
+    if len(seq) < CFG.min_history:
+        return {
+            "size": "BIG" if random.random() >= 0.5 else "SMALL",
+            "logic": "WARM-UP",
+            "confidence": 0.50,
+            "stake": "0.5x",
+            "pattern_catalog": []
+        }
+
+    pattern_catalog = score_pattern_catalog(history, top_n=5)
+
+    # exact suffix pattern
     pattern = PATTERN_ENGINE.detect(seq[-1000:])
     ai_size, ai_prob, _ = SIZE_MODEL.score(seq)
+
+    mined_size_vote = Counter()
+    mined_conf = defaultdict(float)
+
+    for item in pattern_catalog:
+        side = item["next_side"]
+        score = item["score"]
+        mined_size_vote[side] += 1
+        mined_conf[side] += score
+
+    mined_size = None
+    mined_confidence = 0.0
+    if mined_size_vote:
+        mined_size, _ = mined_size_vote.most_common(1)[0]
+        mined_confidence = mined_conf.get(mined_size, 0.0) / max(1, mined_size_vote[mined_size])
 
     recovered = recovery_logic(history)
     if recovered:
@@ -878,11 +1004,16 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         logic = recovered["logic"]
         stake = recovered["stake"]
     else:
-        candidates = []
+        candidates = [
+            ("ai", ai_size, ai_prob),
+            ("fallback", hybrid_fallback(history)["size"], hybrid_fallback(history)["confidence"]),
+        ]
+
         if pattern["strong"]:
             candidates.append(("pattern", pattern["prediction"], pattern["confidence"]))
-        candidates.append(("ai", ai_size, ai_prob))
-        candidates.append(("fallback", hybrid_fallback(history)["size"], hybrid_fallback(history)["confidence"]))
+
+        if mined_size is not None:
+            candidates.append(("mined", mined_size, clamp(mined_confidence / 100.0, 0.50, 0.92)))
 
         size_votes = Counter()
         conf_votes = defaultdict(float)
@@ -894,13 +1025,7 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         if size_votes:
             final_size, _ = size_votes.most_common(1)[0]
             final_conf = conf_votes.get(final_size, 0.0) / max(1, size_votes[final_size])
-
-            if size_votes[final_size] >= 2 and final_conf >= 0.75:
-                logic = "MODULE CONSENSUS"
-            else:
-                final_size = ai_size
-                final_conf = clamp(ai_prob, 0.50, 0.80)
-                logic = "AI SAFE MODE"
+            logic = "CANDIDATE CONSENSUS"
         else:
             final_size = ai_size
             final_conf = clamp(ai_prob, 0.50, 0.80)
@@ -923,7 +1048,8 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
             "size": final_size,
             "logic": logic,
             "confidence": final_conf,
-            "stake": stake
+            "stake": stake,
+            "pattern_catalog": pattern_catalog,
         }
 
     final_size = bias_guard(final_size, history)
@@ -934,9 +1060,14 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "size": final_size,
         "logic": logic,
         "confidence": final_conf,
-        "stake": stake
+        "stake": stake,
+        "pattern_catalog": pattern_catalog,
     }
 
+
+# ============================================================
+# PREDICTION GENERATION
+# ============================================================
 def generate_prediction() -> Dict[str, Any]:
     if len(STATE.history) < CFG.min_history:
         n = random.randint(0, 9)
@@ -952,9 +1083,10 @@ def generate_prediction() -> Dict[str, Any]:
         }
 
     history = STATE.history[-2000:]
-    result = weighted_ensemble(history)
-    final_size = result["size"]
+    engine = weighted_ensemble_with_pattern_mining(history)
+    final_size = engine["size"]
     final_num = choose_number_for_size(final_size, history)
+
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
     walk = WALK.walk_forward_score(history)
@@ -965,20 +1097,21 @@ def generate_prediction() -> Dict[str, Any]:
         "type": "SIZE",
         "size": final_size,
         "num": final_num,
-        "raw_conf": int(result["confidence"] * 100),
-        "logic": result["logic"],
-        "stake": result["stake"],
+        "raw_conf": int(engine["confidence"] * 100),
+        "logic": engine["logic"],
+        "stake": engine["stake"],
         "details": {
             "regime": REGIME.detect([x["size"] for x in history]),
             "pattern": PATTERN_ENGINE.detect([x["size"] for x in history][-1000:]),
+            "pattern_catalog": engine.get("pattern_catalog", []),
             "walk_forward": walk,
-            "targets": targets
+            "targets": targets,
         }
     }
 
 
 # ============================================================
-# DATA PARSE
+# API PARSE + FETCH
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -1046,27 +1179,6 @@ async def fetch_data(session):
 
 
 # ============================================================
-# TELEGRAM SEND
-# ============================================================
-async def send_console(text: str):
-    print(text)
-
-async def send_msg(bot, text: str):
-    chat_id = CFG.parse_chat_id()
-    if not chat_id or not CFG.telegram_token:
-        await send_console(text)
-        return True
-
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        return True
-    except Exception as exc:
-        log.warning("Telegram send failed: %s", exc)
-        await send_console(text)
-        return False
-
-
-# ============================================================
 # FORMATTERS
 # ============================================================
 def format_prediction(pred: Dict[str, Any], recent_rows):
@@ -1086,6 +1198,15 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
     else:
         target_text = ""
 
+    pattern_catalog = pred.get("details", {}).get("pattern_catalog", [])
+    pattern_lines = []
+    for idx, item in enumerate(pattern_catalog[:3], start=1):
+        pattern_lines.append(
+            f"{idx}. Pattern: {item['pattern']} | Repeats: {item['repeats']} | Next: {item['next_side']} | WR: {item['win_rate']}% | Edge: {item['edge']}%"
+        )
+
+    pattern_block = "\n".join(pattern_lines) if pattern_lines else "No mined pattern found"
+
     return f"""
 📌 <b>Period</b>: <code>{h(pred['issue'])}</code>
 📊 <b>Target Size</b>: <b>{h(pred['size'])}</b>
@@ -1094,6 +1215,9 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 🧠 <b>Engine</b>: {h(pred.get('logic', 'N/A'))}
 📊 <b>Confidence</b>: <b>{pred['raw_conf']}%</b>
 💰 <b>Stake</b>: <b>{h(pred['stake'])}</b>{target_text}
+
+━━ Mined Pattern Catalog ━━
+{pattern_block}
 
 ━━━━━━━━━━━━━━━━━━
 🕒 <b>Recent</b>:
@@ -1110,6 +1234,24 @@ def format_result(res: Dict[str, Any]):
         f"Act: {h(res['actual_size'])} {h(res['actual_num'])}\n"
         f"<b>{h(res['status'])}</b>"
     )
+
+async def send_console(text: str):
+    print(text)
+
+async def send_msg(bot, text: str):
+    chat_id = CFG.parse_chat_id()
+    if not chat_id or not CFG.telegram_token:
+        await send_console(text)
+        return True
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        return True
+    except Exception as exc:
+        log.warning("Telegram send failed: %s", exc)
+        await send_console(text)
+        return False
+
 
 # ============================================================
 # WORKER LOOP
@@ -1132,7 +1274,10 @@ async def worker_loop(app, session):
                         STATE.win_streak = 0
                         STATE.recovery_mode = STATE.loss_streak >= 2
 
-                    await send_msg(app.bot, format_result(res))
+                    if app is not None:
+                        await send_msg(app.bot, format_result(res))
+                    else:
+                        print(format_result(res))
 
                 if not STATE.history:
                     await asyncio.sleep(CFG.fetch_every)
@@ -1150,7 +1295,10 @@ async def worker_loop(app, session):
                     pred = generate_prediction()
                     if pred:
                         STORE.save_prediction(pred)
-                        await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
+                        if app is not None:
+                            await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
+                        else:
+                            print(format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
                     last_processed_issue = latest_issue
 
             gc.collect()
@@ -1165,7 +1313,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V40 is Running")
+    return web.Response(text="FTW V41 is Running")
 
 async def start_server():
     app = web.Application()
@@ -1196,9 +1344,10 @@ async def main():
     await start_server()
 
     async with aiohttp.ClientSession() as session:
-        asyncio.create_task(worker_loop(app, session) if app is not None else asyncio.sleep(0))
-        if app is None:
-            # console mode: just do one prediction pass and print it
+        if app is not None:
+            asyncio.create_task(worker_loop(app, session))
+            await asyncio.Event().wait()
+        else:
             while True:
                 if await fetch_data(session):
                     if STATE.history:
@@ -1206,8 +1355,6 @@ async def main():
                         if pred:
                             print(format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
                 await asyncio.sleep(CFG.fetch_every)
-        else:
-            await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
