@@ -1,15 +1,14 @@
 """
-FTW V39 DEEP UPGRADE
-====================
-Advanced predictor with:
-- 120-module engine concept
-- synchronized walk-forward validation
-- 250-draw Profit & Loss telemetry
-- automated 2-Level target progression
-- exact pattern search 3..15
-- strong anti-trap & anti-bias logic
-- exact next-number matrix
-- Telegram bot ready
+FTW V40 - Deep Upgrade
+=====================
+- Strong exact pattern engine 3..15
+- Strict confidence gating
+- Regime detection: trend / zigzag / trap / balanced / neutral
+- Walk-forward telemetry
+- 250 draw telemetry
+- 2-level target progression
+- Telegram ready but safe fallback to console
+- Works even if API payload shape is slightly different
 """
 
 import asyncio
@@ -21,9 +20,10 @@ import math
 import os
 import random
 import sqlite3
+import sys
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,29 +38,33 @@ from telegram.ext import Application
 # ============================================================
 @dataclass
 class Config:
-    telegram_token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
-    chat_id_raw: str = "-1004485961768"
-    source_api_urls: str = os.environ.get(
+    telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
+    chat_id_raw: str = os.environ.get("CHAT_ID", "-1004485961768")
+    api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v39_full.db")
-    cache_file: str = "ftw_v39_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v40.db")
+    cache_file: str = "ftw_v40_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
-    request_timeout: float = 15.0
-    bot_name: str = "FTW V39 ENGINE"
+    timeout: float = 15.0
+    bot_name: str = "FTW V40 ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
 
     def parse_chat_id(self):
-        raw = self.chat_id_raw.strip()
-        return int(raw) if raw.lstrip("-").isdigit() else raw
+        raw = (self.chat_id_raw or "").strip()
+        if not raw:
+            return None
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+        return raw
 
-    def api_urls(self) -> List[str]:
-        urls = [u.strip() for u in self.source_api_urls.split(",") if u.strip()]
-        return urls if urls else [
+    def urls(self) -> List[str]:
+        items = [u.strip() for u in self.api_urls.split(",") if u.strip()]
+        return items if items else [
             "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
         ]
 
@@ -77,32 +81,26 @@ def setup_logging():
     Path(CFG.log_dir).mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
+    stream = logging.StreamHandler()
+    stream.setFormatter(formatter)
+    root.addHandler(stream)
 
     fh = RotatingFileHandler(
-        Path(CFG.log_dir) / "ftw_v39_full.log",
+        Path(CFG.log_dir) / "ftw_v40.log",
         maxBytes=1_000_000,
         backupCount=3
     )
-    fh.setFormatter(fmt)
+    fh.setFormatter(formatter)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v39")
+log = logging.getLogger("ftw_v40")
 
 
 def h(x: Any) -> str:
     return html.escape(str(x))
-
-def safe_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
 
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None:
@@ -120,6 +118,12 @@ def normalize_issue(value: Any) -> Optional[int]:
         return int(value)
     except Exception:
         return None
+
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
 
 def clamp(v: float, low: float, high: float) -> float:
     return max(low, min(high, v))
@@ -141,7 +145,7 @@ def family_for_size(size: str) -> List[int]:
 
 
 # ============================================================
-# BOT STATE
+# STATE
 # ============================================================
 class BotState:
     def __init__(self):
@@ -213,13 +217,13 @@ class Storage:
                 )
             """)
             c.execute("""
-                CREATE TABLE IF NOT EXISTS module_state (
+                CREATE TABLE IF NOT EXISTS modules (
                     module_name TEXT PRIMARY KEY,
                     score REAL,
                     weight REAL,
                     hit_rate REAL,
                     confidence REAL,
-                    last_updated REAL
+                    updated_at REAL
                 )
             """)
 
@@ -242,8 +246,7 @@ class Storage:
 
     def prediction_exists(self, issue: str) -> bool:
         with self._conn() as c:
-            row = c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
-            return row is not None
+            return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
 
     def resolve_pending(self, history_by_issue):
         resolved = []
@@ -316,20 +319,20 @@ class Storage:
     def update_module_state(self, module_name: str, score: float, weight: float, hit_rate: float, confidence: float):
         with self._conn() as c:
             c.execute("""
-                INSERT INTO module_state (module_name, score, weight, hit_rate, confidence, last_updated)
+                INSERT INTO modules (module_name, score, weight, hit_rate, confidence, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(module_name) DO UPDATE SET
                     score=excluded.score,
                     weight=excluded.weight,
                     hit_rate=excluded.hit_rate,
                     confidence=excluded.confidence,
-                    last_updated=excluded.last_updated
+                    updated_at=excluded.updated_at
             """, (module_name, score, weight, hit_rate, confidence, time.time()))
 
-    def get_module_state(self, module_name: str) -> Dict[str, float]:
+    def module_status(self, module_name: str) -> Dict[str, float]:
         with self._conn() as c:
             row = c.execute(
-                "SELECT score, weight, hit_rate, confidence FROM module_state WHERE module_name=?",
+                "SELECT score, weight, hit_rate, confidence FROM modules WHERE module_name=?",
                 (module_name,)
             ).fetchone()
         if not row:
@@ -346,14 +349,14 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# REGIME DETECTOR
+# REGIME DETECTION
 # ============================================================
 class RegimeDetector:
     def alternation_score(self, seq: List[int], window: int = 12) -> float:
         if len(seq) < 2:
             return 0.0
         arr = seq[-window:]
-        changes = sum(1 for i in range(1, len(arr)) if arr[i] != arr[i - 1])
+        changes = sum(1 for i in range(1, len(arr)) if arr[i] != arr[i-1])
         return changes / max(1, len(arr) - 1)
 
     def ratio_big(self, seq: List[int], window: int = 20) -> float:
@@ -386,12 +389,12 @@ REGIME = RegimeDetector()
 # ============================================================
 # EXACT PATTERN ENGINE
 # ============================================================
-class PatternEngineV39:
+class PatternEngineV40:
     def __init__(self):
         self.min_window = 3
         self.max_window = 15
 
-    def _score_suffix(self, seq: List[int], window: int) -> Dict[str, float]:
+    def _score_suffix(self, seq: List[int], window: int) -> Dict[str, Any]:
         if len(seq) < window + 2:
             return {"BIG": 0.5, "SMALL": 0.5, "strength": 0.0, "matches": 0}
 
@@ -421,11 +424,12 @@ class PatternEngineV39:
         p_big = (big_total + 1.0) / (total_weight + 2.0)
         p_small = (small_total + 1.0) / (total_weight + 2.0)
         strength = abs(p_big - p_small)
+
         return {
             "BIG": p_big,
             "SMALL": p_small,
             "strength": strength,
-            "matches": matches,
+            "matches": matches
         }
 
     def detect(self, seq: List[int]) -> Dict[str, Any]:
@@ -446,7 +450,6 @@ class PatternEngineV39:
             strength = result["strength"]
             matches = result["matches"]
 
-            # reject weak exact patterns
             if matches == 0 or strength < 0.12:
                 continue
 
@@ -480,7 +483,6 @@ class PatternEngineV39:
 
         regime = REGIME.detect(seq)
 
-        # anti-trap
         if regime == "zigzag" and len(seq) >= 8:
             final_pred = "SMALL" if seq[-1] == 1 else "BIG"
             final_conf = 0.62
@@ -496,13 +498,13 @@ class PatternEngineV39:
             "top_mode": best
         }
 
-PATTERN_ENGINE = PatternEngineV39()
+PATTERN_ENGINE = PatternEngineV40()
 
 
 # ============================================================
 # SIZE MODEL
 # ============================================================
-class SizeModelV39:
+class SizeModelV40:
     def __init__(self):
         self.weights = {
             "recent_size": 1.2,
@@ -547,7 +549,7 @@ class SizeModelV39:
         for i in range(1, len(seq)):
             if seq[i] != seq[i - 1]:
                 flips += 1
-        return (flips / max(1, len(seq) - 1)) * 2.0 - 1.0
+        return (flips / max(1, len(seq)-1)) * 2.0 - 1.0
 
     def _pattern_repeat(self, seq: List[int]) -> float:
         if len(seq) < 6:
@@ -555,7 +557,7 @@ class SizeModelV39:
         suffix = tuple(seq[-5:])
         matches = 0
         for i in range(len(seq) - 5):
-            if tuple(seq[i:i + 5]) == suffix:
+            if tuple(seq[i:i+5]) == suffix:
                 matches += 1
         return max(-1.0, min(1.0, (matches / max(1, len(seq)-5)) * 2.0 - 1.0))
 
@@ -647,11 +649,11 @@ class SizeModelV39:
 
         return pred, clamp(prob, 0.50, 0.94), feats
 
-SIZE_MODEL = SizeModelV39()
+SIZE_MODEL = SizeModelV40()
 
 
 # ============================================================
-# EXACT NUMBER MATRIX
+# NUMBER MATRIX
 # ============================================================
 class ExactNumberMatrix:
     def __init__(self):
@@ -707,7 +709,7 @@ NUMBER_MATRIX = ExactNumberMatrix()
 
 
 # ============================================================
-# RECOVERY + BIAS
+# RECOVERY / BIAS
 # ============================================================
 def recovery_logic(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     seq = [x["size"] for x in history]
@@ -754,167 +756,7 @@ def bias_guard(pred_size: str, history: List[Dict[str, Any]]) -> str:
 
 
 # ============================================================
-# 120-MODULE ENGINE CONCEPT
-# ============================================================
-class ModuleRegistry:
-    def __init__(self):
-        self.modules = []
-        base = [
-            "pattern_exact",
-            "pattern_reverse",
-            "pattern_run",
-            "pattern_alt",
-            "pattern_gap",
-            "trend_force",
-            "trend_decay",
-            "recovery_guard",
-            "reversal_guard",
-            "matrix_exact_next",
-            "matrix_family_bias",
-            "matrix_parity",
-            "phase_regime",
-            "phase_block",
-            "phase_choppy",
-            "phase_trap",
-            "phase_trend",
-            "momentum_delta",
-            "momentum_divergence",
-            "loss_streak_guard",
-            "win_streak_guard",
-            "family_pressure_big",
-            "family_pressure_small",
-            "recent_momentum",
-            "recent_balance",
-            "one_step_follow",
-            "two_step_follow",
-            "suffix_overlap",
-            "prefix_overlap",
-            "pair_transition",
-            "gap_transition",
-            "cycle_stability",
-            "anti_bias_guard",
-            "risk_gate",
-            "confidence_gate",
-            "telemetry_ladder",
-            "target_breakdown",
-            "walk_forward_score",
-            "module_consensus",
-            "phase_consensus",
-            "soft_restart",
-            "draw_risk",
-            "staircase_bias",
-            "recent_projection",
-            "switch_pressure",
-            "support_score",
-            "trend_sustain",
-            "trend_exhaustion",
-            "fatigue_guard",
-            "dominance_guard",
-            "anti_reversal",
-            "loading_score",
-            "structure_score",
-            "momentum_score",
-            "sequence_score",
-            "balance_score",
-            "recovery_score",
-            "trap_score",
-            "run_score",
-            "volatility_score",
-            "alternation_score",
-            "support_overlap",
-            "next_value_filter",
-            "family_filter",
-            "reverse_filter",
-            "stability_filter",
-            "mod_3_filter",
-            "mod_5_filter",
-            "mod_7_filter",
-            "sync_cycle",
-            "phase_sync",
-            "window_sync",
-            "safe_override",
-            "weighted_override",
-            "distance_gate",
-            "pnl_gate",
-            "draw_gate",
-            "balance_gate",
-            "target_gate",
-            "module_overlap",
-            "module_strength",
-            "global_weight",
-            "module_decay",
-        ]
-
-        # extend to 120
-        for i in range(120):
-            if i < len(base):
-                self.modules.append({"name": f"module_{i+1}", "type": base[i], "weight": 1.0})
-            else:
-                self.modules.append({"name": f"module_{i+1}", "type": f"aux_{i+1}", "weight": 0.8})
-
-    def get_module_list(self):
-        return self.modules
-
-    def score(self, history: List[Dict[str, Any]], prediction_size: str) -> Dict[str, float]:
-        weights = {}
-        for i, mod in enumerate(self.modules):
-            # pseudo-weighting using stage + cycle
-            stage_factor = 1.0 + (i / max(1, len(self.modules)))
-            weights[mod["name"]] = mod["weight"] * stage_factor
-        return weights
-
-MODULE_REGISTRY = ModuleRegistry()
-
-
-# ============================================================
-# 250-DRAW TELEMETRY + TARGET PROGRESSION
-# ============================================================
-class WalkForwardEngine:
-    def __init__(self):
-        self.window_size = 250
-        self.train_window = 120
-        self.validate_window = 30
-        self.balance = 0.0
-        self.pnl = 0.0
-        self.target1 = 0.0
-        self.target2 = 0.0
-
-    def target_breakdown(self) -> Dict[str, float]:
-        return {
-            "target1": self.balance * 0.15,
-            "target2": self.balance * 0.30
-        }
-
-    def update(self, actual_size: str, prediction_size: str, stake_value: float):
-        # simple PnL model: +1 win / -1 loss
-        delta = 1.0 if prediction_size == actual_size else -1.0
-        self.pnl += delta * stake_value
-        self.balance += delta * stake_value
-        self.target1 = self.balance * 0.15
-        self.target2 = self.balance * 0.30
-
-        STORE.log_draw_telemetry(
-            draw_index=int(time.time() * 1000),
-            pnl=self.pnl,
-            balance=self.balance,
-            target1=self.target1,
-            target2=self.target2,
-            win_count=max(0, int(self.balance / max(1.0, abs(stake_value)))),
-            loss_count=max(0, int(abs(self.pnl) / max(1.0, abs(stake_value))))
-        )
-
-    def walk_forward_score(self, history: List[Dict[str, Any]]) -> Dict[str, float]:
-        if len(history) < self.train_window:
-            return {"score": 0.50, "window": self.train_window}
-        ratio = min(1.0, len(history) / 5000.0)
-        score = 0.62 + ratio * 0.28
-        return {"score": score, "window": self.train_window}
-
-WALK = WalkForwardEngine()
-
-
-# ============================================================
-# HYBRID FALLBACK
+# FALLBACK
 # ============================================================
 def hybrid_fallback(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [x["size"] for x in history]
@@ -935,7 +777,93 @@ def hybrid_fallback(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================
-# FINAL PREDICTION + MODULE CONSENSUS
+# NUMBER PREDICTION
+# ============================================================
+def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
+    valid = family_for_size(size)
+    nums = [x["num"] for x in history if x.get("num") is not None]
+
+    if nums:
+        candidate = NUMBER_MATRIX.predict(nums, size)
+        if candidate in valid:
+            return candidate
+
+    family_nums = [n for n in nums if n in valid]
+    if family_nums:
+        freq = Counter(family_nums)
+        best_num, _ = freq.most_common(1)[0]
+        if best_num in valid:
+            return best_num
+
+    for window in range(2, min(10, len(nums))):
+        if len(nums) < window + 1:
+            continue
+        suffix = tuple(nums[-window:])
+        next_counts = defaultdict(int)
+        for i in range(len(nums) - window):
+            if tuple(nums[i:i + window]) == suffix:
+                next_counts[nums[i + window]] += 1
+        if next_counts:
+            best_num, _ = max(next_counts.items(), key=lambda kv: kv[1])
+            if best_num in valid:
+                return best_num
+
+    if nums:
+        last_num = nums[-1]
+        if last_num in valid:
+            return last_num
+
+    return random.choice(valid)
+
+
+# ============================================================
+# WALK-FORWARD TELEMETRY
+# ============================================================
+class WalkForwardEngine:
+    def __init__(self):
+        self.window_size = 250
+        self.train_window = 120
+        self.validate_window = 30
+        self.balance = 0.0
+        self.pnl = 0.0
+        self.target1 = 0.0
+        self.target2 = 0.0
+
+    def update(self, actual_size: str, prediction_size: str, stake_value: float):
+        delta = 1.0 if prediction_size == actual_size else -1.0
+        self.pnl += delta * stake_value
+        self.balance += delta * stake_value
+        self.target1 = self.balance * 0.15
+        self.target2 = self.balance * 0.30
+
+        STORE.log_draw_telemetry(
+            draw_index=int(time.time() * 1000),
+            pnl=self.pnl,
+            balance=self.balance,
+            target1=self.target1,
+            target2=self.target2,
+            win_count=max(0, int(self.balance / max(1.0, abs(stake_value)))),
+            loss_count=max(0, int(abs(self.pnl) / max(1.0, abs(stake_value))))
+        )
+
+    def target_breakdown(self) -> Dict[str, float]:
+        return {
+            "target1": self.balance * 0.15,
+            "target2": self.balance * 0.30,
+        }
+
+    def walk_forward_score(self, history: List[Dict[str, Any]]) -> Dict[str, float]:
+        if len(history) < self.train_window:
+            return {"score": 0.50, "window": self.train_window}
+        ratio = min(1.0, len(history) / 5000.0)
+        score = 0.62 + ratio * 0.28
+        return {"score": score, "window": self.train_window}
+
+WALK = WalkForwardEngine()
+
+
+# ============================================================
+# FINAL ENSEMBLE
 # ============================================================
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [x["size"] for x in history]
@@ -950,26 +878,24 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         logic = recovered["logic"]
         stake = recovered["stake"]
     else:
-        candidate_sizes = []
+        candidates = []
         if pattern["strong"]:
-            candidate_sizes.append(("pattern", pattern["prediction"], pattern["confidence"]))
+            candidates.append(("pattern", pattern["prediction"], pattern["confidence"]))
+        candidates.append(("ai", ai_size, ai_prob))
+        candidates.append(("fallback", hybrid_fallback(history)["size"], hybrid_fallback(history)["confidence"]))
 
-        candidate_sizes.append(("ai", ai_size, ai_prob))
-        candidate_sizes.append(("fallback", hybrid_fallback(history)["size"], hybrid_fallback(history)["confidence"]))
-
-        # choose the side with strongest consensus
         size_votes = Counter()
         conf_votes = defaultdict(float)
 
-        for name, size, conf in candidate_sizes:
+        for _, size, conf in candidates:
             size_votes[size] += 1
             conf_votes[size] += conf
 
         if size_votes:
-            final_size, vote_count = size_votes.most_common(1)[0]
-            conf_total = conf_votes.get(final_size, 0.0)
-            if size_votes[final_size] >= 2 and conf_total >= 1.2:
-                final_conf = min(0.92, conf_total / 2.0)
+            final_size, _ = size_votes.most_common(1)[0]
+            final_conf = conf_votes.get(final_size, 0.0) / max(1, size_votes[final_size])
+
+            if size_votes[final_size] >= 2 and final_conf >= 0.75:
                 logic = "MODULE CONSENSUS"
             else:
                 final_size = ai_size
@@ -1046,50 +972,13 @@ def generate_prediction() -> Dict[str, Any]:
             "regime": REGIME.detect([x["size"] for x in history]),
             "pattern": PATTERN_ENGINE.detect([x["size"] for x in history][-1000:]),
             "walk_forward": walk,
-            "targets": targets,
-            "modules": MODULE_REGISTRY.get_module_list()[:12],
+            "targets": targets
         }
     }
 
-def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
-    valid = family_for_size(size)
-    nums = [x["num"] for x in history if x.get("num") is not None]
-
-    if nums:
-        candidate = NUMBER_MATRIX.predict(nums, size)
-        if candidate in valid:
-            return candidate
-
-    family_nums = [n for n in nums if n in valid]
-    if family_nums:
-        freq = Counter(family_nums)
-        best_num, _ = freq.most_common(1)[0]
-        if best_num in valid:
-            return best_num
-
-    for window in range(2, min(10, len(nums))):
-        if len(nums) < window + 1:
-            continue
-        suffix = tuple(nums[-window:])
-        next_counts = defaultdict(int)
-        for i in range(len(nums) - window):
-            if tuple(nums[i:i + window]) == suffix:
-                next_counts[nums[i + window]] += 1
-        if next_counts:
-            best_num, _ = max(next_counts.items(), key=lambda kv: kv[1])
-            if best_num in valid:
-                return best_num
-
-    if nums:
-        last_num = nums[-1]
-        if last_num in valid:
-            return last_num
-
-    return random.choice(valid)
-
 
 # ============================================================
-# API PARSE + FETCH
+# DATA PARSE
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -1110,6 +999,8 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
             items = payload["result"]
         elif "history" in payload and isinstance(payload["history"], list):
             items = payload["history"]
+        elif "items" in payload and isinstance(payload["items"], list):
+            items = payload["items"]
         else:
             items = []
     else:
@@ -1138,9 +1029,9 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     return out
 
 async def fetch_data(session):
-    for url in CFG.api_urls():
+    for url in CFG.urls():
         try:
-            async with session.get(url, timeout=CFG.request_timeout) as response:
+            async with session.get(url, timeout=CFG.timeout) as response:
                 if response.status != 200:
                     continue
                 payload = await response.json(content_type=None)
@@ -1152,6 +1043,27 @@ async def fetch_data(session):
         except Exception as exc:
             log.warning("Fetch failed for %s: %s", url, exc)
     return False
+
+
+# ============================================================
+# TELEGRAM SEND
+# ============================================================
+async def send_console(text: str):
+    print(text)
+
+async def send_msg(bot, text: str):
+    chat_id = CFG.parse_chat_id()
+    if not chat_id or not CFG.telegram_token:
+        await send_console(text)
+        return True
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        return True
+    except Exception as exc:
+        log.warning("Telegram send failed: %s", exc)
+        await send_console(text)
+        return False
 
 
 # ============================================================
@@ -1199,19 +1111,6 @@ def format_result(res: Dict[str, Any]):
         f"<b>{h(res['status'])}</b>"
     )
 
-async def send_msg(bot, text: str, retries: int = 3):
-    for attempt in range(retries):
-        try:
-            await asyncio.wait_for(
-                bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML"),
-                timeout=CFG.request_timeout
-            )
-            return True
-        except Exception:
-            await asyncio.sleep(1)
-    return False
-
-
 # ============================================================
 # WORKER LOOP
 # ============================================================
@@ -1257,17 +1156,18 @@ async def worker_loop(app, session):
             gc.collect()
             await asyncio.sleep(CFG.fetch_every)
 
-        except Exception as e:
-            log.exception("Worker loop exception: %s", e)
+        except Exception as exc:
+            log.exception("Worker loop exception: %s", exc)
             await asyncio.sleep(2)
+
 
 # ============================================================
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V39 is Running")
+    return web.Response(text="FTW V40 is Running")
 
-async def start_web_server():
+async def start_server():
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
@@ -1275,7 +1175,7 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    log.info(f"Web server started on port {port}")
+    log.info("Web server started on port %s", port)
 
 # ============================================================
 # MAIN
@@ -1284,16 +1184,34 @@ async def main():
     CFG.validate()
     STATE.load_cache()
 
-    app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
-    await app.initialize()
-    await app.start()
-    log.info("Bot started: %s", (await app.bot.get_me()).username)
+    if CFG.telegram_token:
+        app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
+        await app.initialize()
+        await app.start()
+        log.info("Bot started: %s", (await app.bot.get_me()).username)
+    else:
+        app = None
+        log.info("No TELEGRAM_TOKEN found. Running in console mode.")
 
-    await start_web_server()
+    await start_server()
 
     async with aiohttp.ClientSession() as session:
-        asyncio.create_task(worker_loop(app, session))
-        await asyncio.Event().wait()
+        asyncio.create_task(worker_loop(app, session) if app is not None else asyncio.sleep(0))
+        if app is None:
+            # console mode: just do one prediction pass and print it
+            while True:
+                if await fetch_data(session):
+                    if STATE.history:
+                        pred = generate_prediction()
+                        if pred:
+                            print(format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
+                await asyncio.sleep(CFG.fetch_every)
+        else:
+            await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Stopped by user")
+        sys.exit(0)
