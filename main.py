@@ -28,12 +28,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v17_pro.db")
-    cache_file: str = "ftw_v17_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v17_pro_patterns.db")
+    cache_file: str = "ftw_v17_patterns_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V17 PRO"
+    bot_name: str = "FTW V17 PATTERN ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history: int = 2000
@@ -68,7 +68,7 @@ def setup_logging():
         root.addHandler(stream_handler)
 
         fh = RotatingFileHandler(
-            Path(CFG.log_dir) / "ftw_v17_pro.log",
+            Path(CFG.log_dir) / "ftw_v17_pro_patterns.log",
             maxBytes=1_000_000,
             backupCount=3
         )
@@ -76,7 +76,7 @@ def setup_logging():
         root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v17_pro")
+log = logging.getLogger("ftw_v17_patterns")
 
 # ============================================================
 # UTIL
@@ -425,7 +425,6 @@ class RiskManager:
             if quality < 0.68:
                 return "0.5x"
             return "1x"
-
         if quality >= 0.82:
             return "2x"
         if quality >= 0.70:
@@ -451,7 +450,124 @@ class RiskManager:
 RISK = RiskManager()
 
 # ============================================================
-# PATTERN DETECTION
+# PATTERN ANALYZER (USEFUL PATTERN LAYER)
+# ============================================================
+def pattern_label_from_bits(bits: List[int]) -> str:
+    return "".join("B" if b == 1 else "S" for b in bits)
+
+def safe_pattern_candidates(history: List[Dict[str, Any]], min_len: int = 5, max_len: int = 15, top_n: int = 3):
+    seq = [x["size"] for x in history]
+    if len(seq) < min_len + 1:
+        return []
+
+    grouped = defaultdict(list)
+
+    for length in range(min_len, max_len + 1):
+        if len(seq) < length + 1:
+            continue
+
+        suffix = tuple(seq[-length:])
+        counts = defaultdict(int)
+        next_big = defaultdict(int)
+        next_small = defaultdict(int)
+
+        for i in range(len(seq) - length):
+            key = tuple(seq[i:i + length])
+            counts[key] += 1
+            if seq[i + length] == 1:
+                next_big[key] += 1
+            else:
+                next_small[key] += 1
+
+        if suffix not in counts:
+            continue
+
+        repeats = counts[suffix]
+        if repeats < 2:
+            continue
+
+        small_count = next_small.get(suffix, 0)
+        big_count = next_big.get(suffix, 0)
+        total_next = small_count + big_count
+        if total_next == 0:
+            continue
+
+        small_ratio = (small_count / total_next) * 100.0
+        big_ratio = (big_count / total_next) * 100.0
+
+        next_side = "SMALL" if small_ratio >= big_ratio else "BIG"
+        win_ratio = max(small_ratio, big_ratio)
+        edge = abs(small_ratio - big_ratio)
+
+        grouped[length].append({
+            "length": length,
+            "pattern": suffix,
+            "pattern_text": pattern_label_from_bits(list(suffix)),
+            "repeats": repeats,
+            "next": next_side,
+            "win_ratio": round(win_ratio, 1),
+            "edge": round(edge, 1),
+            "small_ratio": round(small_ratio, 1),
+            "big_ratio": round(big_ratio, 1),
+        })
+
+    result = []
+    for length in sorted(grouped.keys()):
+        ranked = sorted(grouped[length], key=lambda x: (x["repeats"], x["edge"]), reverse=True)[:top_n]
+        result.extend(ranked)
+
+    result.sort(key=lambda x: (x["length"], -x["repeats"], -x["edge"]))
+    return result
+
+def pattern_detector(history: List[Dict[str, Any]], min_len: int = 5, max_len: int = 15, top_n: int = 3):
+    rows = safe_pattern_candidates(history, min_len=min_len, max_len=max_len, top_n=top_n)
+    if not rows:
+        return []
+
+    filtered = []
+    for r in rows:
+        if r["repeats"] >= 3 and r["edge"] >= 15:
+            filtered.append(r)
+
+    filtered.sort(key=lambda x: (x["repeats"], x["edge"]), reverse=True)
+    return filtered
+
+def strong_pattern_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    patterns = pattern_detector(history, min_len=5, max_len=15, top_n=3)
+    if not patterns:
+        return None
+
+    best = patterns[0]
+    side = best["next"]
+
+    if best["repeats"] >= 3 and best["edge"] >= 15:
+        return {
+            "size": side,
+            "logic": f"PATTERN {best['length']} | {best['pattern_text']} | Repeats: {best['repeats']} | WR: {best['win_ratio']}% | Edge: {best['edge']}%",
+            "confidence": clamp(best["edge"] / 100.0, 0.60, 0.90),
+            "stake": "1x" if best["edge"] >= 25 else "0.5x"
+        }
+    return None
+
+def print_pattern_report(history: List[Dict[str, Any]], max_lengths: int = 15):
+    rows = pattern_detector(history, min_len=5, max_len=max_lengths, top_n=3)
+    if not rows:
+        print("No pattern signal found.")
+        return
+
+    print("")
+    print("=== PATTERN REPORT ===")
+    last_length = None
+    for idx, r in enumerate(rows[:15], 1):
+        if r["length"] != last_length:
+            print(f"--- LENGTH {r['length']} PATTERNS (Top 3) ---")
+            last_length = r["length"]
+        print(f"Pattern: {r['pattern_text']} | Repeats: {r['repeats']} | Next: {r['next']} (WR: {r['win_ratio']}% | Edge: {r['edge']}%)")
+    print("====================")
+    print("")
+
+# ============================================================
+# TREND PHASE / MOMENTUM
 # ============================================================
 def trend_phase(history: List[Dict[str, Any]]) -> str:
     if len(history) < 8:
@@ -561,6 +677,9 @@ def context_shift_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
                 }
     return None
 
+# ============================================================
+# EXACT PATTERN MATCHING
+# ============================================================
 def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seq = [x["size"] for x in history]
     candidates = []
@@ -607,59 +726,11 @@ def exact_pattern_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, An
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:12]
 
-def exact_number_candidates(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    nums = [x["num"] for x in history]
-    candidates = []
-    for window in range(3, 9):
-        if len(nums) < window + 1:
-            continue
-        suffix = tuple(nums[-window:])
-        counts = defaultdict(int)
-        next_counts = defaultdict(int)
-
-        for i in range(len(nums) - window):
-            key = tuple(nums[i:i + window])
-            counts[key] += 1
-            next_counts[(key, nums[i + window])] += 1
-
-        if suffix not in counts:
-            continue
-
-        total = counts[suffix]
-        best_num = -1
-        best_freq = 0
-
-        for (k, num), freq in next_counts.items():
-            if k == suffix and freq > best_freq:
-                best_freq = freq
-                best_num = num
-
-        if best_num == -1:
-            continue
-
-        confidence = (best_freq / total) * 100.0
-        support = total / max(1, len(nums) - window)
-
-        if support < 0.05 and confidence < 20:
-            continue
-
-        score = confidence + (support * 100.0) + (window * 3.0)
-        candidates.append({
-            "window": window,
-            "num": best_num,
-            "confidence": confidence,
-            "support": support,
-            "score": score,
-            "logic": f"NUM SEQ {window}:{suffix} => {best_num}"
-        })
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates
-
 def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     candidates = exact_pattern_candidates(history)
     if not candidates:
         return None
+
     best = candidates[0]
     if best["confidence"] < 12 and best["support"] < 0.04:
         return None
@@ -674,6 +745,9 @@ def choose_exact_prediction(history: List[Dict[str, Any]]) -> Optional[Dict[str,
         "stake": "2x" if confidence >= 0.82 else "1x" if confidence >= 0.68 else "0.5x"
     }
 
+# ============================================================
+# MARKOV / HYBRID FALLBACK
+# ============================================================
 def markov_prob(history: List[Dict[str, Any]]) -> float:
     sizes = [x["size"] for x in history]
     if len(sizes) < 3:
@@ -699,29 +773,6 @@ def result_bias(history: List[Dict[str, Any]]) -> float:
     if not seq:
         return 0.5
     return sum(seq) / len(seq)
-
-def trend_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    seq = [x["size"] for x in history]
-    if len(seq) < 3:
-        return {"size": "BIG" if random.random() > 0.5 else "SMALL", "confidence": 0.5}
-
-    hist_ctx = context_shift_signal(history)
-    if hist_ctx:
-        return hist_ctx
-
-    run = trailing_run(seq)
-    last = seq[-1]
-
-    if run >= 3:
-        last3, prev3 = seq[-3:], seq[-6:-3]
-        if len(prev3) == 3:
-            last_same = sum(1 for v in last3 if v == last)
-            prev_same = sum(1 for v in prev3 if v == last)
-            if last_same < prev_same:
-                return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.85}
-        return {"size": "BIG" if last == 1 else "SMALL", "confidence": 0.75}
-
-    return {"size": "BIG" if result_bias(history) >= 0.5 else "SMALL", "confidence": 0.6}
 
 def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     markov = markov_prob(history)
@@ -769,11 +820,32 @@ def number_gap_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
 
-    exact_num = exact_number_candidates(history)
-    if exact_num:
-        best_num = exact_num[0]
-        if best_num["confidence"] >= 20 and best_num["num"] in valid:
-            return best_num["num"]
+    # Exact number candidate
+    num_candidates = []
+    for w in range(3, 9):
+        if len(history) < w + 1:
+            continue
+        nums = [x["num"] for x in history]
+        suffix = tuple(nums[-w:])
+        counts = defaultdict(int)
+        next_counts = defaultdict(int)
+        for i in range(len(nums) - w):
+            key = tuple(nums[i:i + w])
+            counts[key] += 1
+            next_counts[(key, nums[i + w])] += 1
+        if suffix not in counts:
+            continue
+        total = counts[suffix]
+        best_num = -1
+        best_freq = 0
+        for (k, num), freq in next_counts.items():
+            if k == suffix and freq > best_freq:
+                best_freq = freq
+                best_num = num
+        if best_num != -1:
+            confidence = (best_freq / total) * 100.0
+            if confidence >= 20 and best_num in valid:
+                return best_num
 
     repeat = number_repeat_score(history)
     if repeat["score"] >= 0.2 and repeat["value"] in valid:
@@ -799,6 +871,7 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     recent = [x["num"] for x in history[-15:]]
     if recent and recent[-1] in valid:
         return recent[-1]
+
     return random.choice(valid)
 
 # ============================================================
@@ -810,6 +883,11 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     final_size = exact["size"] if exact else fallback["size"]
     final_score = exact["confidence"] if exact else 0.55
+
+    pattern_signal = strong_pattern_signal(history)
+    if pattern_signal:
+        final_size = pattern_signal["size"]
+        final_score = max(final_score, pattern_signal["confidence"])
 
     ctx = context_shift_signal(history)
     if ctx:
@@ -827,7 +905,7 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         final_score = max(final_score, trend["confidence"])
 
     final_conf = clamp(final_score, 0.55, 0.94)
-    logic = exact["logic"] if exact else "ENSEMBLE: EXACT + CONTEXT + HYBRID"
+    logic = exact["logic"] if exact else "ENSEMBLE: PATTERN + CONTEXT + HYBRID"
 
     return {
         "size": final_size,
@@ -836,8 +914,31 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.68 else "0.5x"
     }
 
+def trend_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    seq = [x["size"] for x in history]
+    if len(seq) < 3:
+        return {"size": "BIG" if random.random() > 0.5 else "SMALL", "confidence": 0.5}
+
+    hist_ctx = context_shift_signal(history)
+    if hist_ctx:
+        return hist_ctx
+
+    run = trailing_run(seq)
+    last = seq[-1]
+
+    if run >= 3:
+        last3, prev3 = seq[-3:], seq[-6:-3]
+        if len(prev3) == 3:
+            last_same = sum(1 for v in last3 if v == last)
+            prev_same = sum(1 for v in prev3 if v == last)
+            if last_same < prev_same:
+                return {"size": "SMALL" if last == 1 else "BIG", "confidence": 0.85}
+        return {"size": "BIG" if last == 1 else "SMALL", "confidence": 0.75}
+
+    return {"size": "BIG" if result_bias(history) >= 0.5 else "SMALL", "confidence": 0.6}
+
 # ============================================================
-# PREDICTION BUILD
+# FINAL PREDICTION BUILD
 # ============================================================
 def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
     if len(history) < CFG.min_history:
@@ -885,7 +986,7 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
     }
 
 # ============================================================
-# HISTORY PARSER
+# PARSE HISTORY FROM API
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -944,7 +1045,7 @@ async def fetch_history(session):
     return False
 
 # ============================================================
-# FORMATTING
+# DISPLAY / FORMAT
 # ============================================================
 def normalize_recent_row(row: Any):
     if not isinstance(row, (tuple, list)):
@@ -1059,7 +1160,7 @@ async def worker_loop(app, session):
             await asyncio.sleep(2)
 
 async def health_check(request):
-    return web.Response(text="FTW V17 PRO is Running")
+    return web.Response(text="FTW V17 PATTERN ENGINE is Running")
 
 async def start_web_server():
     app = web.Application()
@@ -1072,6 +1173,8 @@ async def start_web_server():
 async def main():
     CFG.validate()
     STATE.load_cache()
+
+    print_pattern_report(STATE.history if STATE.history else [], max_lengths=15)
 
     app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
     await app.initialize()
