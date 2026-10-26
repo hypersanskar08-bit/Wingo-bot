@@ -1,15 +1,14 @@
 """
-FTW V48 ADVANCED PREDICTOR
-=========================
-Strong multi-signal engine:
-- exact section pattern matching (5..15)
-- long-run exhaustion detection
-- momentum decay reverse detection
-- alternation / zigzag / balanced / trend regime detection
-- anti-loss stop logic
-- walk-forward trend score
-- play-ready gating
-- no fake "best timing" label
+FTW V48 FINAL FIXED CODE
+========================
+This is the corrected, deploy-safe version.
+- exact section pattern detection
+- pattern length 5..15
+- long-run fatigue / momentum decay
+- multi-engine consensus
+- play_ready signal gating
+- no fake "BEST TIMING" label
+- Render-safe startup
 """
 
 import asyncio
@@ -40,17 +39,17 @@ from telegram.ext import Application
 @dataclass
 class Config:
     telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
-    chat_id_raw: str = os.environ.get("CHAT_ID", "-1004485961768")
+    chat_id_raw: str = os.environ.get("CHAT_ID", "1264164655")
     api_urls: str = os.environ.get(
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v48.db")
-    cache_file: str = "ftw_v48_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v48_fixed.db")
+    cache_file: str = "ftw_v48_fixed_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     timeout: float = 15.0
-    bot_name: str = "FTW V48 ENGINE"
+    bot_name: str = "FTW V48 FIXED ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1200
@@ -63,6 +62,16 @@ class Config:
             return int(raw)
         return raw
 
+    def validate(self):
+        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+        return True
+
+    def urls(self) -> List[str]:
+        items = [u.strip() for u in self.api_urls.split(",") if u.strip()]
+        return items if items else [
+            "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
+        ]
+
 CFG = Config()
 
 
@@ -74,16 +83,21 @@ def setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v48.log", maxBytes=1_000_000, backupCount=3)
+    fh = RotatingFileHandler(
+        Path(CFG.log_dir) / "ftw_v48_fixed.log",
+        maxBytes=1_000_000,
+        backupCount=3
+    )
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v48")
+log = logging.getLogger("ftw_v48_fixed")
 
 
 def h(x: Any) -> str:
@@ -93,7 +107,7 @@ def safe_int(x, default=0):
     try:
         return int(x)
     except Exception:
-        return safe_int(default, 0)
+        return int(default)
 
 def normalize_issue(value: Any) -> Optional[int]:
     if value is None:
@@ -268,7 +282,44 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# SECTION PATTERN TRACKING
+# REGIME / TREND
+# ============================================================
+class RegimeDetector:
+    def alternation_score(self, seq: List[int], window: int = 12) -> float:
+        if len(seq) < 2:
+            return 0.0
+        arr = seq[-window:]
+        changes = sum(1 for i in range(1, len(arr)) if arr[i] != arr[i - 1])
+        return changes / max(1, len(arr) - 1)
+
+    def ratio_big(self, seq: List[int], window: int = 20) -> float:
+        if not seq:
+            return 0.5
+        arr = seq[-window:]
+        return sum(arr) / len(arr)
+
+    def detect(self, seq: List[int]) -> str:
+        if len(seq) < 8:
+            return "neutral"
+        run = trailing_run(seq)
+        alt = self.alternation_score(seq, 10)
+        ratio = self.ratio_big(seq, 10)
+
+        if alt >= 0.65:
+            return "zigzag"
+        if run >= 5:
+            return "trend"
+        if run >= 3:
+            return "trap"
+        if abs(ratio - 0.5) <= 0.12:
+            return "balanced"
+        return "neutral"
+
+REGIME = RegimeDetector()
+
+
+# ============================================================
+# SECTION PATTERN
 # ============================================================
 def split_sections(seq: List[int]) -> List[Tuple[int, int]]:
     if not seq:
@@ -378,7 +429,7 @@ def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: 
 
 
 # ============================================================
-# TREND / FATIGUE / MOMENTUM
+# FATIGUE / REVERSAL
 # ============================================================
 def dominant_side_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(history) < 8:
@@ -386,7 +437,6 @@ def dominant_side_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
 
     seq = [x["size"] for x in history]
     current = seq[-1]
-
     recent = seq[-12:]
     share_current = sum(1 for v in recent if v == current) / len(recent)
 
@@ -450,34 +500,36 @@ def forced_recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str
 
 
 # ============================================================
-# REGIME / ALTERNATION / MOMENTUM
+# SIGNAL GATING
 # ============================================================
-class RegimeEngine:
-    def detect(self, seq: List[int]) -> str:
-        if len(seq) < 4:
-            return "neutral"
+def can_play(history: List[Dict[str, Any]], section_match: Optional[Dict[str, Any]]) -> bool:
+    if len(history) < 8:
+        return False
 
-        run = trailing_run(seq)
-        alt = 0.0
-        for i in range(1, len(seq)):
-            if seq[i] != seq[i - 1]:
-                alt += 1
-        alt = alt / max(1, len(seq) - 1)
+    seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
+    if not seq:
+        return False
 
-        big_share = sum(1 for v in seq[-8:] if v == 1) / max(1, len(seq[-8:]))
-        small_share = sum(1 for v in seq[-8:] if v == 0) / max(1, len(seq[-8:]))
+    current = seq[-1]
+    run = trailing_run(seq)
 
-        if alt >= 0.6:
-            return "zigzag"
-        if run >= 5:
-            return "trend"
-        if abs(big_share - 0.5) <= 0.12 and abs(small_share - 0.5) <= 0.12:
-            return "balanced"
-        if run >= 3:
-            return "trap"
-        return "neutral"
+    recent8 = seq[-8:]
+    same_share = sum(1 for v in recent8 if v == current) / len(recent8)
 
-REGIME_ENGINE = RegimeEngine()
+    if len(seq) >= 6:
+        last3 = seq[-3:]
+        prev3 = seq[-6:-3]
+        if len(last3) == 3 and len(prev3) == 3:
+            last_same = sum(1 for v in last3 if v == current)
+            prev_same = sum(1 for v in prev3 if v == current)
+            if run >= 6 and same_share >= 0.8 and last_same <= 1 and prev_same >= 2:
+                return True
+
+    if section_match:
+        if section_match.get("valid") and section_match.get("win_rate", 0) >= 75:
+            return True
+
+    return False
 
 
 # ============================================================
@@ -736,46 +788,11 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 
 
 # ============================================================
-# SIGNAL GATING
-# ============================================================
-def can_play(history: List[Dict[str, Any]], section_match: Optional[Dict[str, Any]], engine_signal: str) -> bool:
-    if len(history) < 8:
-        return False
-
-    seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
-    if not seq:
-        return False
-
-    run = trailing_run(seq)
-    current = seq[-1]
-
-    recent8 = seq[-8:]
-    same_share = sum(1 for v in recent8 if v == current) / len(recent8)
-
-    if len(seq) >= 6:
-        last3 = seq[-3:]
-        prev3 = seq[-6:-3]
-        if len(last3) == 3 and len(prev3) == 3:
-            last_same = sum(1 for v in last3 if v == current)
-            prev_same = sum(1 for v in prev3 if v == current)
-            if run >= 6 and same_share >= 0.8 and last_same <= 1 and prev_same >= 2:
-                return True
-
-    if section_match:
-        if section_match.get("valid") and section_match.get("win_rate", 0) >= 75:
-            return True
-
-    if section_match and section_match.get("opposite_fallback") and section_match.get("win_rate", 0) < 75:
-        return False
-
-    return False
-
-
-# ============================================================
-# FINAL ENGINE
+# FINAL SIGNAL ENGINE
 # ============================================================
 def build_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
+
     if len(seq) < CFG.min_history:
         return {
             "size": "BIG" if random.random() >= 0.5 else "SMALL",
@@ -803,10 +820,9 @@ def build_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
 
     if section_match:
-        if section_match.get("opposite_fallback"):
-            candidates.append(("section", section_match["next_side"], 0.60))
-        else:
-            candidates.append(("section", section_match["next_side"], clamp(section_match["win_rate"] / 100.0, 0.50, 0.92)))
+        next_side = section_match["next_side"]
+        next_conf = 0.60 if section_match.get("opposite_fallback") else clamp(section_match["win_rate"] / 100.0, 0.50, 0.92)
+        candidates.append(("section", next_side, next_conf))
 
     if run_reversal:
         return {
@@ -847,14 +863,16 @@ def build_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         if section_match["next_side"] != final_size and section_match["win_rate"] >= 75:
             final_size = section_match["next_side"]
             final_conf = max(final_conf, section_match["win_rate"] / 100.0)
-            logic = "SECTION OVERRIDE"
+            logic = "STRONG SECTION OVERRIDE"
 
     final_size = bias_guard(final_size, history)
     final_conf = clamp(final_conf, 0.50, 0.95)
+
     stake = "3x" if final_conf >= 0.85 else "2x" if final_conf >= 0.72 else "1x" if final_conf >= 0.60 else "0.5x"
 
-    can_ready = can_play(history, section_match, logic)
-    if not can_ready:
+    play_ready = can_play(history, section_match)
+
+    if not play_ready:
         final_conf = min(final_conf, 0.65)
         stake = "0.5x"
 
@@ -863,7 +881,7 @@ def build_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         "logic": logic,
         "confidence": final_conf,
         "stake": stake,
-        "play_ready": can_ready,
+        "play_ready": play_ready,
         "pattern_catalog": pattern_catalog
     }
 
@@ -918,7 +936,7 @@ def generate_prediction() -> Dict[str, Any]:
         "logic": engine["logic"],
         "stake": engine["stake"],
         "details": {
-            "regime": REGIME_ENGINE.detect([x["size"] for x in history]),
+            "regime": REGIME.detect([x["size"] for x in history]),
             "pattern_catalog": engine.get("pattern_catalog", []),
             "play_ready": engine.get("play_ready", False),
             "run_fatigue": dominant_side_signal(history),
@@ -928,7 +946,7 @@ def generate_prediction() -> Dict[str, Any]:
 
 
 # ============================================================
-# API PARSE + FETCH
+# API RESPONSE PARSING
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
@@ -978,11 +996,9 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: int(x["issue"]))
     return out
 
+
 async def fetch_data(session):
-    for url in CFG.api_urls.split(","):
-        url = url.strip()
-        if not url:
-            continue
+    for url in CFG.urls():
         try:
             async with session.get(url, timeout=CFG.timeout) as response:
                 if response.status != 200:
@@ -1026,7 +1042,7 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
     pattern_block = "\n".join(pattern_lines) if pattern_lines else "No mined pattern found"
 
     play_ready = pred.get("details", {}).get("play_ready", False)
-    play_state = "✅ PLAY READY" if play_ready else "⏸️ SKIP"
+    status_text = "✅ PLAY READY" if play_ready else "⏸️ SKIP"
 
     return f"""
 📌 <b>Period</b>: <code>{h(pred['issue'])}</code>
@@ -1036,7 +1052,7 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 🧠 <b>Engine</b>: {h(pred.get('logic', 'N/A'))}
 📊 <b>Confidence</b>: <b>{pred['raw_conf']}%</b>
 💰 <b>Stake</b>: <b>{h(pred['stake'])}</b>
-⏱️ <b>Signal</b>: {play_state}
+⏱️ <b>Signal</b>: {status_text}
 
 ━━ Section Pattern Catalog ━━
 {pattern_block}
@@ -1133,7 +1149,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V48 is Running")
+    return web.Response(text="FTW V48 fixed server is running")
 
 async def start_server():
     app = web.Application()
@@ -1144,6 +1160,7 @@ async def start_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     log.info("Web server started on port %s", port)
+
 
 # ============================================================
 # MAIN
@@ -1175,6 +1192,7 @@ async def main():
                         if pred:
                             print(format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
                 await asyncio.sleep(CFG.fetch_every)
+
 
 if __name__ == "__main__":
     try:
