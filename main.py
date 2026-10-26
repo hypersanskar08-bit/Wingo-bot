@@ -1,11 +1,10 @@
 """
-FTW V23 FULL CODE (DEEP PATTERN + ADVANCED DRAGON)
+FTW V26 FULL CODE (CONTRARIAN TRAP ENGINE)
 =================
-- Multi-Window Sequence Voting (No single pattern bias)
-- Pattern Aging (Ignores old patterns)
-- Advanced Dragon Riding (Momentum Slope + Fake-Out Protection)
+- Deep Voting is BACK with Trap Inversion (>75% Consensus = Invert)
+- Ultra Strong Pattern Detection (Regime Guard prevents fake reversals)
+- ADV Dragon Riding (Momentum + Fake-Out Protection)
 - Invert Rule: WR <= 56%
-- Smart Recovery (No blind rollback)
 - Telegram VIP Channel Ready
 """
 
@@ -39,12 +38,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v23_full.db")
-    cache_file: str = "ftw_v23_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v26_full.db")
+    cache_file: str = "ftw_v26_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     request_timeout: float = 15.0
-    bot_name: str = "FTW V23 DEEP ENGINE"
+    bot_name: str = "FTW V26 TRAP ENGINE"
     min_history: int = 8
     recent_limit: int = 12
 
@@ -76,12 +75,12 @@ def setup_logging():
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v23_full.log", maxBytes=1_000_000, backupCount=2)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v26_full.log", maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v23")
+log = logging.getLogger("ftw_v26")
 
 def h(x: Any) -> str: return html.escape(str(x))
 def safe_int(x, default=0):
@@ -110,51 +109,6 @@ def trailing_run(seq: List[int]) -> int:
         else: break
     return c
 
-def alternating_score(seq: List[int], window: int = 12) -> float:
-    if len(seq) < 2: return 0.0
-    arr = seq[-window:]
-    changes = sum(1 for i in range(1, len(arr)) if arr[i] != arr[i - 1])
-    return changes / max(1, len(arr) - 1)
-
-def volatility(seq: List[int], window: int = 20) -> float:
-    if len(seq) < 2: return 0.0
-    arr = seq[-window:]
-    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
-    return sum(diffs) / max(1, len(diffs))
-
-def ratio_big(seq: List[int], window: int = 20) -> float:
-    if not seq: return 0.5
-    return sum(seq[-window:]) / len(seq[-window:])
-
-def detect_regime(seq: List[int]) -> str:
-    if len(seq) < 8: return "COLD"
-    run = trailing_run(seq)
-    alt = alternating_score(seq, 10)
-    ratio = ratio_big(seq, 10)
-
-    if alt >= 0.65: return "ALTERNATING"
-    if run >= 5: return "TREND"
-    if run >= 3: return "TRAP"
-    if abs(ratio - 0.5) <= 0.12: return "CHOPPY"
-    return "CYCLE"
-
-def signal_strength(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8: return 0.2
-    seq = [x["size"] for x in history]
-    regime = detect_regime(seq)
-    run = trailing_run(seq)
-    alt = alternating_score(seq, 12)
-    ratio = ratio_big(seq, 20)
-
-    s = 0.0
-    if regime == "TRAP": s += 0.35
-    if regime == "TREND": s += 0.25
-    if regime == "ALTERNATING": s += 0.30
-    if run >= 3: s += 0.25
-    if abs(ratio - 0.5) > 0.18: s += 0.15
-    if alt >= 0.6: s += 0.15
-    return clamp(min(1.0, s), 0.0, 1.0)
-
 # ============================================================
 # STATE & STORAGE
 # ============================================================
@@ -164,7 +118,7 @@ class BotState:
         self.loss_streak = 0
         self.win_streak = 0
         self.recovery_mode = False
-        self.fake_breakouts = 0 # For Trend Tracking
+        self.fake_breakouts = 0
 
     def save_cache(self):
         try:
@@ -199,12 +153,6 @@ class Storage:
                     issue TEXT PRIMARY KEY, pred_type TEXT, size TEXT, num INTEGER,
                     status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT,
                     logic TEXT, details TEXT, stake TEXT, created_at REAL
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS pattern_stats (
-                    pattern_key TEXT PRIMARY KEY, hit_count INTEGER DEFAULT 0, miss_count INTEGER DEFAULT 0,
-                    last_seen REAL DEFAULT 0, support REAL DEFAULT 0, confidence REAL DEFAULT 0
                 )
             """)
 
@@ -254,10 +202,10 @@ class Storage:
 STORE = Storage(CFG.db_path)
 
 # ============================================================
-# TREND ENGINE (ADVANCED DRAGON RIDING)
+# 1. ADVANCED TREND ENGINE (DRAGON RIDING)
 # ============================================================
-def advanced_trend_analysis(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(history) < 12: return {"size": "SMALL", "logic": "WARMUP", "confidence": 0.5, "stake": "0.5x"}
+def advanced_trend_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if len(history) < 12: return None
     
     seq = [x["size"] for x in history]
     current_side = seq[-1]
@@ -265,31 +213,25 @@ def advanced_trend_analysis(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     if run < 3: return None
     
-    # Momentum Slope Calculation
     last3 = seq[-3:]
     prev3 = seq[-6:-3]
-    
     last_same = sum(1 for v in last3 if v == current_side)
     prev_same = sum(1 for v in prev3 if v == current_side)
+    momentum = last_same - prev_same
     
-    momentum = last_same - prev_same # +2 means strong trend, -2 means fading
-    
-    # Fake-Out Detection: If trend breaks once but comes back
     if len(seq) > 8:
         if seq[-1] == seq[-3] and seq[-2] != seq[-1]:
             STATE.fake_breakouts += 1
         else:
             STATE.fake_breakouts = max(0, STATE.fake_breakouts - 1)
             
-    # If Momentum is strong, ride it
-    if momentum >= 1 or run >= 5:
+    if momentum >= 1 or run >= 4:
         return {
             "size": "BIG" if current_side == 1 else "SMALL",
-            "logic": f"ADV DRAGON RIDING (Run:{run} | Mom:{momentum})",
+            "logic": f"ADV DRAGON (Run:{run} | Mom:{momentum})",
             "confidence": 0.88,
             "stake": "1x"
         }
-    # If Momentum is decaying, prepare for reversal
     elif momentum <= -1:
         return {
             "size": "SMALL" if current_side == 1 else "BIG",
@@ -297,26 +239,20 @@ def advanced_trend_analysis(history: List[Dict[str, Any]]) -> Dict[str, Any]:
             "confidence": 0.85,
             "stake": "1x"
         }
-    
     return None
 
 # ============================================================
-# DEEP SEQUENCE PATTERN ENGINE (VOTING SYSTEM)
+# 2. ULTRA STRONG PATTERN ENGINE
 # ============================================================
-def deep_pattern_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def get_best_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     seq = [x["size"] for x in history]
     total_history = len(seq)
+    current_run = trailing_run(seq)
+    current_live_side = "BIG" if seq[-1] == 1 else "SMALL"
     
-    # Store votes from different window sizes
-    big_votes = 0.0
-    small_votes = 0.0
+    best_candidate = None
+    highest_score = 0
     
-    best_edge = 0.0
-    best_window = 0
-    best_logic = ""
-    is_trap = False
-    
-    # Analyze windows from 5 to 14
     for window in range(5, 15):
         if total_history < window + 5: continue
         
@@ -324,32 +260,24 @@ def deep_pattern_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
         exact_big = 0.0
         exact_small = 0.0
         exact_weight_total = 0.0
-        recent_matches = []
         
-        # Lookback limit (Only check last 300 periods for speed, older patterns are dead)
-        lookback_limit = min(total_history, 300) 
+        lookback_limit = min(total_history, 300)
         
         for i in range(total_history - window - 1, total_history - lookback_limit, -1):
             past_pattern = tuple(seq[i:i + window])
             
             if past_pattern == suffix:
                 next_res = seq[i + window]
-                
-                # Pattern Aging: Older patterns get 0 weight after 100 rounds
                 distance_from_end = total_history - (i + window)
+                
                 if distance_from_end > 100: continue 
                 
                 recency_weight = max(0.1, 1.0 - (distance_from_end / 100.0))
-                
                 exact_weight_total += recency_weight
                 if next_res == 1: exact_big += recency_weight
                 else: exact_small += recency_weight
-                
-                if distance_from_end <= 30:
-                    recent_matches.append(next_res)
 
         if exact_weight_total >= 2.0:
-            # Laplace Smoothing
             big_prob = (exact_big + 1) / (exact_weight_total + 2)
             small_prob = (exact_small + 1) / (exact_weight_total + 2)
             
@@ -357,74 +285,100 @@ def deep_pattern_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, A
             win_rate = max(big_prob, small_prob)
             edge = abs(big_prob - small_prob) * 100.0
             
-            # 🆕 USER RULE: Invert if WR <= 56%
+            is_inverted = False
+            
             if win_rate <= 0.56:
                 pred = "SMALL" if pred == "BIG" else "BIG"
-                is_trap = True
-                edge = 100.0 - edge # Invert the edge
+                is_inverted = True
+                edge = 100.0 - edge
                 win_rate = 1.0 - win_rate
                 
-            # Add to Voting System
-            if pred == "BIG":
-                big_votes += edge
-            else:
-                small_votes += edge
+            if current_run >= 2 and pred != current_live_side:
+                if edge < 35.0:
+                    continue 
+
+            score = edge + (exact_weight_total * 2.0) + (window * 2.0)
+            
+            if score > highest_score:
+                highest_score = score
+                tag = "INVERTED EXACT" if is_inverted else "STRONG EXACT"
                 
-            # Track the strongest signal
-            if edge > best_edge and win_rate > 0.56:
-                best_edge = edge
-                best_window = window
-                best_logic = f"DEEP {window}-SEQ (WR:{win_rate*100:.1f}% | Edge:{edge:.1f}%)"
+                best_candidate = {
+                    "size": pred, 
+                    "logic": f"{tag} {window}-SEQ (WR:{win_rate*100:.1f}% | Edge:{edge:.1f}%)",
+                    "confidence": clamp(edge / 100.0, 0.55, 0.95) if is_inverted else clamp(win_rate, 0.55, 0.95),
+                    "stake": "2x" if edge > 25 else "1x" if edge > 15 else "0.5x"
+                }
                 
-    if big_votes == 0 and small_votes == 0:
-        return None
+    return best_candidate
+
+# ============================================================
+# 3. CONTRARIAN DEEP VOTING (TRAP INVERSION)
+# ============================================================
+def deep_voting_analysis(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    seq = [x["size"] for x in history]
+    total_history = len(seq)
+    
+    big_votes = 0.0
+    small_votes = 0.0
+    
+    for window in range(5, 15):
+        if total_history < window + 5: continue
+        suffix = tuple(seq[-window:])
+        exact_big, exact_small, exact_weight_total = 0.0, 0.0, 0.0
         
+        lookback_limit = min(total_history, 300)
+        for i in range(total_history - window - 1, total_history - lookback_limit, -1):
+            if tuple(seq[i:i + window]) == suffix:
+                next_res = seq[i + window]
+                distance_from_end = total_history - (i + window)
+                if distance_from_end > 100: continue 
+                
+                recency_weight = max(0.1, 1.0 - (distance_from_end / 100.0))
+                exact_weight_total += recency_weight
+                if next_res == 1: exact_big += recency_weight
+                else: exact_small += recency_weight
+
+        if exact_weight_total >= 2.0:
+            big_prob = (exact_big + 1) / (exact_weight_total + 2)
+            small_prob = (exact_small + 1) / (exact_weight_total + 2)
+            
+            pred = "BIG" if big_prob >= small_prob else "SMALL"
+            edge = abs(big_prob - small_prob) * 100.0
+            
+            if max(big_prob, small_prob) <= 0.56:
+                pred = "SMALL" if pred == "BIG" else "BIG"
+                
+            if pred == "BIG": big_votes += edge
+            else: small_votes += edge
+                
     total_votes = big_votes + small_votes
+    if total_votes == 0: return None
+    
     final_pred = "BIG" if big_votes > small_votes else "SMALL"
     vote_percentage = (max(big_votes, small_votes) / total_votes) * 100.0
     
-    # If the voting is very one-sided
-    if vote_percentage > 70.0:
+    # 🆕 CONTRARIAN LOGIC: Invert if Consensus is too high (Trap Alert)
+    if vote_percentage >= 75.0:
+        inverted_pred = "SMALL" if final_pred == "BIG" else "BIG"
+        return {
+            "size": inverted_pred,
+            "logic": f"TRAP VOTING INVERTED ({vote_percentage:.1f}% Consensus)",
+            "confidence": 0.78,
+            "stake": "1x"
+        }
+    elif vote_percentage >= 60.0:
         return {
             "size": final_pred,
-            "logic": f"DEEP VOTING: {final_pred} ({vote_percentage:.1f}% Consensus)",
-            "confidence": clamp(vote_percentage / 100.0, 0.65, 0.92),
-            "stake": "2x" if vote_percentage > 85.0 else "1x"
+            "logic": f"SAFE VOTING ({vote_percentage:.1f}% Consensus)",
+            "confidence": 0.70,
+            "stake": "1x"
         }
-        
-    # If top pattern edge is huge, override voting
-    if best_edge > 30.0:
-         return {
-            "size": "BIG" if "BIG" in best_logic else "SMALL", # Simplified logic
-            "logic": best_logic,
-            "confidence": clamp(best_edge / 100.0, 0.70, 0.95),
-            "stake": "2x"
-        }
-
     return None
 
 # ============================================================
-# ENSEMBLE & RECOVERY
+# ENSEMBLE & MAIN GENERATION
 # ============================================================
-def recovery_logic(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    seq = [x["size"] for x in history]
-    if not seq: return None
-    
-    # If Loss streak is high, DO NOT fight the trend.
-    if STATE.loss_streak >= 2:
-        run = trailing_run(seq)
-        if run >= 4:
-            last = seq[-1]
-            return {"size": "BIG" if last == 1 else "SMALL", "logic": "RECOVERY: RIDING TREND", "confidence": 0.80, "stake": "1x"}
-            
-        recent = seq[-6:]
-        small_share = sum(1 for v in recent if v == 0) / len(recent)
-        big_share = sum(1 for v in recent if v == 1) / len(recent)
-        if small_share >= 0.80: return {"size": "BIG", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
-        if big_share >= 0.80: return {"size": "SMALL", "logic": "CONTROLLED RECOVERY", "confidence": 0.75, "stake": "1x"}
-        
-    return None
-
 def hybrid_fallback(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [x["size"] for x in history]
     bias = sum(seq[-20:]) / 20.0 if len(seq) >= 20 else 0.5
@@ -438,30 +392,28 @@ def generate_prediction() -> Dict[str, Any]:
 
     history = STATE.history[-2000:]
     
-    # 1. Check Recovery
-    recovery = recovery_logic(history)
-    if recovery:
-        final_res = recovery
+    trend = advanced_trend_analysis(history)
+    pattern = get_best_pattern(history)
+    
+    final_res = None
+    
+    if trend and trend["confidence"] >= 0.88:
+        final_res = trend 
+    elif pattern and pattern["confidence"] >= 0.75:
+        final_res = pattern 
+    elif trend:
+        final_res = trend
+    elif pattern:
+        final_res = pattern
     else:
-        # 2. Check Deep Pattern Analysis
-        pattern = deep_pattern_analysis(history)
-        
-        # 3. Check Advanced Trend
-        trend = advanced_trend_analysis(history)
-        
-        # 4. Decide Final (Pattern gets priority if Edge is strong)
-        if pattern and pattern["confidence"] >= 0.75:
-            final_res = pattern
-        elif trend:
-            final_res = trend
-        elif pattern:
-            final_res = pattern
+        voting = deep_voting_analysis(history)
+        if voting:
+            final_res = voting
         else:
             final_res = hybrid_fallback(history)
 
     final_size = final_res["size"]
     final_num = choose_number_for_size(final_size, history)
-    
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
 
     return {
@@ -483,7 +435,6 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
     valid = family_for_size(size)
     nums = [x["num"] for x in history]
     
-    # Exact Number Sequence
     for window in range(3, 8):
         if len(nums) < window + 2: continue
         suffix = tuple(nums[-window:])
@@ -494,18 +445,14 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
                 
         if next_counts:
             best_num, freq = Counter(next_counts).most_common(1)[0]
-            if freq >= 2 and best_num in valid:
-                return best_num
+            if freq >= 2 and best_num in valid: return best_num
 
-    # Fallback: Most common in family
     family_nums = [n for n in nums[-20:] if n in valid]
-    if family_nums:
-        return Counter(family_nums).most_common(1)[0][0]
-        
+    if family_nums: return Counter(family_nums).most_common(1)[0][0]
     return random.choice(valid)
 
 # ============================================================
-# API FETCHING & FORMATTING
+# API & FORMATTING
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
     if payload is None: return []
@@ -607,7 +554,7 @@ async def worker_loop(app, session):
             log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
 
-async def health_check(request): return web.Response(text="FTW V23 is Running")
+async def health_check(request): return web.Response(text="FTW V26 is Running")
 
 async def main():
     CFG.validate()
