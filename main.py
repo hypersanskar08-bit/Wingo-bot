@@ -1,23 +1,13 @@
 """
-FTW V47 FULL CODE
-=================
-Ultra-deep predictive engine with:
-- exact section pattern tracking
-- no midpoint / half-run matching
-- run exhaustion + trend fatigue + reversal logic
-- momentum decay & dominance check
-- anti-bias / opposite-side protection
-- strong fallback model + weighted walk-forward consensus
-- Telegram-ready + console-safe fallback
-
-Important:
-- This is not a guaranteed win engine.
-- It is a much stronger decision system designed to reduce bad bets by combining:
-  1) exact section pattern matching
-  2) long-run fatigue + reversal detection
-  3) AI/hybrid signal
-  4) recovery / anti-bias logic
-  5) walk-forward scoring
+FTW V47.1 FULL CODE
+==================
+Updated:
+- pattern length = 5..15
+- exact section tracking only
+- long run fatigue + reversal logic
+- walk-forward fallback
+- play_ready gate for best timing
+- Telegram ready + console fallback
 """
 
 import asyncio
@@ -53,12 +43,12 @@ class Config:
         "API_URLS",
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_v47.db")
-    cache_file: str = "ftw_v47_cache.json"
+    db_path: str = os.environ.get("DB_PATH", "ftw_v471.db")
+    cache_file: str = "ftw_v471_cache.json"
     log_dir: str = "logs"
     fetch_every: float = 1.0
     timeout: float = 15.0
-    bot_name: str = "FTW V47 ENGINE"
+    bot_name: str = "FTW V47.1 ENGINE"
     min_history: int = 8
     recent_limit: int = 12
     max_history_window: int = 1000
@@ -94,12 +84,12 @@ def setup_logging():
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     root.addHandler(sh)
-    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v47.log", maxBytes=1_000_000, backupCount=3)
+    fh = RotatingFileHandler(Path(CFG.log_dir) / "ftw_v471.log", maxBytes=1_000_000, backupCount=3)
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
 setup_logging()
-log = logging.getLogger("ftw_v47")
+log = logging.getLogger("ftw_v471")
 
 
 def h(x: Any) -> str:
@@ -285,7 +275,7 @@ STORE = Storage(CFG.db_path)
 
 
 # ============================================================
-# REFERENCE MODELS
+# REGIME
 # ============================================================
 class RegimeDetector:
     def alternation_score(self, seq: List[int], window: int = 12) -> float:
@@ -323,7 +313,7 @@ REGIME = RegimeDetector()
 
 
 # ============================================================
-# EXACT SECTION PATTERN DETECTION
+# SECTION PATTERN MATCHING
 # ============================================================
 def split_sections(seq: List[int]) -> List[Tuple[int, int]]:
     if not seq:
@@ -343,7 +333,7 @@ def split_sections(seq: List[int]) -> List[Tuple[int, int]]:
     return sections
 
 
-def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: int = 6) -> Optional[Dict[str, Any]]:
+def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: int = 15) -> Optional[Dict[str, Any]]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
     if len(seq) < 6:
         return None
@@ -355,7 +345,8 @@ def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: 
 
     candidates = []
 
-    for section_count in range(2, min(max_section_count, total_sections) + 1):
+    # pattern length 5..15
+    for section_count in range(5, min(max_section_count, total_sections) + 1):
         tail = current_signature[-section_count:]
 
         next_counts = defaultdict(int)
@@ -373,7 +364,7 @@ def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: 
         if matches == 0:
             continue
 
-        if section_count >= 4 and matches < 5:
+        if section_count >= 10 and matches < 5:
             continue
 
         next_key, next_count = max(next_counts.items(), key=lambda kv: kv[1]) if next_counts else (None, 0)
@@ -432,7 +423,7 @@ def exact_section_match_score(history: List[Dict[str, Any]], max_section_count: 
 
 
 # ============================================================
-# RUN FATIGUE / DOMINANCE / REVERSAL
+# RUN FATIGUE / REVERSAL / DOMINANCE
 # ============================================================
 def dominant_side_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(history) < 8:
@@ -443,7 +434,6 @@ def dominant_side_signal(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
     recent = seq[-12:]
     share_current = sum(1 for v in recent if v == current) / len(recent)
 
-    # momentum decay
     last3 = seq[-3:]
     prev3 = seq[-6:-3]
     if len(last3) == 3 and len(prev3) == 3:
@@ -484,14 +474,12 @@ def forced_recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str
     big_share = sum(1 for v in recent if v == 1) / len(recent)
     small_share = sum(1 for v in recent if v == 0) / len(recent)
 
-    # if same side keeps dominating but continuation weak => reverse
     if trailing_run(seq) >= 5:
         if current == 1 and big_share >= 0.75:
-            return {"size": "SMALL", "logic": "LONG BIG RUN FATIGUE", "confidence": 0.9, "stake": "2x"}
+            return {"size": "SMALL", "logic": "LONG BIG RUN FATIGUE", "confidence": 0.90, "stake": "2x"}
         if current == 0 and small_share >= 0.75:
-            return {"size": "BIG", "logic": "LONG SMALL RUN FATIGUE", "confidence": 0.9, "stake": "2x"}
+            return {"size": "BIG", "logic": "LONG SMALL RUN FATIGUE", "confidence": 0.90, "stake": "2x"}
 
-    # if a side is too dominant but last few steps are fading
     if len(seq) >= 8:
         last3 = seq[-3:]
         prev3 = seq[-6:-3]
@@ -506,9 +494,9 @@ def forced_recovery_override(history: List[Dict[str, Any]]) -> Optional[Dict[str
 
 
 # ============================================================
-# HYBRID FALLBACK MODEL
+# HYBRID MODEL
 # ============================================================
-class SizeModelV47:
+class SizeModelV471:
     def __init__(self):
         self.weights = {
             "recent_size": 1.2,
@@ -653,7 +641,7 @@ class SizeModelV47:
 
         return pred, clamp(prob, 0.50, 0.94), feats
 
-SIZE_MODEL = SizeModelV47()
+SIZE_MODEL = SizeModelV471()
 
 
 # ============================================================
@@ -774,9 +762,9 @@ def choose_number_for_size(size: str, history: List[Dict[str, Any]]) -> int:
 
 
 # ============================================================
-# FINAL DECISION ENGINE
+# FINAL ENGINE
 # ============================================================
-def weighted_ensemble_v47(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def weighted_ensemble_v471(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [int(x["size"]) for x in history if "size" in x and x["size"] in (0, 1)]
 
     if len(seq) < CFG.min_history:
@@ -785,52 +773,51 @@ def weighted_ensemble_v47(history: List[Dict[str, Any]]) -> Dict[str, Any]:
             "logic": "WARM-UP",
             "confidence": 0.50,
             "stake": "0.5x",
-            "pattern_catalog": []
+            "pattern_catalog": [],
+            "play_ready": False
         }
 
-    section_match = exact_section_match_score(history, max_section_count=6)
-    section_side = None
-    section_conf = 0.0
+    section_match = exact_section_match_score(history, max_section_count=15)
+    pattern_catalog = []
     if section_match:
-        if section_match.get("opposite_fallback"):
-            section_side = section_match["next_side"]
-            section_conf = 0.60
-        else:
-            section_side = section_match["next_side"]
-            section_conf = clamp(section_match["win_rate"] / 100.0, 0.50, 0.92)
+        pattern_catalog.append(section_match)
 
-    run_fatigue = dominant_side_signal(history)
-    recovery = forced_recovery_override(history)
-
-    ai_side, ai_prob, _ = SIZE_MODEL.score(seq)
+    ai_size, ai_prob, _ = SIZE_MODEL.score(seq)
     fallback = hybrid_fallback(history)
 
+    strong_reversal = forced_recovery_override(history)
+    fatigue_signal = dominant_side_signal(history)
+
+    if strong_reversal:
+        return {
+            "size": strong_reversal["size"],
+            "logic": strong_reversal["logic"],
+            "confidence": strong_reversal["confidence"],
+            "stake": strong_reversal["stake"],
+            "pattern_catalog": pattern_catalog,
+            "play_ready": True
+        }
+
+    if fatigue_signal:
+        return {
+            "size": fatigue_signal["size"],
+            "logic": fatigue_signal["logic"],
+            "confidence": fatigue_signal["confidence"],
+            "stake": fatigue_signal["stake"],
+            "pattern_catalog": pattern_catalog,
+            "play_ready": True
+        }
+
     candidates = [
-        ("ai", ai_side, ai_prob),
+        ("ai", ai_size, ai_prob),
         ("fallback", fallback["size"], fallback["confidence"]),
     ]
 
-    if section_side is not None:
-        candidates.append(("section", section_side, section_conf))
-
-    if recovery:
-        return {
-            "size": recovery["size"],
-            "logic": recovery["logic"],
-            "confidence": recovery["confidence"],
-            "stake": recovery["stake"],
-            "pattern_catalog": [] if not section_match else [section_match]
-        }
-
-    if run_fatigue:
-        # If long run has exhaustion signal, this should override most things
-        return {
-            "size": run_fatigue["size"],
-            "logic": run_fatigue["logic"],
-            "confidence": run_fatigue["confidence"],
-            "stake": run_fatigue["stake"],
-            "pattern_catalog": [] if not section_match else [section_match]
-        }
+    if section_match:
+        if section_match.get("opposite_fallback"):
+            candidates.append(("section", section_match["next_side"], 0.60))
+        else:
+            candidates.append(("section", section_match["next_side"], clamp(section_match["win_rate"] / 100.0, 0.50, 0.92)))
 
     size_votes = Counter()
     conf_votes = defaultdict(float)
@@ -843,27 +830,37 @@ def weighted_ensemble_v47(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         final_conf = conf_votes.get(final_size, 0.0) / max(1, size_votes[final_size])
         logic = "MULTI-ENGINE CONSENSUS"
     else:
-        final_size = ai_side
+        final_size = ai_size
         final_conf = clamp(ai_prob, 0.50, 0.80)
         logic = "AI SAFE MODE"
 
-    # If section match strongly supports opposite side to ai, allow override
-    if section_side is not None and section_side != final_size:
-        if section_conf >= 0.72:
-            final_size = section_side
-            final_conf = section_conf
-            logic = "SECTION OVERRIDE"
+    if section_match and section_match.get("next_side") and section_match.get("valid"):
+        if section_match["next_side"] != final_size and section_match["win_rate"] >= 75:
+            final_size = section_match["next_side"]
+            final_conf = section_match["win_rate"] / 100.0
+            logic = "STRONG SECTION OVERRIDE"
 
     final_size = bias_guard(final_size, history)
     final_conf = clamp(final_conf, 0.50, 0.95)
     stake = "3x" if final_conf >= 0.85 else "2x" if final_conf >= 0.72 else "1x" if final_conf >= 0.60 else "0.5x"
+
+    play_ready = (
+        final_conf >= 0.70 and
+        (
+            (strong_reversal is not None) or
+            (fatigue_signal is not None) or
+            (section_match is not None and section_match.get("valid")) or
+            (section_match is not None and section_match.get("win_rate", 0) >= 75)
+        )
+    )
 
     return {
         "size": final_size,
         "logic": logic,
         "confidence": final_conf,
         "stake": stake,
-        "pattern_catalog": [] if not section_match else [section_match]
+        "pattern_catalog": pattern_catalog,
+        "play_ready": play_ready
     }
 
 
@@ -899,11 +896,11 @@ def generate_prediction() -> Dict[str, Any]:
             "raw_conf": 50,
             "logic": "WARM-UP",
             "stake": "0.5x",
-            "details": {"regime": "neutral"}
+            "details": {"regime": "neutral", "play_ready": False}
         }
 
     history = STATE.history[-2000:]
-    engine = weighted_ensemble_v47(history)
+    engine = weighted_ensemble_v471(history)
     final_size = engine["size"]
     final_num = choose_number_for_size(final_size, history)
     issue = str(max([normalize_issue(x["issue"]) for x in history if normalize_issue(x["issue"]) is not None], default=0) + 1)
@@ -924,6 +921,7 @@ def generate_prediction() -> Dict[str, Any]:
             "pattern_catalog": engine.get("pattern_catalog", []),
             "walk_forward": walk_score,
             "targets": target_break,
+            "play_ready": engine.get("play_ready", False),
             "run_fatigue": dominant_side_signal(history),
             "recovery": forced_recovery_override(history),
         }
@@ -1057,6 +1055,9 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 
     pattern_block = "\n".join(pattern_lines) if pattern_lines else "No mined pattern found"
 
+    can_play = pred.get("details", {}).get("play_ready", False)
+    timing_text = "✅ BEST TIMING" if can_play else "⏸️ SKIP"
+
     return f"""
 📌 <b>Period</b>: <code>{h(pred['issue'])}</code>
 📊 <b>Target Size</b>: <b>{h(pred['size'])}</b>
@@ -1064,7 +1065,8 @@ def format_prediction(pred: Dict[str, Any], recent_rows):
 
 🧠 <b>Engine</b>: {h(pred.get('logic', 'N/A'))}
 📊 <b>Confidence</b>: <b>{pred['raw_conf']}%</b>
-💰 <b>Stake</b>: <b>{h(pred['stake'])}</b>{target_text}
+💰 <b>Stake</b>: <b>{h(pred['stake'])}</b>
+⏱️ <b>Timing</b>: {timing_text}{target_text}
 
 ━━ Section Pattern Catalog ━━
 {pattern_block}
@@ -1163,7 +1165,7 @@ async def worker_loop(app, session):
 # WEB SERVER
 # ============================================================
 async def health_check(request):
-    return web.Response(text="FTW V47 is Running")
+    return web.Response(text="FTW V47.1 is Running")
 
 async def start_server():
     app = web.Application()
@@ -1174,6 +1176,7 @@ async def start_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     log.info("Web server started on port %s", port)
+
 
 # ============================================================
 # MAIN
