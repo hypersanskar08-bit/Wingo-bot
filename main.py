@@ -47,7 +47,7 @@ class Config:
     max_pattern: int = 12
     round_seconds: float = 60.0
     delivery_ttl: float = 40.0
-    name: str = "FTW ADAPTIVE PATTERN"
+    name: str = "FTW VIP PREDICTOR" # Thoda naam bhi VIP kar diya
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
@@ -478,8 +478,6 @@ class Engine:
         p = (30 * p_raw + successes) / (30 + n)
         p = clip(p)
 
-        reasons = ["SIGNAL GENERATED"]
-        
         pred_side = "BIG" if p >= 0.5 else "SMALL"
         pred_num = random.randint(5, 9) if pred_side == "BIG" else random.randint(0, 4)
 
@@ -491,7 +489,7 @@ class Engine:
             "side": pred_side,
             "num": pred_num,
             "action": "SIGNAL",
-            "reasons": reasons,
+            "reasons": ["SIGNAL GENERATED"],
             "regime": current_regime,
             "experts": experts,
             "patterns": [
@@ -570,13 +568,16 @@ class Engine:
                     self.db.set("cooldown", CFG.cooldown_rounds)
                     self.db.set("loss_streak", 0)
 
-                # 🚀 CHANGE: Sirf Emoji Bhejna Hai (Win = 🏆, Loss = ❌)
-                result_emoji = "🏆" if won else "❌"
+                # 🚀 CHANGE: Jackpot Style Emoji Message for Win/Loss
+                if won:
+                    result_text = "🎰💰 <b>JACKPOT WIN!</b> 💰🎰"
+                else:
+                    result_text = "❌ <b>LOSS</b>"
                 
                 self.db.queue(
                     "result",
                     row["issue"],
-                    result_emoji,  # Yahan sirf emoji ja raha hai
+                    result_text, 
                 )
 
                 self.db.set("stats", stats)
@@ -590,21 +591,31 @@ class Engine:
 
 def format_prediction(p):
     selected_probability = max(p["p"], 1 - p["p"])
-    pattern_text = "\n".join(
-        f"{escape(x['key'])} | samples={x['support']}"
-        for x in p["patterns"][:3]
-    ) or "No sufficiently supported exact pattern"
+    conf_percent = selected_probability * 100
+    
+    # Progress Bar (10 blocks)
+    filled = int(conf_percent // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    
+    # Target Color Emoji
+    color_emoji = "🔴" if p['side'] == "BIG" else "🔵"
+    
+    # Quality & Stake based on Confidence
+    if conf_percent >= 65:
+        quality = "🔥 HIGH VIP (Stake: 1x)"
+    elif conf_percent >= 60:
+        quality = "⭐ VIP (Stake: 1x)"
+    else:
+        quality = "✅ NORMAL (Stake: 0.5x)"
 
     return (
-        f"<b>{escape(CFG.name)}</b>\n"
-        f"Period: <code>{escape(p['issue'])}</code>\n"
-        f"Target Size: <b>{p['side']}</b>\n"
-        f"Target No: <code>{p.get('num', '')}</code>\n"
-        f"Estimated probability: {selected_probability:.1%}\n"
-        f"Regime: {p['regime']}\n"
-        f"Disagreement: {p['disagreement']:.3f}\n\n"
-        f"<b>Pattern miner</b>\n{pattern_text}\n\n"
-        "<i>Experimental estimate, not a guaranteed win rate.</i>"
+        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
+        f"──────────────────\n"
+        f"🎯 <b>TARGET:</b> {color_emoji} <b>{p['side']}</b>  [ <code>{p.get('num', '')}</code> ]\n"
+        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
+        f"📊 <b>CONFIDENCE:</b> {conf_percent:.1f}% [{bar}]\n"
+        f"🏆 <b>QUALITY:</b> {quality}\n"
+        f"──────────────────"
     )
 
 
@@ -741,7 +752,7 @@ class Runtime:
                     json={
                         "chat_id": CFG.chat,
                         "text": row["text"],
-                        # Telegram API automatically sends large emojis if it's the only character
+                        "parse_mode": "HTML" # Added HTML parsing for bold/formatting
                     },
                 ) as response:
                     data = await response.json(content_type=None)
