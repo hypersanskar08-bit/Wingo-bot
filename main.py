@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V6)
+# bot.py — FTW VIP PREDICTOR (HYPER V7)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -31,19 +31,19 @@ class Config:
     urls: tuple = tuple(
         x.strip() for x in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000").split(",") if x.strip()
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v6.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v7.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "10"))
+    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "2"))
     loss_limit: int = 3
     learning_rate: float = 0.035
     meta_lr: float = 0.03
     decay: float = 0.985
-    max_pattern: int = 10
+    max_pattern: int = 15   # UPGRADED: 15 length tak
     delivery_ttl: float = 40.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
 
@@ -277,9 +277,9 @@ class Engine:
         candidates = {}
         def weight(idx): return 0.5 ** ((n - 1 - idx) / 300.0)
 
-        # Exact
-        for length in range(2, CFG.max_pattern + 1):
-            if n < length * 3: break
+        # 1. Exact Matches (Length 5 to 15)
+        for length in range(5, CFG.max_pattern + 1):
+            if n < length * 2: continue
             suffix = tuple(seq[-length:])
             obs, last = [], -length - 1
             for i in range(length, n - length):
@@ -292,28 +292,9 @@ class Engine:
                     key = f"exact:{bits}"
                     candidates[key] = (abs(p - 0.5) * math.sqrt(eff_n), p, len(obs), eff_n, key)
 
-        # Skip-gram
-        for length in range(5, min(9, CFG.max_pattern + 1)):
-            if n < length * 3: continue
-            for gap in range(length - 1):
-                suffix_items = tuple(x for i, x in enumerate(seq[-length:]) if i != gap)
-                obs, last = [], -length - 1
-                for i in range(length, n - length):
-                    cand = tuple(x for j, x in enumerate(seq[i - length:i]) if j != gap)
-                    if cand == suffix_items and i - last >= length + 1:
-                        obs.append((seq[i], weight(i) * 0.9)); last = i
-                if len(obs) >= CFG.min_support + 3:
-                    p, eff_n = weighted_probability(obs)
-                    if eff_n >= (CFG.min_support + 3) * 0.5:
-                        bits = "".join("B" if x else "S" for x in suffix_items)
-                        key = f"gap{gap}:{bits}"
-                        rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.85
-                        if key not in candidates or candidates[key][0] < rank:
-                            candidates[key] = (rank, p, len(obs), eff_n, key)
-
-        # Mismatch
-        for length in range(6, min(9, CFG.max_pattern + 1)):
-            if n < length * 3: continue
+        # 2. Mismatch Matches (Length 5 to 10, Hamming <= 1)
+        for length in range(5, 11):
+            if n < length * 2: continue
             suffix = tuple(seq[-length:])
             obs, last = [], -length - 1
             for i in range(length, n - length):
@@ -321,12 +302,51 @@ class Engine:
                 mm = sum(a != b for a, b in zip(window, suffix))
                 if mm <= 1 and i - last >= length + 1:
                     obs.append((seq[i], weight(i) * (1.0 if mm == 0 else 0.55))); last = i
+            if len(obs) >= CFG.min_support + 2:
+                p, eff_n = weighted_probability(obs)
+                if eff_n >= (CFG.min_support + 2) * 0.5:
+                    bits = "".join("B" if x else "S" for x in suffix)
+                    key = f"mm1:{bits}"
+                    rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.85
+                    if key not in candidates or candidates[key][0] < rank:
+                        candidates[key] = (rank, p, len(obs), eff_n, key)
+
+        # 3. Skip-gram Matches (Length 5 to 12, Gaps 1-3)
+        for length in range(5, 13):
+            if n < length * 2: continue
+            for gap in range(1, min(4, length - 1)):
+                suffix_items = tuple(x for i, x in enumerate(seq[-length:]) if i != gap)
+                obs, last = [], -length - 1
+                for i in range(length, n - length):
+                    cand = tuple(x for j, x in enumerate(seq[i - length:i]) if j != gap)
+                    if cand == suffix_items and i - last >= length + 1:
+                        obs.append((seq[i], weight(i) * 0.9)); last = i
+                if len(obs) >= CFG.min_support + 2:
+                    p, eff_n = weighted_probability(obs)
+                    if eff_n >= (CFG.min_support + 2) * 0.5:
+                        bits = "".join("B" if x else "S" for x in suffix_items)
+                        key = f"gap{gap}:{bits}"
+                        rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.8
+                        if key not in candidates or candidates[key][0] < rank:
+                            candidates[key] = (rank, p, len(obs), eff_n, key)
+
+        # 4. Delta/Transition Patterns (Length 4 to 10) — B B S becomes 0 1
+        for length in range(4, min(11, CFG.max_pattern)):
+            if n < length * 2: continue
+            raw_suffix = seq[-length:]
+            delta_suffix = tuple(1 if raw_suffix[i] != raw_suffix[i-1] else 0 for i in range(1, length))
+            obs, last = [], -length - 1
+            for i in range(length, n - length):
+                raw_win = seq[i - length:i]
+                delta_win = tuple(1 if raw_win[j] != raw_win[j-1] else 0 for j in range(1, length))
+                if delta_win == delta_suffix and i - last >= length + 1:
+                    obs.append((seq[i], weight(i) * 0.85)); last = i
             if len(obs) >= CFG.min_support + 3:
                 p, eff_n = weighted_probability(obs)
                 if eff_n >= (CFG.min_support + 3) * 0.5:
-                    bits = "".join("B" if x else "S" for x in suffix)
-                    key = f"mm1:{bits}"
-                    rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.75
+                    bits = "".join(str(x) for x in delta_suffix)
+                    key = f"delta:{bits}"
+                    rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.9
                     if key not in candidates or candidates[key][0] < rank:
                         candidates[key] = (rank, p, len(obs), eff_n, key)
 
@@ -425,7 +445,6 @@ class Engine:
                  0.30 * (recent_c.get(n, 0) / len(nums[-100:]) if nums else 0))
             scores[n] = s
         pred_num = max(scores, key=scores.get) if scores and max(scores.values()) > 0 else random.choice(valid_nums)
-        alts = sorted([n for n, sc in scores.items() if n != pred_num], key=lambda x: -scores[x])[:3]
 
         # Trend Shift Detection
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
@@ -435,13 +454,22 @@ class Engine:
         pat_str = "None"
         if patterns:
             top_p = patterns[0]
+            p_type = top_p[4].split(":")[0]
             bits = top_p[4].split(":")[-1]
             arrow = "⬆️" if top_p[1] >= 0.5 else "⬇️"
-            pat_str = f"<code>{bits}</code> {arrow}"
+            
+            if p_type == "delta":
+                pat_str = f"Δ <code>{bits}</code> {arrow}"
+            elif p_type.startswith("gap"):
+                pat_str = f"Skip <code>{bits}</code> {arrow}"
+            elif p_type == "mm1":
+                pat_str = f"~ <code>{bits}</code> {arrow}"
+            else:
+                pat_str = f"<code>{bits}</code> {arrow}"
 
         return {
             "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
-            "num": pred_num, "alts": alts, "regime": current_regime,
+            "num": pred_num, "regime": current_regime,
             "trend_shift": trend_shift, "pattern_str": pat_str,
             "experts": experts, "features": features, "meta_feats": m_feats,
             "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
@@ -490,10 +518,25 @@ class Engine:
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
                 self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
 
-                # Result Emoji Sequence
-                if won_side and won_num: emoji = "🎰🎰🎰 <b>JACKPOT</b>"
-                elif won_side: emoji = "🏆 <b>WIN</b>"
-                else: emoji = "❌ <b>LOSS</b>"
+                # BADA EMOJI SEQUENCE
+                if won_side and won_num: 
+                    emoji = (
+                        "🎰 🎰 🎰\n"
+                        "💎 <b>JACKPOT</b> 💎\n"
+                        "🎰 🎰 🎰"
+                    )
+                elif won_side: 
+                    emoji = (
+                        "🏆 🏆 🏆\n"
+                        "🔥 <b>WIN</b> 🔥\n"
+                        "🏆 🏆 🏆"
+                    )
+                else: 
+                    emoji = (
+                        "❌ ❌ ❌\n"
+                        "💀 <b>LOSS</b> 💀\n"
+                        "❌ ❌ ❌"
+                    )
                 
                 self.db.queue("result", row["issue"], emoji)
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
@@ -513,13 +556,11 @@ def format_prediction(p):
     
     shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") else ""
-    alts = " • ".join(str(x) for x in p.get("alts", []))
 
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🎯 <b>TARGET:</b> {color} <b>{side}</b> → <code>{p['num']}</code>\n"
-        f"🎲 <b>ALT:</b> <code>{alts}</code>\n"
         f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
@@ -576,7 +617,6 @@ class Runtime:
                 seen = self.db.get("latest_seen")
                 self.db.set("latest_seen", latest)
 
-                # Always generate for next period if we have enough history
                 if len(history) >= CFG.min_history:
                     issue = str(latest + 1)
                     exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
@@ -598,10 +638,9 @@ class Runtime:
         endpoint = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
         backoff = 1.0
         while not self.stop.is_set():
-            # EXPIRED messages clear
             self.db.c.execute("UPDATE outbox SET sent=2 WHERE sent=0 AND expires <= ?", (time.time(),))
             
-            # SEQUENTIAL ORDER: strict id ASC (which means Result(X) then Prediction(X+1))
+            # STRICT SEQUENCE: id ASC ensures Result (id=X) goes before Prediction (id=X+1)
             row = self.db.c.execute("SELECT * FROM outbox WHERE sent=0 ORDER BY id ASC LIMIT 1").fetchone()
             if not row:
                 await self.pause(0.5)
@@ -660,7 +699,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V6 Predictor Started")
+            LOG.info("HYPER V7 Predictor Started")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
