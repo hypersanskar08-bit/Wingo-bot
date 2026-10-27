@@ -37,7 +37,7 @@ class Config:
     min_history: int = 8
     recent_limit: int = 12
     max_history: int = 1000
-    min_repeat: int = 5
+    min_repeat: int = 3 # UPGRADE: 5 se 3 kiya gaya hai taaki patterns jaldi mile
 
     def parse_chat_id(self):
         raw = self.chat_id_raw.strip()
@@ -143,28 +143,15 @@ def ratio_big(seq: List[int], window: int = 20) -> float:
     arr = seq[-window:]
     return sum(arr) / max(1, len(arr))
 
-def block_pattern(seq: List[int], window: int = 10) -> bool:
-    if len(seq) < 4:
-        return False
-    arr = seq[-window:]
-    for i in range(len(arr) - 3):
-        a, b, c, d = arr[i:i + 4]
-        if a == b and c == d and a != c:
-            return True
-    return False
-
 def detect_regime(seq: List[int]) -> str:
     if len(seq) < 8:
         return "COLD"
     run = trailing_run(seq)
     alt = alternating_score(seq, 10)
-    bp = block_pattern(seq, 10)
     ratio = ratio_big(seq, 10)
 
     if alt >= 0.65:
         return "ALTERNATING"
-    if bp:
-        return "BLOCK"
     if run >= 5:
         return "TREND"
     if run >= 3:
@@ -180,14 +167,12 @@ def signal_strength(history: List[Dict[str, Any]]) -> float:
     regime = detect_regime(seq)
     run = trailing_run(seq)
     alt = alternating_score(seq, 12)
-    bp = block_pattern(seq, 10)
     ratio = ratio_big(seq, 20)
 
     s = 0.0
     if regime == "TRAP": s += 0.35
     if regime == "TREND": s += 0.25
     if regime == "ALTERNATING": s += 0.30
-    if bp: s += 0.20
     if run >= 3: s += 0.25
     if abs(ratio - 0.5) > 0.18: s += 0.15
     if alt >= 0.6: s += 0.15
@@ -268,17 +253,6 @@ class Storage:
                     last_seen REAL DEFAULT 0
                 )
             """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS pattern_stats (
-                    pattern_key TEXT PRIMARY KEY,
-                    hit_count INTEGER DEFAULT 0,
-                    miss_count INTEGER DEFAULT 0,
-                    last_seen REAL DEFAULT 0,
-                    support REAL DEFAULT 0,
-                    confidence REAL DEFAULT 0
-                )
-            """)
-            # NAYA TABLE PATTERN MEMORY KE LIYE
             c.execute("""
                 CREATE TABLE IF NOT EXISTS pattern_memory (
                     pattern_key TEXT PRIMARY KEY,
@@ -391,7 +365,6 @@ class Storage:
                     fail_streak=excluded.fail_streak, penalty=excluded.penalty, last_seen=excluded.last_seen
             """, (pattern_key, fail_streak, penalty, now))
 
-    # NAYA TRACKING METHODS
     def get_pattern_memory(self, key: str) -> Dict[str, Any]:
         with self._conn() as c:
             row = c.execute("""
@@ -411,11 +384,11 @@ class Storage:
 
         if won:
             consec = 0
-            is_flipped = False # Jeet gaya toh wapas Normal
+            is_flipped = False
         else:
             consec += 1
             if consec >= 2:
-                is_flipped = True # 2 baar lagatar fail = FLIP
+                is_flipped = True
 
         with self._conn() as c:
             c.execute("""
@@ -434,16 +407,10 @@ STORE = Storage(CFG.db_path)
 # BLOCK EXTRACTION & MATCHING LOGIC
 # ============================================================
 def get_block_candidates(seq_str: str, min_len: int = 5, max_len: int = 16) -> List[str]:
-    # seq_str format: [Oldest] ... [Newest]
-    # Example: "BBSSSBBS" (BB oldest hai, S newest hai)
-    if not seq_str:
-        return []
-        
-    # Step 1: Break into blocks (Left to Right = Oldest to Newest)
+    if not seq_str: return []
     blocks = []
     current_char = seq_str[0]
     current_len = 0
-    
     for c in seq_str:
         if c == current_char:
             current_len += 1
@@ -453,20 +420,16 @@ def get_block_candidates(seq_str: str, min_len: int = 5, max_len: int = 16) -> L
             current_len = 1
     blocks.append(current_char * current_len)
     
-    # Step 2: Drop oldest blocks one by one
     candidates = []
     for i in range(len(blocks)):
         candidate = "".join(blocks[i:])
-        # Length 5 se 16 ke beech honi chahiye
         if min_len <= len(candidate) <= max_len:
             candidates.append(candidate)
-            
     return candidates
 
 def exact_size_sequence(history: List[Dict[str, Any]]):
     seq = [1 if x["size"] == 1 else 0 for x in history[-CFG.max_history:]]
-    if len(seq) < 5:
-        return None
+    if len(seq) < 5: return None
 
     tail_str = "".join("B" if v == 1 else "S" for v in seq[-16:])
     candidates = get_block_candidates(tail_str, min_len=5, max_len=16)
@@ -475,7 +438,6 @@ def exact_size_sequence(history: List[Dict[str, Any]]):
         cand_seq = [1 if c == 'B' else 0 for c in cand]
         cand_len = len(cand_seq)
 
-        # History me match dhoondho (tail ko chhod kar)
         match_indices = []
         for i in range(len(seq) - cand_len):
             if seq[i:i+cand_len] == cand_seq:
@@ -483,14 +445,12 @@ def exact_size_sequence(history: List[Dict[str, Any]]):
 
         if len(match_indices) >= CFG.min_repeat:
             next_bits = [seq[i + cand_len] for i in match_indices if i + cand_len < len(seq)]
-            if not next_bits:
-                continue
+            if not next_bits: continue
 
             total = len(next_bits)
             raw_big = sum(next_bits)
             raw_small = total - raw_big
 
-            # Recency Weighting (Naye results ka weight zyada)
             decay = 0.85
             weights = [decay ** (total - 1 - k) for k in range(total)]
             w_big = sum(w for w, v in zip(weights, next_bits) if v == 1)
@@ -513,7 +473,6 @@ def exact_size_sequence(history: List[Dict[str, Any]]):
                 "pattern_key": cand,
             }
 
-            # FLIP LOGIC
             mem = STORE.get_pattern_memory(cand)
             if mem["is_flipped"]:
                 info["predicted_bit"] = 1 - predicted_bit_normal
@@ -524,7 +483,6 @@ def exact_size_sequence(history: List[Dict[str, Any]]):
                 
             info["predicted_side"] = "BIG" if info["predicted_bit"] == 1 else "SMALL"
             return info
-
     return None
 
 def family_value(num: int) -> Optional[int]:
@@ -532,11 +490,10 @@ def family_value(num: int) -> Optional[int]:
     if num in [0, 1, 2, 3, 4]: return 0
     return None
 
-def exact_family_sequence(history: List[Dict[str, Any]], min_len: int = 5):
+def exact_family_sequence(history: List[Dict[str, Any]]):
     seq = [family_value(x["num"]) for x in history[-CFG.max_history:]]
     seq = [x for x in seq if x is not None]
-    if len(seq) < 5:
-        return None
+    if len(seq) < 5: return None
 
     tail_str = "".join("B" if v == 1 else "S" for v in seq[-16:])
     candidates = get_block_candidates(tail_str, min_len=5, max_len=16)
@@ -552,8 +509,7 @@ def exact_family_sequence(history: List[Dict[str, Any]], min_len: int = 5):
 
         if len(match_indices) >= CFG.min_repeat:
             next_bits = [seq[i + cand_len] for i in match_indices if i + cand_len < len(seq)]
-            if not next_bits:
-                continue
+            if not next_bits: continue
 
             total = len(next_bits)
             raw_big = sum(next_bits)
@@ -581,7 +537,6 @@ def exact_family_sequence(history: List[Dict[str, Any]], min_len: int = 5):
                 "pattern_key": cand,
             }
 
-            # FLIP LOGIC
             mem = STORE.get_pattern_memory(cand)
             if mem["is_flipped"]:
                 info["predicted_bit"] = 1 - predicted_bit_normal
@@ -592,7 +547,6 @@ def exact_family_sequence(history: List[Dict[str, Any]], min_len: int = 5):
                 
             info["predicted_side"] = "BIG" if info["predicted_bit"] == 1 else "SMALL"
             return info
-
     return None
 
 def choose_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -621,16 +575,26 @@ def choose_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
                 "stake": "1x" if family["win_rate"] >= 0.72 else "0.5x",
                 "pattern_key": family["pattern_key"],
             }
-
     return None
 
 # ============================================================
-# FINAL ENSEMBLE
+# FINAL ENSEMBLE (TREND FOLLOW UPGRADE)
 # ============================================================
 def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = [x["size"] for x in history]
     if not seq:
         return {"size": "BIG", "logic": "EMPTY", "confidence": 0.55, "stake": "0.5x"}
+
+    # 🚀 UPGRADE: Agar lagatar 3 ya usse zyada same aa raha hai, toh TREND follow karo
+    run = trailing_run(seq)
+    if run >= 3:
+        last_side = "BIG" if seq[-1] == 1 else "SMALL"
+        return {
+            "size": last_side, 
+            "logic": f"TREND FOLLOW ({run}x)", 
+            "confidence": 0.60, 
+            "stake": "0.5x"
+        }
 
     bias = sum(seq) / len(seq)
     vol = volatility(seq, 20)
@@ -649,7 +613,7 @@ def hybrid_prediction(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     score = (markov * 0.36) + (bias * 0.28) + ((1.0 - min(vol, 1.0)) * 0.18) + 0.18
     size = "BIG" if score >= 0.5 else "SMALL"
     confidence = clamp(max(score, 1.0 - score), 0.55, 0.78)
-    return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "0.5x" if confidence < 0.68 else "1x"}
+    return {"size": size, "logic": "HYBRID FALLBACK", "confidence": confidence, "stake": "0.5x"}
 
 def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq_signal = choose_valid_pattern(history)
@@ -659,39 +623,51 @@ def weighted_ensemble(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     final_score = seq_signal["confidence"] if seq_signal else hybrid["confidence"]
     pattern_key = seq_signal["pattern_key"] if seq_signal else None
 
-    # FIX: recent_fail_count sahi tarike se DB se niklega
     recent = STORE.recent_outcomes(8)
     recent_fail_count = sum(1 for _, _, s in recent if "LOSS" in str(s))
 
-    if recent_fail_count >= 3:
+    # 2 Loss Rule: Confidence aur Stake kam karo
+    if recent_fail_count >= 2:
         final_conf = max(0.55, final_score * 0.75)
     else:
         final_conf = final_score
 
     logic = seq_signal["logic"] if seq_signal else "HYBRID + FALLBACK"
+    
+    if recent_fail_count >= 2:
+        final_stake = "0.5x"
+    else:
+        final_stake = "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.72 else "0.5x"
 
     return {
         "size": final_size,
         "logic": logic,
         "confidence": clamp(final_conf, 0.55, 0.94),
-        "stake": "2x" if final_conf >= 0.82 else "1x" if final_conf >= 0.72 else "0.5x",
+        "stake": final_stake,
         "pattern_key": pattern_key,
     }
 
 # ============================================================
-# PREDICTION BUILD
+# PREDICTION BUILD (COOLDOWN UPGRADE)
 # ============================================================
 def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any]:
     if len(history) < CFG.min_history:
         n = random.randint(0, 9)
         return {
+            "issue": str(issue), "type": "SIZE", "size": "BIG" if n >= 5 else "SMALL",
+            "num": n, "raw_conf": 50, "logic": "WARMING UP", "stake": "0.5x", "details": {}
+        }
+
+    # 🚀 UPGRADE: 2 Loss pe Cooldown (SKIP)
+    if STATE.loss_streak >= 2:
+        return {
             "issue": str(issue),
             "type": "SIZE",
-            "size": "BIG" if n >= 5 else "SMALL",
-            "num": n,
-            "raw_conf": 50,
-            "logic": "WARMING UP",
-            "stake": "0.5x",
+            "size": "SKIP", 
+            "num": 0,
+            "raw_conf": 0,
+            "logic": f"COOLDOWN (Loss Streak: {STATE.loss_streak})",
+            "stake": "0x",
             "details": {}
         }
 
@@ -701,19 +677,11 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
     pred_conf = ensemble["confidence"]
     pred_stake = ensemble["stake"]
 
-    recent = STORE.recent_outcomes(8)
-    recent_fail_count = sum(1 for _, _, s in recent if "LOSS" in str(s))
-
-    if recent_fail_count >= 3:
-        pred_conf = max(0.55, pred_conf * 0.75)
-        pred_stake = "0.5x" if pred_conf < 0.75 else "1x"
-
     # FIX: BIG me 5-9, SMALL me 0-4
     final_num = random.randint(5, 9) if pred_size == "BIG" else random.randint(0, 4)
-    final_issue = str(issue)
-
+    
     return {
-        "issue": final_issue,
+        "issue": str(issue),
         "type": "SIZE",
         "size": pred_size,
         "num": final_num,
@@ -732,12 +700,10 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
 # PARSE HISTORY / FETCH
 # ============================================================
 def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
-    if payload is None:
-        return []
+    if payload is None: return []
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict):
-        # FIX: Ab {"data": []} bhi parse hoga
         if isinstance(payload.get("data"), list):
             items = payload["data"]
         elif isinstance(payload.get("data"), dict):
@@ -750,27 +716,17 @@ def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
 
     out, seen = [], set()
     for item in items:
-        if not isinstance(item, dict):
-            continue
-
+        if not isinstance(item, dict): continue
         issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
-        if issue is None:
-            continue
-
+        if issue is None: continue
         num = safe_int(item.get("number", item.get("value", 0)), 0)
-        if not (0 <= num <= 9):
-            continue
+        if not (0 <= num <= 9): continue
 
         key = str(issue)
-        if key in seen:
-            continue
+        if key in seen: continue
         seen.add(key)
 
-        out.append({
-            "issue": key,
-            "num": num,
-            "size": 1 if num >= 5 else 0
-        })
+        out.append({"issue": key, "num": num, "size": 1 if num >= 5 else 0})
 
     out.sort(key=lambda x: int(x["issue"]))
     return out
@@ -779,8 +735,7 @@ async def fetch_history(session):
     for url in CFG.api_urls():
         try:
             async with session.get(url, timeout=CFG.request_timeout) as response:
-                if response.status != 200:
-                    continue
+                if response.status != 200: continue
                 parsed = parse_history_payload(await response.json(content_type=None))
                 if parsed:
                     STATE.history = parsed[-CFG.max_history:]
@@ -794,18 +749,15 @@ async def fetch_history(session):
 # FORMAT / SEND
 # ============================================================
 def normalize_recent_row(row: Any):
-    if not isinstance(row, (tuple, list)):
-        return "", "", "", ""
-    if len(row) >= 3:
-        return str(row[0]), str(row[1]), str(row[2]), ""
+    if not isinstance(row, (tuple, list)): return "", "", "", ""
+    if len(row) >= 3: return str(row[0]), str(row[1]), str(row[2]), ""
     return "", "", "", ""
 
 def format_prediction(pred: Dict[str, Any], recent_rows):
     recent_lines = []
     for r in recent_rows[-CFG.recent_limit:]:
         issue, size, status, _extra = normalize_recent_row(r)
-        if not issue:
-            continue
+        if not issue: continue
         recent_lines.append(
             f"➜ <code>{h(issue[-4:])}</code> {h(size)} → <b>{h(status)}</b>" if status else
             f"➜ <code>{h(issue[-4:])}</code> {h(size)}"
@@ -876,7 +828,6 @@ async def worker_loop(app, session):
                     details = res.get("details", {})
                     pattern_key = details.get("pattern_key") if isinstance(details, dict) else None
                     
-                    # PATTERN UPDATE
                     if pattern_key:
                         STORE.penalize_pattern(str(pattern_key), bool(res["win"]))
                         STORE.record_pattern_outcome(str(pattern_key), bool(res["win"]))
@@ -894,7 +845,15 @@ async def worker_loop(app, session):
                 if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
                     pred = build_prediction(STATE.history, next_issue)
                     
-                    # FIX: Purana bug theek kiya gaya hai. Ab pattern details overwrite nahi hongi.
+                    # 🚀 UPGRADE: SKIP handle karo
+                    if pred["size"] == "SKIP":
+                        skip_msg = f"⚠️ <b>COOLDOWN ACTIVE</b>\nLagatar {STATE.loss_streak} loss hue hain. Bot 1 period observe kar raha hai.\nPeriod: <code>{next_issue}</code>"
+                        await send_msg(app.bot, skip_msg)
+                        STATE.loss_streak = 0 # Cooldown complete hua, wapas try karega
+                        last_processed_issue = latest_issue
+                        await asyncio.sleep(CFG.fetch_every)
+                        continue
+                        
                     STORE.save_prediction({**pred, "type": "SIZE"})
                     await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
 
