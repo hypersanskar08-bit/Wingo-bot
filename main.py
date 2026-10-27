@@ -575,15 +575,15 @@ class Engine:
                     self.db.set("cooldown", CFG.cooldown_rounds)
                     self.db.set("loss_streak", 0)
 
-                # 🚀 CHANGE: Sabhi emojis bade size me dikhenge (sirf emoji bhejna hai)
+                # 🚀 CHANGE: Sabhi emojis bade size me dikhenge (sirf emoji bhejna hai, bina space ke)
                 if won_side and won_num:
-                    # Size aur Number dono win (Jackpot) - Bada 🪎
-                    result_text = "🪎" 
+                    # Size aur Number dono win (Jackpot) - 3 Slot Machines (Jumbo Size)
+                    result_text = "🎰🎰🎰" 
                 elif won_side:
-                    # Sirf Size win (Normal Win) - Bada 🏆
+                    # Sirf Size win (Normal Win) - Bada Trophy
                     result_text = "🏆" 
                 else:
-                    # Loss - Bada ❌
+                    # Loss - Bada Cross
                     result_text = "❌" 
                 
                 self.db.queue(
