@@ -3,6 +3,7 @@ import gc
 import html
 import json
 import logging
+import math
 import os
 import random
 import sqlite3
@@ -160,7 +161,6 @@ def ratio_big(seq: List[int], window: int = 20) -> float:
 def detect_regime(seq: List[int]) -> str:
     if len(seq) < 8:
         return "COLD"
-
     last10 = seq[-10:]
     run = trailing_run(seq)
     alt = sum(1 for i in range(1, len(last10)) if last10[i] != last10[i - 1]) / max(1, len(last10) - 1)
@@ -223,7 +223,6 @@ class BotState:
                         self.history = data[-CFG.max_history:]
         except Exception:
             pass
-
 
 STATE = BotState()
 
@@ -532,7 +531,6 @@ def choose_valid_pattern(history: List[Dict[str, Any]]) -> Optional[Dict[str, An
             }
     return None
 
-
 # ============================================================
 # TREND / MARKOV / FEATURE ENGINE
 # ============================================================
@@ -603,7 +601,6 @@ def score_size(history: List[Dict[str, Any]]) -> Tuple[float, str]:
     score = 0.0
     logic_parts = []
 
-    # trend continuation
     run = trailing_run(seq)
     if run >= 3:
         if seq[-1] == 1:
@@ -613,7 +610,6 @@ def score_size(history: List[Dict[str, Any]]) -> Tuple[float, str]:
             score -= 0.75
             logic_parts.append(f"trend-{run}")
 
-    # sma cross
     if len(seq) >= 20:
         sma5 = sum(seq[-5:]) / 5
         sma20 = sum(seq[-20:]) / 20
@@ -624,11 +620,9 @@ def score_size(history: List[Dict[str, Any]]) -> Tuple[float, str]:
             score -= 0.30
             logic_parts.append("SMA5<20")
 
-    # alternation / reversal
     last10 = seq[-10:]
     alt_ratio = sum(1 for i in range(1, len(last10)) if last10[i] != last10[i - 1]) / max(1, len(last10) - 1)
     if alt_ratio >= 0.65:
-        # alternating sequence often means reversal
         if seq[-1] == 1:
             score -= 0.20
             logic_parts.append("alt-reverse")
@@ -636,12 +630,10 @@ def score_size(history: List[Dict[str, Any]]) -> Tuple[float, str]:
             score += 0.20
             logic_parts.append("alt-follow")
 
-    # markov
     markov_prob, _ = advanced_markov(seq)
     score += (markov_prob - 0.5) * 1.40
     logic_parts.append(f"markov={markov_prob:.2f}")
 
-    # pattern / exact sequence
     if pattern:
         pside = pattern["size"]
         pconf = pattern["confidence"]
@@ -652,7 +644,6 @@ def score_size(history: List[Dict[str, Any]]) -> Tuple[float, str]:
             score -= (pconf - 0.5) * 1.6
             logic_parts.append(f"seq-small:{pattern['pattern_key'][:6]}")
 
-    # bias and volatility control
     ratio = features.get("ratio_10", 0.5)
     if ratio > 0.6:
         score += 0.15
@@ -664,7 +655,6 @@ def score_size(history: List[Dict[str, Any]]) -> Tuple[float, str]:
         score *= 0.85
         logic_parts.append("high-vol")
 
-    # regime adjustments
     if regime == "TREND":
         score += 0.1
     elif regime == "TRAP":
@@ -680,45 +670,45 @@ def score_size(history: List[Dict[str, Any]]) -> Tuple[float, str]:
 def exact_number_distribution(history: List[Dict[str, Any]], pred_size: str, regime: str) -> Dict[int, float]:
     entries = [x["num"] for x in history if isinstance(x, dict) and "num" in x and isinstance(x.get("num"), int)]
     if not entries:
-        base = {n: 0.1 for n in range(10)}
-        return base
+        return {n: 0.1 for n in range(10)}
 
-    recent = entries[-min(len(entries), 60):]
+    valid_nums = list(range(5, 10)) if pred_size == "BIG" else list(range(0, 5))
     weighted = defaultdict(float)
+    recent = entries[-min(len(entries), 60):]
+
     for idx, num in enumerate(recent):
+        if int(num) not in valid_nums:
+            continue
         weight = 1.0 + (idx / max(1, len(recent)))
         weighted[int(num)] += weight
 
-    # size preference
-    low, high = (5, 9) if pred_size == "BIG" else (0, 4)
-    for n in range(10):
-        if n < low or n > high:
-            weighted[n] *= 0.25
+    if not weighted:
+        for n in valid_nums:
+            weighted[n] = 1.0
 
-    # regime adjustment
     if regime == "ALTERNATING":
-        for n in range(10):
-            if n >= 5:
-                weighted[n] *= 1.2 if pred_size == "BIG" else 0.8
-            else:
-                weighted[n] *= 1.2 if pred_size == "SMALL" else 0.8
+        for n in valid_nums:
+            weighted[n] *= 1.2
     elif regime == "TREND":
         recent_values = recent[-8:]
         tail_bias = Counter(recent_values)
         for n, val in tail_bias.items():
-            weighted[n] *= 1.25 + (val * 0.1)
+            if n in valid_nums:
+                weighted[n] *= 1.25 + (val * 0.1)
 
     total = sum(weighted.values()) or 1.0
-    dist = {n: float(weighted.get(n, 0.0)) / total for n in range(10)}
+    dist = {n: float(weighted.get(n, 0.0)) / total for n in valid_nums}
     return dist
 
 def choose_number(distribution: Dict[int, float]) -> int:
     if not distribution:
         return random.randint(0, 9)
+
     items = list(distribution.items())
     total = sum(v for _, v in items)
     if total <= 0:
         return random.randint(0, 9)
+
     r = random.random() * total
     acc = 0.0
     for num, p in items:
@@ -728,7 +718,6 @@ def choose_number(distribution: Dict[int, float]) -> int:
     return int(items[-1][0])
 
 def calibrate_confidence(raw_conf: float, recent_accuracy: float) -> float:
-    # If recent accuracy is weak, reduce confidence
     if recent_accuracy < 0.35:
         return clamp(raw_conf * 0.68, 0.55, 0.78)
     if recent_accuracy < 0.45:
@@ -748,7 +737,6 @@ def calculate_stake(confidence: float, recent_accuracy: float, loss_streak: int)
         return "1x"
     return "0.5x"
 
-
 # ============================================================
 # PREDICTION BUILD
 # ============================================================
@@ -766,24 +754,48 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
             "details": {}
         }
 
+    seq = [x["size"] for x in history]
+    regime = detect_regime(seq)
+
     if STATE.loss_streak >= 2:
+        recent = seq[-8:]
+        recent_big = sum(recent) / max(1, len(recent))
+        fallback_size = "BIG" if recent_big >= 0.5 else "SMALL"
+
+        valid_range = list(range(5, 10)) if fallback_size == "BIG" else list(range(0, 5))
+        recent_nums = [x["num"] for x in history[-20:] if "num" in x]
+        if recent_nums:
+            valid_recent = [n for n in recent_nums if n in valid_range]
+            if valid_recent:
+                counts = Counter(valid_recent)
+                total = sum(counts.values()) or 1.0
+                probs = {k: v / total for k, v in counts.items()}
+                pred_num = choose_number(probs)
+            else:
+                pred_num = random.choice(valid_range)
+        else:
+            pred_num = random.choice(valid_range)
+
+        recent_accuracy = STORE.recent_accuracy(limit=20)
         return {
             "issue": str(issue),
             "type": "SIZE",
-            "size": "SKIP",
-            "num": 0,
-            "raw_conf": 0,
-            "logic": f"COOLDOWN (Loss Streak: {STATE.loss_streak})",
-            "stake": "0x",
-            "details": {}
+            "size": fallback_size,
+            "num": pred_num,
+            "raw_conf": 60,
+            "logic": f"COOLDOWN SAFE MODE (Loss Streak: {STATE.loss_streak})",
+            "stake": "0.5x",
+            "details": {
+                "signal_strength": signal_strength(history),
+                "regime": regime,
+                "fallback_mode": True,
+                "recent_accuracy": recent_accuracy,
+            }
         }
 
-    seq = [x["size"] for x in history]
-    regime = detect_regime(seq)
     size_prob, logic = score_size(history)
     pred_size = "BIG" if size_prob >= 0.5 else "SMALL"
 
-    # exact number distribution
     dist = exact_number_distribution(history, pred_size, regime)
     pred_num = choose_number(dist)
 
@@ -808,7 +820,6 @@ def build_prediction(history: List[Dict[str, Any]], issue: Any) -> Dict[str, Any
             "distribution": dist,
         }
     }
-
 
 # ============================================================
 # PARSE & FETCH
@@ -862,7 +873,6 @@ async def fetch_history(session):
         except Exception as e:
             log.warning("Fetch failed from %s: %s", url, e)
     return False
-
 
 # ============================================================
 # FORMAT / SEND
@@ -923,7 +933,6 @@ async def send_msg(bot, text: str, retries: int = 3):
             await asyncio.sleep(1)
     return False
 
-
 # ============================================================
 # WORKER LOOP
 # ============================================================
@@ -965,29 +974,7 @@ async def worker_loop(app, session):
                 if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
                     pred = build_prediction(STATE.history, next_issue)
 
-                    if pred["size"] == "SKIP":
-                        skip_msg = (
-                            f"⚠️ <b>COOLDOWN ACTIVE</b>\n"
-                            f"Lagatar {STATE.loss_streak} loss hue hain. Bot 1 period observe kar raha hai.\n"
-                            f"Period: <code>{next_issue}</code>"
-                        )
-                        await send_msg(app.bot, skip_msg)
-                        STATE.loss_streak = 0
-                        last_processed_issue = latest_issue
-                        await asyncio.sleep(CFG.fetch_every)
-                        continue
-
-                    if pred["raw_conf"] < 62:
-                        skip_msg = (
-                            f"⚠️ <b>LOW-CONFIDENCE SKIP</b>\n"
-                            f"Bot confidence kam hai, prediction avoid kiya gaya.\n"
-                            f"Period: <code>{next_issue}</code>"
-                        )
-                        await send_msg(app.bot, skip_msg)
-                        last_processed_issue = latest_issue
-                        await asyncio.sleep(CFG.fetch_every)
-                        continue
-
+                    # NO SKIP
                     STORE.save_prediction({**pred, "type": "SIZE"})
                     await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
                     last_processed_issue = latest_issue
@@ -997,7 +984,6 @@ async def worker_loop(app, session):
         except Exception as e:
             log.exception("Worker loop exception: %s", e)
             await asyncio.sleep(2)
-
 
 # ============================================================
 # WEB SERVER
@@ -1012,7 +998,6 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
     await site.start()
-
 
 # ============================================================
 # MAIN
@@ -1031,5 +1016,4 @@ async def main():
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    import math
     asyncio.run(main())
