@@ -45,7 +45,7 @@ class Config:
     chat: str = os.getenv("CHAT_ID", "-1004485961768")
     urls: tuple = tuple(
         x.strip()
-        for x in os.getenv("API_URLS", "").split(",")
+        for x in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1M-1000").split(",")
         if x.strip()
     )
     db_path: str = os.getenv("DB_PATH", "predictor_v2.db")
