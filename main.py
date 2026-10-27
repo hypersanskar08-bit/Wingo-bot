@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V7)
+# bot.py — FTW VIP PREDICTOR (HYPER V9 - Mind Reader)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -22,7 +22,7 @@ import aiohttp
 from aiohttp import web
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG
+# CONFIG (Stickers yahan set kar sakte ho)
 # ─────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Config:
@@ -31,24 +31,26 @@ class Config:
     urls: tuple = tuple(
         x.strip() for x in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000").split(",") if x.strip()
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v7.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v9.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
-    cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "2"))
-    loss_limit: int = 3
     learning_rate: float = 0.035
     meta_lr: float = 0.03
     decay: float = 0.985
-    max_pattern: int = 15   # UPGRADED: 15 length tak
+    max_pattern: int = 15   # Pattern length 5 to 15
     delivery_ttl: float = 40.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
+    
+    # ── STICKERS (Apne Telegram Sticker File IDs) ──
+    win_sticker: str = os.getenv("WIN_STICKER", "AAMCBQADGQEAAVbQjGrhCWKiJjLHf3FF7dqQvMa-pehKAAKODwACD8-AVzbn1gF3m2MGAQAHbQADPQQ") 
+    loss_sticker: str = os.getenv("LOSS_STICKER", "AAMCBQADGQEAAVbQlmrhCvhA9K2qJCPJKg_UNAy-wVlrAAJXHQACm2shVfq7O2zptuhwAQAHbQADPQQ")
+    jack_sticker: str = os.getenv("JACK_STICKER", "AAMCBQADGQEAAVbQimrhCUtsaBG7lHdMgiJJj_3PW427AAJLFAAC7XOBVyG9C9fn0qwcAQAHbQADPQQ")
 
-    def validate(self):
-        if not self.token or not self.chat or not self.urls:
+    def validate(selfself.token or not self.chat or not self.urls:
             raise ValueError("Set TELEGRAM_TOKEN, CHAT_ID and API_URLS.")
 
 CFG = Config()
@@ -79,15 +81,6 @@ def run_length(seq):
         if x != seq[-1]: break
         n += 1
     return n
-
-def entropy(seq):
-    if not seq: return 0.0
-    p1 = sum(seq) / len(seq)
-    p0 = 1.0 - p1
-    e = 0.0
-    if p0 > 0: e -= p0 * math.log2(p0)
-    if p1 > 0: e -= p1 * math.log2(p1)
-    return e
 
 def get_regime(seq):
     tail = seq[-24:]
@@ -173,7 +166,9 @@ def trend_features(seq):
         1.0, 2*mean(3)-1, 2*mean(5)-1, 2*mean(10)-1, 2*mean(24)-1, 2*mean(48)-1, 2*mean(96)-1,
         mean(3)-mean(10), mean(5)-mean(24), mean(10)-mean(48), signed_run, 2*seq[-1]-1,
         (2*alternation-1)*(2*seq[-1]-1), rsi_n, macd, (2*std(10)-1), (2*std(24)-1),
-        entropy(seq[-24:])-1, entropy(seq[-48:])-1, autocorr, 1.0 if mean(5)>0.5 else -1.0,
+        (sum(x * math.log2(x) for x in [sum(seq[-24:])/24, 1-(sum(seq[-24:])/24)] if x > 0) * -1) - 1,
+        (sum(x * math.log2(x) for x in [sum(seq[-48:])/48, 1-(sum(seq[-48:])/48)] if x > 0) * -1) - 1,
+        autocorr, 1.0 if mean(5)>0.5 else -1.0,
         (2*seq[-1]-1)*(2*mean(24)-1), abs(mean(24)-0.5)*2, (2*seq[-1]-1)*(mean(10)-mean(48)),
         (2*mean(10)-1)/(std(10)+0.1), (2*mean(24)-1)/(std(24)+0.1), (sum(seq[-10:])/10.0)-0.5,
         (sum(seq[-5:])/5.0)-0.5, (2*mean(5)-1)*(2*mean(24)-1), math.tanh((mean(10)-0.5)*6),
@@ -181,9 +176,7 @@ def trend_features(seq):
     ]
 
 EXPERT_NAMES = ["patterns", "markov1", "markov2", "markov3", "markov4", "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic"]
-
-def logistic(weights, features):
-    return sigmoid(sum(w * x for w, x in zip(weights, features)))
+def logistic(weights, features): return sigmoid(sum(w * x for w, x in zip(weights, features)))
 
 # ─────────────────────────────────────────────────────────────
 # DATABASE
@@ -249,15 +242,27 @@ class Database:
         m = self.memory(key)
         n = m["n"]
         if n < 1: return probability, 0.65, False
+        
         brier = m["loss"] / n
         inverse_brier = m["inverse_loss"] / n
-        flipped = (n >= 25 and inverse_brier + 0.04 < brier and inverse_brier < 0.245)
+        
+        # 🧠 MISTAKE FIXER: Agar model lagatar 2 baar fail hua hai, toh uski prediction ulte side kar do
+        flip_due_to_failures = (m["failures"] >= 2)
+        flip_due_to_loss = (n >= 25 and inverse_brier + 0.04 < brier and inverse_brier < 0.245)
+        
+        flipped = flip_due_to_failures or flip_due_to_loss
         effective_loss = inverse_brier if flipped else brier
         p = 1 - probability if flipped else probability
+
+        # 🪤 TRAP DETECTOR: Agar confidence bahut high hai par loss 0.22 se zyada hai, matlab trap hai
+        if p > 0.80 and effective_loss > 0.22: p = 0.5 - (p - 0.5) * 0.5 
+        elif p < 0.20 and effective_loss > 0.22: p = 0.5 + (0.5 - p) * 0.5
+
         reliability = clip((0.28 - effective_loss) / 0.08, 0.0, 1.0)
         maturity = min(n / 30.0, 1.0)
         shrink = (1 - maturity) * 0.65 + maturity * reliability
         p = 0.5 + (p - 0.5) * shrink
+        
         weight = clip(math.exp(-8 * (effective_loss - 0.25)), 0.15, 2.0)
         if m["failures"] >= 3 and not flipped: weight *= 0.35
         return clip(p), weight, flipped
@@ -266,7 +271,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Advanced Pattern & Trend)
+# ENGINE
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -277,7 +282,6 @@ class Engine:
         candidates = {}
         def weight(idx): return 0.5 ** ((n - 1 - idx) / 300.0)
 
-        # 1. Exact Matches (Length 5 to 15)
         for length in range(5, CFG.max_pattern + 1):
             if n < length * 2: continue
             suffix = tuple(seq[-length:])
@@ -292,7 +296,6 @@ class Engine:
                     key = f"exact:{bits}"
                     candidates[key] = (abs(p - 0.5) * math.sqrt(eff_n), p, len(obs), eff_n, key)
 
-        # 2. Mismatch Matches (Length 5 to 10, Hamming <= 1)
         for length in range(5, 11):
             if n < length * 2: continue
             suffix = tuple(seq[-length:])
@@ -311,7 +314,6 @@ class Engine:
                     if key not in candidates or candidates[key][0] < rank:
                         candidates[key] = (rank, p, len(obs), eff_n, key)
 
-        # 3. Skip-gram Matches (Length 5 to 12, Gaps 1-3)
         for length in range(5, 13):
             if n < length * 2: continue
             for gap in range(1, min(4, length - 1)):
@@ -330,7 +332,6 @@ class Engine:
                         if key not in candidates or candidates[key][0] < rank:
                             candidates[key] = (rank, p, len(obs), eff_n, key)
 
-        # 4. Delta/Transition Patterns (Length 4 to 10) — B B S becomes 0 1
         for length in range(4, min(11, CFG.max_pattern)):
             if n < length * 2: continue
             raw_suffix = seq[-length:]
@@ -404,14 +405,20 @@ class Engine:
         adjusted = []
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
-            if name == "momentum" and current_streak >= 3: weight *= 2.2
+            
+            # 🧠 SMART LOGIC: Agar streak 4+ hai, toh momentum ko boost karo par contrarian trap se bachao
+            if name == "momentum" and current_streak >= 4: weight *= 2.0
             if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
             adjusted.append((corrected, weight))
 
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
         
-        # Meta Predict
+        # 🧠 OVERCONFIDENCE PENALTY: Agar sab experts ek hi side bol rahe hain, toh thoda contrarian ho jao (Game maker mindset)
+        consensus = max(sum(1 for p,_ in adjusted if p>=0.5), sum(1 for p,_ in adjusted if p<0.5)) / len(adjusted)
+        if consensus > 0.85:
+            p_avg = 0.5 + (p_avg - 0.5) * 0.7 # Reduce extreme confidence
+
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
         mw = self.db.get("meta_weights")
         if not isinstance(mw, list) or len(mw) != len(m_feats): mw = [0.0] * len(m_feats)
@@ -420,11 +427,6 @@ class Engine:
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        if current_streak >= 3:
-            trend_p = 0.65 if seq[-1] == 1 else 0.35
-            p_raw = 0.7 * p_raw + 0.3 * trend_p
-
-        # Calibration
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
@@ -432,7 +434,6 @@ class Engine:
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
         
-        # Number prediction
         matrix = self.db.get("num_matrix", {})
         trans = matrix.get(str(nums[-1] if nums else 5), {})
         freq = self.db.get("num_freq", {})
@@ -446,11 +447,9 @@ class Engine:
             scores[n] = s
         pred_num = max(scores, key=scores.get) if scores and max(scores.values()) > 0 else random.choice(valid_nums)
 
-        # Trend Shift Detection
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
-        # Pattern Sequence for Message
         pat_str = "None"
         if patterns:
             top_p = patterns[0]
@@ -458,14 +457,10 @@ class Engine:
             bits = top_p[4].split(":")[-1]
             arrow = "⬆️" if top_p[1] >= 0.5 else "⬇️"
             
-            if p_type == "delta":
-                pat_str = f"Δ <code>{bits}</code> {arrow}"
-            elif p_type.startswith("gap"):
-                pat_str = f"Skip <code>{bits}</code> {arrow}"
-            elif p_type == "mm1":
-                pat_str = f"~ <code>{bits}</code> {arrow}"
-            else:
-                pat_str = f"<code>{bits}</code> {arrow}"
+            if p_type == "delta": pat_str = f"Δ <code>{bits}</code> {arrow}"
+            elif p_type.startswith("gap"): pat_str = f"Skip <code>{bits}</code> {arrow}"
+            elif p_type == "mm1": pat_str = f"~ <code>{bits}</code> {arrow}"
+            else: pat_str = f"<code>{bits}</code> {arrow}"
 
         return {
             "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
@@ -518,27 +513,15 @@ class Engine:
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
                 self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
 
-                # BADA EMOJI SEQUENCE
+                # ── SEND STICKERS INSTEAD OF TEXT ──
                 if won_side and won_num: 
-                    emoji = (
-                        "🎰 🎰 🎰\n"
-                        "💎 <b>JACKPOT</b> 💎\n"
-                        "🎰 🎰 🎰"
-                    )
+                    sticker = CFG.jack_sticker
                 elif won_side: 
-                    emoji = (
-                        "🏆 🏆 🏆\n"
-                        "🔥 <b>WIN</b> 🔥\n"
-                        "🏆 🏆 🏆"
-                    )
+                    sticker = CFG.win_sticker
                 else: 
-                    emoji = (
-                        "❌ ❌ ❌\n"
-                        "💀 <b>LOSS</b> 💀\n"
-                        "❌ ❌ ❌"
-                    )
+                    sticker = CFG.loss_sticker
                 
-                self.db.queue("result", row["issue"], emoji)
+                self.db.queue("sticker", row["issue"], sticker)
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
 
 # ─────────────────────────────────────────────────────────────
@@ -635,12 +618,13 @@ class Runtime:
             await self.pause(min(60, CFG.fetch_every * 2 ** min(failures, 4)))
 
     async def sender(self, session):
-        endpoint = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
+        endpoint_msg = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
+        endpoint_sticker = f"https://api.telegram.org/bot{CFG.token}/sendSticker"
         backoff = 1.0
+        
         while not self.stop.is_set():
             self.db.c.execute("UPDATE outbox SET sent=2 WHERE sent=0 AND expires <= ?", (time.time(),))
             
-            # STRICT SEQUENCE: id ASC ensures Result (id=X) goes before Prediction (id=X+1)
             row = self.db.c.execute("SELECT * FROM outbox WHERE sent=0 ORDER BY id ASC LIMIT 1").fetchone()
             if not row:
                 await self.pause(0.5)
@@ -648,7 +632,14 @@ class Runtime:
 
             delay = backoff
             try:
-                async with session.post(endpoint, json={"chat_id": CFG.chat, "text": row["text"], "parse_mode": "HTML"}) as response:
+                if row["kind"] == "sticker":
+                    url = endpoint_sticker
+                    payload = {"chat_id": CFG.chat, "sticker": row["text"]}
+                else:
+                    url = endpoint_msg
+                    payload = {"chat_id": CFG.chat, "text": row["text"], "parse_mode": "HTML"}
+
+                async with session.post(url, json=payload) as response:
                     data = await response.json(content_type=None)
                     if response.status == 200 and data.get("ok"):
                         self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
@@ -657,7 +648,13 @@ class Runtime:
                     
                     code = data.get("error_code", response.status)
                     if code == 429: delay = float(data.get("parameters", {}).get("retry_after", 10))
-                    elif code in (400, 401, 403, 404): delay = 60
+                    elif code in (400, 401, 403, 404): 
+                        delay = 60
+                        if code == 400 and row["kind"] == "sticker":
+                            LOG.error(f"Invalid Sticker ID: {row['text']}")
+                            self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],))
+                            continue
+                            
             except asyncio.CancelledError: raise
             except Exception as e: LOG.warning(f"Telegram fail: {e}")
             
@@ -699,7 +696,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V7 Predictor Started")
+            LOG.info("HYPER V9 Predictor Started (Mind Reader)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
