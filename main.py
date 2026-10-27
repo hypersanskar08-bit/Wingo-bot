@@ -1,15 +1,6 @@
 # bot.py
 # Python 3.10+
 # Dependency: pip install aiohttp
-#
-# Required environment variables:
-#   TELEGRAM_TOKEN = NEW token from BotFather
-#   CHAT_ID        = your Telegram chat/channel ID
-#   API_URLS       = comma-separated history API URLs
-#
-# Optional:
-#   DB_PATH= predictor_v5_final.db
-#   PORT=8080
 
 import asyncio
 import contextlib
@@ -21,7 +12,7 @@ import os
 import signal
 import sqlite3
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 
 import aiohttp
@@ -30,6 +21,7 @@ from aiohttp import web
 
 @dataclass(frozen=True)
 class Config:
+    # Hardcoded your provided credentials as defaults
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo").strip()
     chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
     urls: tuple = tuple(
@@ -37,24 +29,38 @@ class Config:
         for u in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000").split(",")
         if u.strip()
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_v5_final.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v5.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
-    min_history: int = int(os.getenv("MIN_HISTORY", "100")) # Kam kiya taaki jaldi start ho
-    min_validation: int = int(os.getenv("MIN_VALIDATION", "30")) # Zidd khatam
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.04")) # Signal aasani se aaye
-    max_disagreement: float = float(os.getenv("MAX_DISAGREEMENT", "0.20"))
-    cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "2"))
+    min_history: int = int(os.getenv("MIN_HISTORY", "150"))
+    min_validation: int = int(os.getenv("MIN_VALIDATION", "150"))
+    min_edge: float = float(os.getenv("MIN_EDGE", "0.08"))
+    max_disagreement: float = float(os.getenv("MAX_DISAGREEMENT", "0.12"))
+    cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "3"))
     max_history: int = 2000
     validation_window: int = 500
     loss_limit: int = 3
     timeout: float = 12.0
-    delivery_ttl: float = 45.0 # Network delay ke liye time badhaya
-    name: str = "FTW VIP PREDICTOR (ULTRA)"
+    delivery_ttl: float = 12.0
+    name: str = "FTW RESEARCH PREDICTOR V5"
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
             raise ValueError("Set TELEGRAM_TOKEN, CHAT_ID and API_URLS.")
+        if any(not u.startswith("https://") for u in self.urls):
+            raise ValueError("History URLs must use HTTPS.")
+        if not 30 <= self.min_history <= self.max_history:
+            raise ValueError("Invalid MIN_HISTORY.")
+        if not 30 <= self.min_validation <= self.validation_window:
+            raise ValueError("Invalid MIN_VALIDATION.")
+        if not 0 < self.min_edge < 0.5:
+            raise ValueError("MIN_EDGE must be between 0 and 0.5.")
+        if not 0 < self.max_disagreement < 0.5:
+            raise ValueError("Invalid MAX_DISAGREEMENT.")
+        if self.fetch_every <= 0 or self.cooldown_rounds < 0:
+            raise ValueError("Invalid polling/cooldown configuration.")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("Invalid PORT.")
 
 
 CFG = Config()
@@ -242,15 +248,17 @@ class Model:
         number = max(valid, key=lambda v: (counts[v], -v))
         conditional = counts[number] / sum(counts[v] for v in valid)
 
-        # 🚀 FIX: Strict logic relaxed so bot sends messages
         candidate = (
             abs(p - 0.5) >= CFG.min_edge
             and disagreement <= CFG.max_disagreement
         )
         validation = self.metrics()
-        
-        # Ab hum validation ka wait nahi karenge, sirf math dekhenge
-        qualified = candidate 
+        qualified = (
+            candidate
+            and validation["n"] >= CFG.min_validation
+            and validation["wilson_lower"] > 0.5
+            and validation["brier"] < validation["baseline_brier"]
+        )
 
         return {
             "p": p,
@@ -309,7 +317,7 @@ class Model:
         return {
             "n": n,
             "wins": wins,
-            "accuracy": wins / n if n else 0.0,
+            "accuracy": wins / n if n else None,
             "wilson_lower": wilson_lower(wins, n),
             "brier": sum(r["brier"] for r in eligible) / n if n else 1.0,
             "baseline_brier": (
@@ -398,26 +406,18 @@ class Database:
 
 def prediction_text(issue, p):
     side = "BIG" if p["side"] else "SMALL"
-    conf_percent = max(p["p"], 1 - p["p"]) * 100
-    filled = int(conf_percent // 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    color_emoji = "🔴" if side == "BIG" else "🔵"
-    
-    if conf_percent >= 65:
-        quality = "🔥 HIGH VIP (Stake: 1x)"
-    elif conf_percent >= 60:
-        quality = "⭐ VIP (Stake: 1x)"
-    else:
-        quality = "✅ NORMAL (Stake: 0.5x)"
-
+    m = p["validation"]
     return (
-        f"⚡️ <b>{esc(CFG.name)}</b> ⚡️\n"
-        f"──────────────────\n"
-        f"🎯 <b>TARGET:</b> {color_emoji} <b>{side}</b>  [ <code>{p['number']}</code> ]\n"
-        f"📅 <b>PERIOD:</b> <code>{issue}</code>\n"
-        f"📊 <b>CONFIDENCE:</b> {conf_percent:.1f}% [{bar}]\n"
-        f"🏆 <b>QUALITY:</b> {quality}\n"
-        f"──────────────────"
+        f"<b>{esc(CFG.name)}</b>\n"
+        f"Period: <code>{issue}</code>\n"
+        f"Side: <b>{side}</b>\n"
+        f"Experimental probability: {max(p['p'], 1-p['p']):.1%}\n"
+        f"Number estimate: <b>{p['number']}</b>\n"
+        f"Number probability estimate: {p['number_estimate']:.1%}\n"
+        f"Prior candidate sample: {m['n']}\n"
+        f"Prior candidate hit rate: {m['accuracy']:.1%}\n"
+        f"Wilson lower bound: {m['wilson_lower']:.1%}\n"
+        f"Research signal only. No guaranteed outcome."
     )
 
 
@@ -431,7 +431,6 @@ class Runtime:
         self.error = None
         self.telegram_blocked = False
 
-        # Clear stuck messages on restart
         db.c.execute(
             "UPDATE outbox SET state=2 WHERE kind='prediction' AND state=0"
         )
@@ -453,7 +452,12 @@ class Runtime:
                         await response.json(content_type=None)
                     )
                     return data or None
-            except Exception:
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                ValueError,
+                TypeError,
+            ):
                 return None
 
         sources = [
@@ -485,8 +489,6 @@ class Runtime:
 
             p = json.loads(row["payload"])
             won = p["side"] == int(number >= 5)
-            won_num = p["number"] == number
-            
             self.db.c.execute(
                 "UPDATE predictions SET actual=? WHERE issue=?",
                 (number, issue),
@@ -504,7 +506,7 @@ class Runtime:
                 )
                 stats["signals"] += 1
                 stats["wins"] += int(won)
-                stats["number_hits"] += int(won_num)
+                stats["number_hits"] += int(number == p["number"])
                 self.db.set("live_stats", stats)
 
                 streak = 0 if won else self.db.get("loss_streak", 0) + 1
@@ -513,22 +515,20 @@ class Runtime:
                     streak = 0
                 self.db.set("loss_streak", streak)
 
-                # 🚀 Jumbo Emojis
-                if won and won_num:
-                    result_emoji = "🎰🎰🎰"
-                elif won:
-                    result_emoji = "🏆"
-                else:
-                    result_emoji = "❌"
-
                 self.db.queue(
                     issue,
                     "result",
-                    result_emoji,
+                    (
+                        f"<b>{'WIN' if won else 'LOSS'}</b>\n"
+                        f"Period: <code>{issue}</code>\n"
+                        f"Actual: {number} "
+                        f"({'BIG' if number >= 5 else 'SMALL'})\n"
+                        f"Number match: {'YES' if number == p['number'] else 'NO'}"
+                    ),
                     ttl=3600,
                 )
 
-    def process(self, records):
+    def process(self, records, allow_signal):
         before = self.model.rows[-1][0] if self.model.rows else None
         known = dict(self.model.rows)
 
@@ -558,9 +558,9 @@ class Runtime:
                 self.last_advance = time.time()
                 cooldown = self.db.get("cooldown", 0)
 
-                # 🚀 FIX: Removed 'timely_poll' condition that was blocking signals
                 contiguous_live_step = (
-                    before is not None
+                    allow_signal
+                    and before is not None
                     and len(new_rows) == 1
                     and new_rows[0][0] == before + 1
                     and len(self.model.rows) >= CFG.min_history
@@ -595,11 +595,21 @@ class Runtime:
 
     async def worker(self, session):
         failures = 0
+        armed = False
+        last_poll = None
 
         while not self.stop.is_set():
             try:
                 records = await self.fetch(session)
-                self.process(records)
+                now = time.monotonic()
+
+                timely_poll = (
+                    last_poll is not None
+                    and now - last_poll <= max(10, 3 * CFG.fetch_every)
+                )
+                self.process(records, armed and timely_poll)
+                last_poll = now
+                armed = True
                 failures = 0
                 self.last_fetch = time.time()
                 self.error = None
@@ -610,6 +620,7 @@ class Runtime:
                 self.model = Model.restore(self.db.get("model"))
                 self.error = type(exc).__name__
                 failures += 1
+                armed = False
                 LOG.error("History processing failed: %s", self.error)
 
             await self.pause(
@@ -617,6 +628,7 @@ class Runtime:
             )
 
     async def sender(self, session):
+        # --- FIXED ENDPOINT URL HERE ---
         endpoint = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
         backoff = 1
 
@@ -662,7 +674,9 @@ class Runtime:
                     },
                 ) as response:
                     data = await response.json(content_type=None)
-                    
+                    if not isinstance(data, dict):
+                        raise ValueError("InvalidTelegramResponse")
+
                     if response.status == 200 and data.get("ok"):
                         with self.db.transaction():
                             self.db.c.execute(
@@ -690,18 +704,25 @@ class Runtime:
                         )
                     elif code in (401, 403, 404):
                         self.telegram_blocked = True
-                        LOG.error("Telegram blocked: code %s.", code)
+                        LOG.error(
+                            "Telegram blocked: code %s. Fix credentials/"
+                            "permissions and restart.",
+                            code,
+                        )
                     elif code == 400:
                         self.db.c.execute(
                             "UPDATE outbox SET state=3 WHERE id=?",
                             (row["id"],),
                         )
-                        LOG.error("Telegram rejected message: code 400. Check HTML format.")
+                        LOG.error("Telegram rejected message: code 400.")
 
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                LOG.warning("Telegram transport failure: %s", type(exc).__name__)
+                LOG.warning(
+                    "Telegram transport failure: %s",
+                    type(exc).__name__,
+                )
 
             await self.pause(delay)
             backoff = min(60, backoff * 2)
@@ -756,6 +777,7 @@ async def main():
 
     try:
         await runner.setup()
+        # Render requires binding to 0.0.0.0
         await web.TCPSite(
             runner, "0.0.0.0", CFG.port
         ).start()
@@ -773,7 +795,7 @@ async def main():
             ]
             stopper = asyncio.create_task(runtime.stop.wait())
 
-            LOG.info("V5 FINAL Predictor started.")
+            LOG.info("Predictor started in conservative research mode.")
             done, _ = await asyncio.wait(
                 [*tasks, stopper],
                 return_when=asyncio.FIRST_COMPLETED,
