@@ -47,7 +47,7 @@ class Config:
     max_pattern: int = 12
     round_seconds: float = 60.0
     delivery_ttl: float = 40.0
-    name: str = "FTW VIP PREDICTOR" # Thoda naam bhi VIP kar diya
+    name: str = "FTW VIP PREDICTOR"
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
@@ -515,9 +515,16 @@ class Engine:
 
             prediction = json.loads(row["payload"])
             y = actual["size"]
-            won = int(prediction["p"] >= 0.5) == y
             
-            status = "WIN" if won else "LOSS"
+            # Check karein ki Size sahi laga ya nahi
+            won_side = int(prediction["p"] >= 0.5) == y
+            
+            # Check karein ki Number bhi match hua ya nahi (Jackpot ke liye)
+            actual_num = actual["num"]
+            pred_num = prediction.get("num")
+            won_num = (actual_num == pred_num) if pred_num is not None else False
+            
+            status = "WIN" if won_side else "LOSS"
 
             with self.db.transaction():
                 self.db.c.execute(
@@ -560,19 +567,24 @@ class Engine:
                 stats["observed"] += 1
                 stats["brier"] += (prediction["p"] - y) ** 2
                 stats["signals"] += 1
-                stats["wins"] += int(won)
+                stats["wins"] += int(won_side)
                 
-                streak = 0 if won else self.db.get("loss_streak", 0) + 1
+                streak = 0 if won_side else self.db.get("loss_streak", 0) + 1
                 self.db.set("loss_streak", streak)
                 if streak >= CFG.loss_limit:
                     self.db.set("cooldown", CFG.cooldown_rounds)
                     self.db.set("loss_streak", 0)
 
-                # 🚀 CHANGE: Jackpot Style Emoji Message for Win/Loss
-                if won:
-                    result_text = "🎰💰 <b>JACKPOT WIN!</b> 💰🎰"
+                # 🚀 CHANGE: Sabhi emojis bade size me dikhenge (sirf emoji bhejna hai)
+                if won_side and won_num:
+                    # Size aur Number dono win (Jackpot) - Bada 🪎
+                    result_text = "🪎" 
+                elif won_side:
+                    # Sirf Size win (Normal Win) - Bada 🏆
+                    result_text = "🏆" 
                 else:
-                    result_text = "❌ <b>LOSS</b>"
+                    # Loss - Bada ❌
+                    result_text = "❌" 
                 
                 self.db.queue(
                     "result",
@@ -752,7 +764,7 @@ class Runtime:
                     json={
                         "chat_id": CFG.chat,
                         "text": row["text"],
-                        "parse_mode": "HTML" # Added HTML parsing for bold/formatting
+                        "parse_mode": "HTML" # Added for bold, code, and formatting
                     },
                 ) as response:
                     data = await response.json(content_type=None)
