@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V13 - Sliding Window)
+# bot.py — FTW VIP PREDICTOR (HYPER V15 - Deep N-Gram Number Tracker)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -30,7 +30,7 @@ class Config:
     chat: str = "-1004485961768"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v13.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v15.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -269,7 +269,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Sliding Window Logic)
+# ENGINE (Trend Rider, Deep N-Gram Number Tracker)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -294,17 +294,11 @@ class Engine:
         runs = self.get_runs(seq)
         if len(runs) < 2: return []
 
-        # Sliding Window: Try longest pattern first, drop oldest if not found
-        # Example: S1-B3-S5-B1 -> B3-S5-B1 -> S5-B1 -> B1
         for k in range(min(6, len(runs)), 1, -1):
             target = runs[-k:]
-            
             observations = []
-            # Search backward in history
             for i in range(len(runs) - k - 1, -1, -1):
                 window = runs[i:i+k]
-                
-                # STRICT MATCH: Both the direction (B/S) and exact length must match
                 if window == target:
                     if i + k < len(runs):
                         next_run = runs[i + k]
@@ -314,20 +308,15 @@ class Engine:
                 p, eff_n = weighted_probability(observations)
                 bits = "-".join(f"{'B' if v else 'S'}{c}" for v, c in target)
                 key = f"family:{bits}"
-                rank = abs(p - 0.5) * math.sqrt(eff_n) + 10.0 # Massive boost
+                rank = abs(p - 0.5) * math.sqrt(eff_n) + 10.0 
                 return [(rank, p, len(observations), eff_n, key)]
-
         return []
 
     def mine_patterns(self, seq):
         n = len(seq)
-        
-        # 1. Family Patterns get top priority
         family_cands = self.mine_family_patterns(seq)
-        if family_cands:
-            return family_cands
+        if family_cands: return family_cands
 
-        # 2. Fallback to exact matching if no family pattern found
         candidates = {}
         def weight(idx): return 0.5 ** ((n - 1 - idx) / 300.0)
 
@@ -389,6 +378,30 @@ class Engine:
 
         return experts, patterns, features, current_regime
 
+    def _predict_number(self, seq_nums, pred_side):
+        valid = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
+        if not seq_nums: return random.choice(valid)
+
+        ngram_db = self.db.get("num_ngrams", {})
+        
+        # Track from Longest (10) down to Shortest (2)
+        for length in range(min(10, len(seq_nums)), 1, -1):
+            seq_key = ",".join(str(x) for x in seq_nums[-length:])
+            if seq_key in ngram_db:
+                trans = ngram_db[seq_key]
+                # Filter next numbers that match the target side (BIG/SMALL)
+                valid_trans = {int(k): v for k, v in trans.items() if int(k) in valid}
+                if valid_trans:
+                    return max(valid_trans, key=valid_trans.get)
+                    
+        # Fallback to overall frequency
+        freq = self.db.get("num_freq", {})
+        valid_freq = {int(k): v for k, v in freq.items() if int(k) in valid}
+        if valid_freq:
+            return max(valid_freq, key=valid_freq.get)
+            
+        return random.choice(valid)
+
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
@@ -400,10 +413,11 @@ class Engine:
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
             
-            # Pattern expert ko extra power
             if name == "patterns": weight *= 2.5
             
-            if name == "momentum" and current_streak >= 4: weight *= 2.0
+            if current_streak >= 4:
+                if name in ("momentum", "run"): weight *= 3.0
+            
             if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
             adjusted.append((corrected, weight))
 
@@ -421,11 +435,14 @@ class Engine:
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
+        if current_streak >= 4:
+            trend_val = float(seq[-1])
+            p_raw = 0.90 * trend_val + 0.10 * p_raw
+
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
 
-        # 🧠 TARGET OVERRIDE (Arrow Match) 🧠
         pat_str = "None"
         if patterns:
             top_p = patterns[0]
@@ -435,31 +452,16 @@ class Engine:
             arrow = "⬆️" if p_pat >= 0.5 else "⬇️"
             
             if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
-            elif p_type.startswith("gap"): pat_str = f"Skip <code>{bits}</code> {arrow}"
-            elif p_type == "mm1": pat_str = f"~ <code>{bits}</code> {arrow}"
             else: pat_str = f"<code>{bits}</code> {arrow}"
 
-            # Force target to match pattern
             if p_pat >= 0.55:
                 p_cal = max(p_cal, 0.60) 
             elif p_pat <= 0.45:
                 p_cal = min(p_cal, 0.40) 
 
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
-        valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
         
-        matrix = self.db.get("num_matrix", {})
-        trans = matrix.get(str(nums[-1] if nums else 5), {})
-        freq = self.db.get("num_freq", {})
-        recent_c = Counter(nums[-100:])
-        
-        scores = {}
-        for n in valid_nums:
-            s = (0.45 * (trans.get(str(n), 0) / sum(trans.values()) if sum(trans.values()) else 0) +
-                 0.25 * (freq.get(str(n), 0) / sum(freq.values()) if sum(freq.values()) else 0) +
-                 0.30 * (recent_c.get(n, 0) / len(nums[-100:]) if nums else 0))
-            scores[n] = s
-        pred_num = max(scores, key=scores.get) if scores and max(scores.values()) > 0 else random.choice(valid_nums)
+        pred_num = self._predict_number(nums, pred_side)
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
@@ -474,14 +476,23 @@ class Engine:
 
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
-        num_matrix = self.db.get("num_matrix", {})
-        num_freq = self.db.get("num_freq", {})
+        
+        # Build Deep N-Gram Number Tracker (Length 2 to 10)
+        num_ngrams = {}
+        num_freq = {}
         for i in range(1, len(history)):
-            p, c = str(history[i-1]["num"]), str(history[i]["num"])
-            if p not in num_matrix: num_matrix[p] = {}
-            num_matrix[p][c] = num_matrix[p].get(c, 0) + 1
-            num_freq[c] = num_freq.get(c, 0) + 1
-        self.db.set("num_matrix", num_matrix)
+            curr_num = history[i]["num"]
+            num_freq[str(curr_num)] = num_freq.get(str(curr_num), 0) + 1
+            
+            for length in range(2, 11):
+                if i >= length:
+                    seq_key = ",".join(str(history[j]["num"]) for j in range(i-length, i))
+                    if seq_key not in num_ngrams:
+                        num_ngrams[seq_key] = {}
+                    num_ngrams[seq_key][str(curr_num)] = num_ngrams[seq_key].get(str(curr_num), 0) + 1
+                    
+        # Prune ngrams to avoid DB bloat (keep only if appeared at least 1 time)
+        self.db.set("num_ngrams", num_ngrams)
         self.db.set("num_freq", num_freq)
 
         pending = self.db.c.execute("SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)").fetchall()
@@ -694,7 +705,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V13 Predictor Started (Sliding Window)")
+            LOG.info("HYPER V15 Predictor Started (Deep N-Gram)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
