@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V9 - Mind Reader)
+# bot.py — FTW VIP PREDICTOR (HYPER V9 - Mind Reader Final)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -22,21 +22,22 @@ import aiohttp
 from aiohttp import web
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG (Stickers yahan set kar sakte ho)
+# CONFIG (Yahan sab kuch set kar diya gaya hai)
 # ─────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Config:
-    token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo").strip()
-    chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
-    urls: tuple = tuple(
-        x.strip() for x in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000").split(",") if x.strip()
-    )
+    # Telegram Details
+    token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
+    chat: str = "-1004485961768"
+    urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
+    
+    # Bot Settings
     db_path: str = os.getenv("DB_PATH", "predictor_hyper_v9.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
-    min_history: int = int(os.getenv("MIN_HISTORY", "120"))
+    min_history: int = int(os.getenv("MIN_HISTORY", "120")) # 120 results ke baad start hoga
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     learning_rate: float = 0.035
     meta_lr: float = 0.03
@@ -45,13 +46,14 @@ class Config:
     delivery_ttl: float = 40.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
     
-    # ── STICKERS (Apne Telegram Sticker File IDs) ──
-    win_sticker: str = os.getenv("WIN_STICKER", "AAMCBQADGQEAAVbQjGrhCWKiJjLHf3FF7dqQvMa-pehKAAKODwACD8-AVzbn1gF3m2MGAQAHbQADPQQ") 
-    loss_sticker: str = os.getenv("LOSS_STICKER", "AAMCBQADGQEAAVbQlmrhCvhA9K2qJCPJKg_UNAy-wVlrAAJXHQACm2shVfq7O2zptuhwAQAHbQADPQQ")
-    jack_sticker: str = os.getenv("JACK_STICKER", "AAMCBQADGQEAAVbQimrhCUtsaBG7lHdMgiJJj_3PW427AAJLFAAC7XOBVyG9C9fn0qwcAQAHbQADPQQ")
+    # Stickers (Tumhare diye gaye File IDs)
+    win_sticker: str = "AAMCBQADGQEAAVbQjGrhCWKiJjLHf3FF7dqQvMa-pehKAAKODwACD8-AVzbn1gF3m2MGAQAHbQADPQQ"
+    loss_sticker: str = "AAMCBQADGQEAAVbQlmrhCvhA9K2qJCPJKg_UNAy-wVlrAAJXHQACm2shVfq7O2zptuhwAQAHbQADPQQ"
+    jack_sticker: str = "AAMCBQADGQEAAVbQimrhCUtsaBG7lHdMgiJJj_3PW427AAJLFAAC7XOBVyG9C9fn0qwcAQAHbQADPQQ"
 
-    def validate(selfself.token or not self.chat or not self.urls:
-            raise ValueError("Set TELEGRAM_TOKEN, CHAT_ID and API_URLS.")
+    def validate(self):
+        if not self.token or not self.chat or not self.urls:
+            raise ValueError("Missing required config: token, chat, or urls")
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -246,7 +248,7 @@ class Database:
         brier = m["loss"] / n
         inverse_brier = m["inverse_loss"] / n
         
-        # 🧠 MISTAKE FIXER: Agar model lagatar 2 baar fail hua hai, toh uski prediction ulte side kar do
+        # 🧠 MISTAKE FIXER: Agar lagatar 2 baar fail hua, toh flip karo
         flip_due_to_failures = (m["failures"] >= 2)
         flip_due_to_loss = (n >= 25 and inverse_brier + 0.04 < brier and inverse_brier < 0.245)
         
@@ -254,7 +256,7 @@ class Database:
         effective_loss = inverse_brier if flipped else brier
         p = 1 - probability if flipped else probability
 
-        # 🪤 TRAP DETECTOR: Agar confidence bahut high hai par loss 0.22 se zyada hai, matlab trap hai
+        # 🪤 TRAP DETECTOR
         if p > 0.80 and effective_loss > 0.22: p = 0.5 - (p - 0.5) * 0.5 
         elif p < 0.20 and effective_loss > 0.22: p = 0.5 + (0.5 - p) * 0.5
 
@@ -271,7 +273,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE
+# ENGINE (Pattern Detector)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -405,8 +407,6 @@ class Engine:
         adjusted = []
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
-            
-            # 🧠 SMART LOGIC: Agar streak 4+ hai, toh momentum ko boost karo par contrarian trap se bachao
             if name == "momentum" and current_streak >= 4: weight *= 2.0
             if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
             adjusted.append((corrected, weight))
@@ -414,10 +414,9 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
         
-        # 🧠 OVERCONFIDENCE PENALTY: Agar sab experts ek hi side bol rahe hain, toh thoda contrarian ho jao (Game maker mindset)
+        # 🧠 CONSENSUS PENALTY
         consensus = max(sum(1 for p,_ in adjusted if p>=0.5), sum(1 for p,_ in adjusted if p<0.5)) / len(adjusted)
-        if consensus > 0.85:
-            p_avg = 0.5 + (p_avg - 0.5) * 0.7 # Reduce extreme confidence
+        if consensus > 0.85: p_avg = 0.5 + (p_avg - 0.5) * 0.7
 
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
         mw = self.db.get("meta_weights")
@@ -513,7 +512,7 @@ class Engine:
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
                 self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
 
-                # ── SEND STICKERS INSTEAD OF TEXT ──
+                # SEND STICKERS
                 if won_side and won_num: 
                     sticker = CFG.jack_sticker
                 elif won_side: 
@@ -525,7 +524,7 @@ class Engine:
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
 
 # ─────────────────────────────────────────────────────────────
-# FORMATTER
+# FORMATTER (No ALT numbers)
 # ─────────────────────────────────────────────────────────────
 def format_prediction(p):
     conf = max(p["p"], 1 - p["p"]) * 100
