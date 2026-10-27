@@ -31,7 +31,7 @@ class Config:
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     
-    # Logic relaxed to ensure predictions come through
+    # Relaxed Logic
     min_history: int = int(os.getenv("MIN_HISTORY", "150"))
     min_validation: int = int(os.getenv("MIN_VALIDATION", "10"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.01"))
@@ -42,7 +42,7 @@ class Config:
     validation_window: int = 500
     loss_limit: int = 3
     timeout: float = 12.0
-    delivery_ttl: float = 60.0
+    delivery_ttl: float = 55.0 # Expiry time 55 seconds (Wingo round ke andar)
     name: str = "FTW RESEARCH PREDICTOR V5"
 
     def validate(self):
@@ -79,7 +79,6 @@ def parse_history(payload):
             break
         if not isinstance(obj, dict):
             return []
-        # Look for common array keys
         obj = next(
             (
                 obj[key]
@@ -90,7 +89,6 @@ def parse_history(payload):
         )
 
     if not isinstance(obj, list):
-        LOG.error(f"API structure unknown. Keys found: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}")
         return []
 
     records = {}
@@ -236,7 +234,6 @@ class Model:
             and disagreement <= CFG.max_disagreement
         )
         
-        # DEADLOCK FIXED: Removed strict validation check
         qualified = candidate 
 
         return {
@@ -407,6 +404,10 @@ class Runtime:
         self.error = None
         self.telegram_blocked = False
 
+        # CLEAR OLD COOLDOWNS ON RESTART SO BOT NEVER STOPS
+        self.db.set("cooldown", 0)
+        self.db.set("loss_streak", 0)
+        
         db.c.execute(
             "UPDATE outbox SET state=2 WHERE kind='prediction' AND state=0"
         )
@@ -544,7 +545,7 @@ class Runtime:
                         (issue, json.dumps(p)),
                     )
                     if cursor.rowcount:
-                        LOG.info(f"Queued prediction for period {issue}: {prediction_text(issue, p)[:50]}...")
+                        LOG.info(f"Queued prediction for period {issue}")
                         self.db.queue(
                             issue,
                             "prediction",
@@ -562,8 +563,6 @@ class Runtime:
         while not self.stop.is_set():
             try:
                 records = await self.fetch(session)
-                if records:
-                    LOG.info(f"Fetched {len(records)} records. Latest issue: {records[-1][0]}")
                 self.process(records, True)
                 failures = 0
                 self.last_fetch = time.time()
@@ -604,18 +603,8 @@ class Runtime:
                 await self.pause(0.5)
                 continue
 
-            # For predictions, make sure it's still the latest issue
-            if row["kind"] == "prediction":
-                latest = (
-                    self.model.rows[-1][0] if self.model.rows else None
-                )
-                if latest is None or row["issue"] != latest + 1:
-                    LOG.info(f"Dropping outdated prediction for {row['issue']}")
-                    self.db.c.execute(
-                        "UPDATE outbox SET state=2 WHERE id=?",
-                        (row["id"],),
-                    )
-                    continue
+            # REMOVED THE STRICT DROP CONDITION HERE
+            # Ab prediction tabhi drop hogi jab uska TTL (55s) expire ho jayega.
 
             delay = backoff
             try:
@@ -630,7 +619,7 @@ class Runtime:
                     data = await response.json(content_type=None)
                     
                     if response.status == 200 and data.get("ok"):
-                        LOG.info(f"Successfully sent message to Telegram for issue {row['issue']}")
+                        LOG.info(f"Message sent for issue {row['issue']}")
                         with self.db.transaction():
                             self.db.c.execute(
                                 "UPDATE outbox SET state=1 WHERE id=?",
