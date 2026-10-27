@@ -1,866 +1,1186 @@
+# bot.py — FTW VIP PREDICTOR (ULTRA V5)
+# Python 3.10+
+# Dependency: pip install aiohttp
+
 import asyncio
-import gc
+import contextlib
 import html
 import json
 import logging
 import math
 import os
 import random
+import signal
+import socket
 import sqlite3
 import time
-from collections import Counter, defaultdict
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiohttp
 from aiohttp import web
-from telegram.ext import Application
 
-# ============================================================
+
+# ─────────────────────────────────────────────────────────────
 # CONFIG
-# ============================================================
-@dataclass
+# ─────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
 class Config:
-    telegram_token: str = os.environ.get("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
-    chat_id_raw: str = os.environ.get("CHAT_ID", "-1004485961768")
-
-    source_api_urls: str = os.environ.get(
-        "API_URLS",
-        "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
+    token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo").strip()
+    chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
+    urls: tuple = tuple(
+        x.strip()
+        for x in os.getenv(
+            "API_URLS",
+            "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
+        ).split(",")
+        if x.strip()
     )
-    db_path: str = os.environ.get("DB_PATH", "ftw_final_pattern.db")
-    cache_file: str = "ftw_final_pattern_cache.json"
-    log_dir: str = "logs"
-    fetch_every: float = 1.0
-    request_timeout: float = 15.0
-    bot_name: str = "FTW FINAL PATTERN V2"
-    min_history: int = 8
-    recent_limit: int = 12
-    max_history: int = 1000
-    min_repeat: int = 3
-    pattern_stats_cap: int = 2500
-
-    def parse_chat_id(self):
-        raw = self.chat_id_raw.strip()
-        return int(raw) if raw.lstrip("-").isdigit() else raw
-
-    def api_urls(self) -> List[str]:
-        urls = [u.strip() for u in self.source_api_urls.split(",") if u.strip()]
-        return urls or [
-            "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000"
-        ]
+    db_path: str = os.getenv("DB_PATH", "predictor_v5.db")
+    port: int = int(os.getenv("PORT", "8080"))
+    fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
+    timeout: float = 15.0
+    max_history: int = 4000
+    min_history: int = int(os.getenv("MIN_HISTORY", "150"))
+    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "10"))
+    min_edge: float = float(os.getenv("MIN_EDGE", "0.06"))
+    cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "2"))
+    loss_limit: int = 3
+    learning_rate: float = 0.035
+    meta_lr: float = 0.03
+    decay: float = 0.985
+    max_pattern: int = 10
+    round_seconds: float = 60.0
+    delivery_ttl: float = 40.0
+    min_confidence: float = float(os.getenv("MIN_CONFIDENCE", "0.54"))
+    kelly_cap: float = 1.5
+    name: str = "FTW VIP PREDICTOR (ULTRA V5)"
 
     def validate(self):
-        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+        if not self.token or not self.chat or not self.urls:
+            raise ValueError("Set TELEGRAM_TOKEN, CHAT_ID and API_URLS.")
+        if self.fetch_every <= 0 or self.min_history < 30:
+            raise ValueError("Invalid polling interval or history minimum.")
+        if self.min_support < 3 or not 0 < self.min_edge < 0.5:
+            raise ValueError("Invalid support or edge configuration.")
+
 
 CFG = Config()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG = logging.getLogger("predictor")
 
-# ============================================================
-# LOGGING
-# ============================================================
-def setup_logging():
-    Path(CFG.log_dir).mkdir(parents=True, exist_ok=True)
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    if not root.handlers:
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        root.addHandler(stream_handler)
+# ─────────────────────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────────────────────
+def clip(x, low=0.02, high=0.98):
+    return max(low, min(high, float(x)))
 
-        fh = RotatingFileHandler(
-            Path(CFG.log_dir) / "ftw_final_pattern.log",
-            maxBytes=1_000_000,
-            backupCount=3
-        )
-        fh.setFormatter(formatter)
-        root.addHandler(fh)
 
-setup_logging()
-log = logging.getLogger("ftw_final_pattern")
-
-# ============================================================
-# HELPERS
-# ============================================================
-def h(x: Any) -> str:
-    return html.escape(str(x))
-
-def safe_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-def normalize_issue(value: Any) -> Optional[int]:
-    if value is None: return None
-    if isinstance(value, str):
-        value = value.strip()
-        if value == "": return None
-        if value.isdigit(): return int(value)
-        digits = "".join(ch for ch in value if ch.isdigit())
-        if digits: return int(digits)
-    try: return int(value)
-    except Exception: return None
-
-def clamp(v: float, low: float, high: float) -> float:
-    return max(low, min(high, v))
-
-def trailing_run(seq: List[int]) -> int:
-    if not seq: return 0
-    last = seq[-1]
-    count = 1
-    for i in range(len(seq) - 2, -1, -1):
-        if seq[i] == last: count += 1
-        else: break
-    return count
-
-def volatility(seq: List[int], window: int = 20) -> float:
-    if len(seq) < 2: return 0.0
-    arr = seq[-window:]
-    diffs = [abs(arr[i] - arr[i - 1]) for i in range(1, len(arr))]
-    return sum(diffs) / max(1, len(diffs))
-
-def ratio_big(seq: List[int], window: int = 20) -> float:
-    if not seq: return 0.5
-    arr = seq[-window:]
-    return sum(arr) / max(1, len(arr))
-
-def detect_regime(seq: List[int]) -> str:
-    if len(seq) < 8: return "COLD"
-    run = trailing_run(seq)
-    alt = sum(1 for i in range(1, len(seq[-10:])) if seq[-10:][i] != seq[-10:][i - 1]) / max(1, len(seq[-10:]) - 1)
-    ratio = ratio_big(seq, 10)
-    if alt >= 0.65: return "ALTERNATING"
-    if run >= 5: return "TREND"
-    if run >= 3: return "TRAP"
-    if abs(ratio - 0.5) <= 0.12: return "CHOPPY"
-    return "CYCLE"
-
-def signal_strength(history: List[Dict[str, Any]]) -> float:
-    if len(history) < 8: return 0.2
-    seq = [x["size"] for x in history]
-    regime = detect_regime(seq)
-    run = trailing_run(seq)
-    alt = sum(1 for i in range(1, len(seq[-12:])) if seq[-12:][i] != seq[-12:][i - 1]) / max(1, len(seq[-12:]) - 1)
-    s = 0.0
-    if regime == "TRAP": s += 0.35
-    if regime == "TREND": s += 0.25
-    if regime == "ALTERNATING": s += 0.30
-    if run >= 3: s += 0.25
-    if alt >= 0.6: s += 0.15
-    return clamp(min(1.0, s), 0.0, 1.0)
-
-# ============================================================
-# STATISTICS CORE (shared by every detector below)
-# Wilson lower bound = how confident we can be a win-rate is really above
-# 50% given how much live evidence actually exists — a pattern seen 3
-# times at 67% and one seen 80 times at 67% must NOT be trusted the same
-# amount, and this is what makes that honest instead of a flat threshold.
-# ============================================================
-def wilson_lb(w: float, n: float, z: float = 1.645) -> float:
-    if n <= 0: return 0.5
-    p = w / n
-    z2 = z * z
-    denom = 1 + z2 / n
-    center = p + z2 / (2 * n)
-    margin = z * math.sqrt(max(0.0, (p * (1 - p) + z2 / (4 * n)) / n))
-    return max(0.0, min(1.0, (center - margin) / denom))
-
-def logit(p: float) -> float:
-    p = min(max(p, 1e-9), 1 - 1e-9)
+def logit(p, eps=0.02):
+    p = max(eps, min(1 - eps, float(p)))
     return math.log(p / (1 - p))
 
-def sigmoid(x: float) -> float:
-    x = max(-15.0, min(15.0, x))
-    return 1.0 / (1.0 + math.exp(-x))
 
-# ============================================================
-# STATE
-# ============================================================
-class BotState:
-    def __init__(self):
-        self.history: List[Dict[str, Any]] = []
-        self.loss_streak = 0
-        self.win_streak = 0
-        self.recovery_mode = False
+def sigmoid(z):
+    z = max(-20.0, min(20.0, float(z)))
+    return 1.0 / (1.0 + math.exp(-z))
 
-    def save_cache(self):
-        try:
-            with open(CFG.cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.history[-CFG.max_history:], f)
-        except Exception: pass
 
-    def load_cache(self):
-        try:
-            if os.path.exists(CFG.cache_file):
-                with open(CFG.cache_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        self.history = data[-CFG.max_history:]
-        except Exception: pass
+def escape(x):
+    return html.escape(str(x))
 
-STATE = BotState()
 
-# ============================================================
-# STORAGE
-# One unified, honest tracking system (replaces the old pair of
-# pattern_penalties + pattern_memory tables, which duplicated state and
-# could disagree with each other) plus a new engine_stats table that
-# shadow-tracks EVERY sub-engine's own live accuracy every round, whether
-# it was the one actually used or not — that's what lets the fusion step
-# below trust whichever engines are genuinely working right now instead
-# of a fixed hard-coded preference order.
-# ============================================================
-class Storage:
-    def __init__(self, path: str):
-        self.path = path
-        self._init_db()
-
-    def _conn(self):
-        conn = sqlite3.connect(self.path, timeout=20)
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
-
-    def _init_db(self):
-        with self._conn() as c:
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS predictions (
-                    issue TEXT PRIMARY KEY, pred_type TEXT, size TEXT, num INTEGER,
-                    status TEXT DEFAULT 'PENDING', actual_num INTEGER, actual_size TEXT,
-                    logic TEXT, details TEXT, stake TEXT, created_at REAL
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS pattern_stats (
-                    pattern_key TEXT PRIMARY KEY,
-                    w_hits REAL DEFAULT 0, w_total REAL DEFAULT 0,
-                    total_preds INTEGER DEFAULT 0, total_wins INTEGER DEFAULT 0,
-                    strikes INTEGER DEFAULT 0, blacklisted INTEGER DEFAULT 0,
-                    recent TEXT DEFAULT '[]', last_seen REAL DEFAULT 0
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS engine_stats (
-                    engine_name TEXT PRIMARY KEY,
-                    w_hits REAL DEFAULT 0, w_total REAL DEFAULT 0,
-                    total_preds INTEGER DEFAULT 0, total_wins INTEGER DEFAULT 0,
-                    last_seen REAL DEFAULT 0
-                )
-            """)
-
-    # ---- predictions (unchanged shape) ----
-    def save_prediction(self, p: Dict[str, Any]):
-        with self._conn() as c:
-            c.execute("""
-                INSERT OR IGNORE INTO predictions
-                (issue, pred_type, size, num, logic, details, stake, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (p["issue"], p["type"], p.get("size", ""), p.get("num", 0), p.get("logic", "N/A"),
-                  json.dumps(p.get("details", {})), p.get("stake", "1x"), time.time()))
-
-    def prediction_exists(self, issue: str) -> bool:
-        with self._conn() as c:
-            return c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone() is not None
-
-    def resolve_pending(self, history_by_issue):
-        resolved = []
-        with self._conn() as c:
-            rows = c.execute("SELECT issue, pred_type, size, num, details, stake FROM predictions WHERE status='PENDING'").fetchall()
-
-        for issue, pred_type, p_size, p_num, details_json, stake in rows:
-            act = history_by_issue.get(str(issue))
-            if not act: continue
-
-            actual_size = "BIG" if act["size"] == 1 else "SMALL"
-            win = (p_size == actual_size) if p_size else False
-            status = "JACK 🏆" if (win and p_num == act["num"]) else "WIN ✅" if win else "LOSS ❌"
-
-            with self._conn() as c2:
-                c2.execute("UPDATE predictions SET status=?, actual_num=?, actual_size=? WHERE issue=?",
-                           (status, act["num"], actual_size, issue))
-
-            resolved.append({
-                "issue": issue, "type": pred_type or "SIZE", "size": p_size, "num": p_num, "stake": stake,
-                "actual_num": act["num"], "actual_size": actual_size, "status": status, "win": win,
-                "details": json.loads(details_json) if details_json else {}
-            })
-        return resolved
-
-    def recent_outcomes(self, limit: int = 12):
-        with self._conn() as c:
-            rows = c.execute(
-                "SELECT issue, size, status FROM predictions WHERE status != 'PENDING' ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
-                (limit,)).fetchall()
-        return rows[::-1]
-
-    # ---- unified pattern tracking ----
-    def get_pattern_stats(self, key: str) -> Dict[str, Any]:
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT w_hits, w_total, total_preds, total_wins, strikes, blacklisted, recent FROM pattern_stats WHERE pattern_key=?",
-                (key,)).fetchone()
-        if not row:
-            return {"w_hits": 0.0, "w_total": 0.0, "total_preds": 0, "total_wins": 0,
-                     "strikes": 0, "blacklisted": False, "recent": []}
-        return {"w_hits": row[0], "w_total": row[1], "total_preds": row[2], "total_wins": row[3],
-                "strikes": row[4], "blacklisted": bool(row[5]), "recent": json.loads(row[6] or "[]")}
-
-    def record_pattern_result(self, key: str, won: bool):
-        """
-        Replaces the old binary is_flipped-after-2-losses rule (which
-        flip-flops on pure noise — a genuinely 50-55% pattern hits 2
-        losses in a row roughly 1 round in 4-5, so the old logic was
-        inverting itself constantly, then inverting back, etc.) with:
-          - decayed Bayesian hit/total counts, so recent rounds matter
-            most but nothing is thrown away after one bad round
-          - a 3-STRIKES BLACKLIST instead of a flip: a pattern that keeps
-            losing sits OUT of the vote rather than being inverted and
-            instantly trusted in the opposite direction with zero
-            evidence that direction is any better
-          - 2 consecutive wins (while still being graded, even while
-            blacklisted) lift the blacklist
-        """
-        st = self.get_pattern_stats(key)
-        decay = 0.94
-        w_hits = st["w_hits"] * decay + (1.0 if won else 0.0)
-        w_total = st["w_total"] * decay + 1.0
-        total_preds = st["total_preds"] + 1
-        total_wins = st["total_wins"] + (1 if won else 0)
-        recent = (st["recent"] + [1 if won else 0])[-12:]
-
-        strikes = st["strikes"]
-        blacklisted = st["blacklisted"]
-        if won:
-            strikes = 0
-            if blacklisted and len(recent) >= 2 and recent[-2:] == [1, 1]:
-                blacklisted = False
-        else:
-            strikes += 1
-            if strikes >= 3:
-                blacklisted = True
-
-        with self._conn() as c:
-            c.execute("""
-                INSERT INTO pattern_stats (pattern_key, w_hits, w_total, total_preds, total_wins, strikes, blacklisted, recent, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(pattern_key) DO UPDATE SET
-                    w_hits=excluded.w_hits, w_total=excluded.w_total,
-                    total_preds=excluded.total_preds, total_wins=excluded.total_wins,
-                    strikes=excluded.strikes, blacklisted=excluded.blacklisted,
-                    recent=excluded.recent, last_seen=excluded.last_seen
-            """, (key, w_hits, w_total, total_preds, total_wins, strikes, int(blacklisted), json.dumps(recent), time.time()))
-
-    def pattern_lower_bound(self, key: str) -> Tuple[float, int]:
-        st = self.get_pattern_stats(key)
-        if st["blacklisted"]:
-            return 0.0, st["total_preds"]
-        return wilson_lb(st["w_hits"], st["w_total"]), st["total_preds"]
-
-    def cleanup_pattern_stats(self, keep: Optional[int] = None):
-        keep = keep or CFG.pattern_stats_cap
-        with self._conn() as c:
-            n = c.execute("SELECT COUNT(*) FROM pattern_stats").fetchone()[0]
-            if n > keep:
-                c.execute("""
-                    DELETE FROM pattern_stats WHERE pattern_key IN (
-                        SELECT pattern_key FROM pattern_stats ORDER BY last_seen ASC LIMIT ?
-                    )
-                """, (n - keep,))
-
-    # ---- per sub-engine live accuracy (shadow-tracked every round) ----
-    def record_engine_result(self, name: str, won: bool):
-        with self._conn() as c:
-            row = c.execute("SELECT w_hits, w_total, total_preds, total_wins FROM engine_stats WHERE engine_name=?",
-                            (name,)).fetchone()
-        decay = 0.96
-        w_hits0, w_total0, tp0, tw0 = (0.0, 0.0, 0, 0) if not row else row
-        w_hits = w_hits0 * decay + (1.0 if won else 0.0)
-        w_total = w_total0 * decay + 1.0
-        with self._conn() as c:
-            c.execute("""
-                INSERT INTO engine_stats (engine_name, w_hits, w_total, total_preds, total_wins, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(engine_name) DO UPDATE SET
-                    w_hits=excluded.w_hits, w_total=excluded.w_total,
-                    total_preds=excluded.total_preds, total_wins=excluded.total_wins, last_seen=excluded.last_seen
-            """, (name, w_hits, w_total, tp0 + 1, tw0 + (1 if won else 0), time.time()))
-
-    def engine_weight(self, name: str) -> float:
-        """Soft internal fusion weight — engines with little live data get a
-        small flat vote; engines not beating chance get pushed near zero."""
-        with self._conn() as c:
-            row = c.execute("SELECT w_hits, w_total, total_preds FROM engine_stats WHERE engine_name=?",
-                            (name,)).fetchone()
-        if not row or row[2] < 8:
-            return 0.35
-        lb = wilson_lb(row[0], row[1], z=1.28)
-        return 0.08 if lb <= 0.5 else (lb - 0.5) * 6.0
-
-    def engine_lb(self, name: str) -> Tuple[float, int]:
-        """Stricter, display/priority-grade lower bound (95% one-sided)."""
-        with self._conn() as c:
-            row = c.execute("SELECT w_hits, w_total, total_preds FROM engine_stats WHERE engine_name=?",
-                            (name,)).fetchone()
-        if not row or row[2] < 15:
-            return 0.0, 0 if not row else row[2]
-        return wilson_lb(row[0], row[1], z=1.645), row[2]
-
-STORE = Storage(CFG.db_path)
-
-# ============================================================
-# PATTERN MINER
-# Tests EVERY signature length 4-16 as a plain tail-substring of the
-# actual B/S sequence (not just run-compressed block suffixes like
-# before, which only ever produced a handful of candidates per round) —
-# a much larger, more thorough candidate space.
-# ============================================================
-def mine_exact_patterns(history: List[Dict[str, Any]], store: "Storage") -> List[Dict[str, Any]]:
-    seq = [1 if x["size"] == 1 else 0 for x in history]
-    N = len(seq)
-    out: List[Dict[str, Any]] = []
-    if N < 20:
-        return out
-    for L in range(16, 3, -1):
-        if N < L + CFG.min_repeat:
-            continue
-        tail = seq[-L:]
-        matches = [i for i in range(N - L) if seq[i:i + L] == tail]
-        if len(matches) < CFG.min_repeat:
-            continue
-        next_bits = [seq[i + L] for i in matches if i + L < N]
-        if not next_bits:
-            continue
-        total = len(next_bits)
-        decay = 0.90
-        weights = [decay ** (total - 1 - k) for k in range(total)]
-        w_big = sum(w for w, v in zip(weights, next_bits) if v == 1)
-        w_small = sum(w for w, v in zip(weights, next_bits) if v == 0)
-        w_tot = w_big + w_small or 1.0
-        p_big = (w_big + 1) / (w_tot + 2)      # Laplace smoothing
-        if abs(p_big - 0.5) < 0.06:
-            continue
-        key = "".join("B" if v else "S" for v in tail)
-        lb, n_live = store.pattern_lower_bound(key)
-        out.append({
-            "key": key, "length": L, "n_hist": total, "p_big": p_big,
-            "dir": 1 if p_big >= 0.5 else 0, "lb": lb, "n_live": n_live,
-        })
-    out.sort(key=lambda d: (d["lb"], d["length"]), reverse=True)
-    return out
-
-def fuzzy_match_signal(seq: List[int]) -> Optional[Tuple[int, float, float]]:
-    """Approximate (Hamming-similarity ≥5/7) match — a genuinely different
-    technique from exact matching, catches near-repeats exact matching
-    would miss entirely."""
-    N = len(seq)
-    win = 7
-    if N < win * 3:
-        return None
-    recent = seq[-win:]
-    m_big = m_small = 0
-    for i in range(0, N - win * 2):
-        w = seq[i:i + win]
-        sim = sum(1 for a, b in zip(w, recent) if a == b)
-        if sim >= 5:
-            nxt = seq[i + win] if i + win < N else None
-            if nxt is not None:
-                if nxt == 1: m_big += 1
-                else: m_small += 1
-    total = m_big + m_small
-    if total < 3:
-        return None
-    p_big = (m_big + 1) / (total + 2)
-    if abs(p_big - 0.5) < 0.06:
-        return None
-    return (1 if p_big >= 0.5 else 0, p_big, min(1.0, total / 10.0))
-
-def gap_theory_signal(seq: List[int]) -> Optional[Tuple[int, float]]:
-    """How long since the OPPOSITE side last appeared — the longer the
-    gap, the more "due" that side is considered."""
-    if len(seq) < 10:
-        return None
-    last = seq[-1]
-    opp = 1 - last
-    gap = None
-    for i, v in enumerate(reversed(seq[:-1])):
-        if v == opp:
-            gap = i + 1
+def run_length(seq):
+    if not seq:
+        return 0
+    n = 0
+    for x in reversed(seq):
+        if x != seq[-1]:
             break
-    if gap is None or gap < 5:
+        n += 1
+    return n
+
+
+def entropy(seq):
+    if not seq:
+        return 0.0
+    p1 = sum(seq) / len(seq)
+    p0 = 1.0 - p1
+    e = 0.0
+    if p0 > 0:
+        e -= p0 * math.log2(p0)
+    if p1 > 0:
+        e -= p1 * math.log2(p1)
+    return e
+
+
+def regime(seq):
+    tail = seq[-24:]
+    if len(tail) < 8:
+        return "COLD"
+    flips = sum(a != b for a, b in zip(tail, tail[1:]))
+    rate = flips / (len(tail) - 1)
+    if run_length(tail) >= 4:
+        return "RUN"
+    if rate >= 0.70:
+        return "ALT"
+    if abs(sum(tail) / len(tail) - 0.5) > 0.20:
+        return "IMBAL"
+    return "MIXED"
+
+
+def numeric(value):
+    if isinstance(value, bool):
         return None
-    strength = min(1.0, (gap - 4) / 8.0) * 0.9
-    return (opp, strength)
+    text = str(value).strip()
+    return int(text) if text.isascii() and text.isdigit() else None
 
-def alternation_break_signal(seq: List[int]) -> Optional[Tuple[int, float]]:
-    """6 perfectly alternating results in a row is itself an unusual event
-    — bet on the alternation finally breaking."""
-    if len(seq) < 7:
-        return None
-    tail = seq[-6:]
-    strict = all(tail[i] != tail[i + 1] for i in range(len(tail) - 1))
-    if not strict:
-        return None
-    return (1 - seq[-1], 0.7)
 
-def advanced_markov(seq: List[int], max_n: int = 4) -> Tuple[float, float]:
-    if len(seq) < 5: return 0.5, 0.0
-    total_score, total_weight = 0.0, 0.0
-    for n in range(2, max_n + 1):
-        if len(seq) <= n: continue
-        pattern = tuple(seq[-n:])
-        match_count, big_count = 0, 0
-        for i in range(len(seq) - n):
-            if tuple(seq[i:i+n]) == pattern:
-                match_count += 1
-                if seq[i+n] == 1: big_count += 1
-        if match_count >= 2:
-            prob = big_count / match_count
-            weight = match_count * (n ** 1.5)
-            total_score += prob * weight
-            total_weight += weight
-    return (total_score / total_weight, total_weight) if total_weight > 0 else (0.5, 0.0)
+def parse_history(payload):
+    obj = payload
+    for _ in range(6):
+        if isinstance(obj, list):
+            break
+        if not isinstance(obj, dict):
+            return []
+        obj = next(
+            (
+                obj[k]
+                for k in ("data", "list", "result", "items", "history")
+                if isinstance(obj.get(k), (list, dict))
+            ),
+            None,
+        )
+    if not isinstance(obj, list):
+        return []
 
-# ============================================================
-# SIGNAL GATHERING + FUSION
-# Every detector returns its own raw directional call + raw evidence
-# strength; the fusion step below is what decides how much to actually
-# trust each one, based on that engine's OWN live track record — nothing
-# is hard-coded as "the preferred" engine the way the old pattern-first
-# logic was.
-# ============================================================
-def gather_signals(history: List[Dict[str, Any]], store: "Storage") -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    seq = [x["size"] for x in history]
-    N = len(seq)
-    signals: List[Dict[str, Any]] = []
-
-    exact_candidates = mine_exact_patterns(history, store)
-    top_pattern = exact_candidates[0] if exact_candidates else None
-    if top_pattern and not store.get_pattern_stats(top_pattern["key"])["blacklisted"]:
-        conf = 0.5 + abs(top_pattern["p_big"] - 0.5) * min(1.0, math.log(top_pattern["n_hist"] + 1) / math.log(15))
-        signals.append({"name": "PatternExact", "dir": top_pattern["dir"], "conf": conf})
-
-    fz = fuzzy_match_signal(seq)
-    if fz:
-        d, p, ev = fz
-        signals.append({"name": "PatternFuzzy", "dir": d, "conf": 0.5 + abs(p - 0.5) * ev})
-
-    gt = gap_theory_signal(seq)
-    if gt:
-        d, strength = gt
-        signals.append({"name": "GapTheory", "dir": d, "conf": 0.5 + strength * 0.4})
-
-    ab = alternation_break_signal(seq)
-    if ab:
-        d, strength = ab
-        signals.append({"name": "AltBreak", "dir": d, "conf": 0.5 + strength * 0.4})
-
-    mk_prob, mk_weight = advanced_markov(seq)
-    if mk_weight > 0 and abs(mk_prob - 0.5) >= 0.05:
-        signals.append({"name": "Markov", "dir": 1 if mk_prob >= 0.5 else 0, "conf": max(mk_prob, 1 - mk_prob)})
-
-    run = trailing_run(seq)
-    if run >= 3:
-        signals.append({"name": "TrendFollow", "dir": seq[-1], "conf": 0.5 + min(0.25, run * 0.04)})
-
-    if N >= 20:
-        sma5, sma20 = sum(seq[-5:]) / 5, sum(seq[-20:]) / 20
-        if abs(sma5 - sma20) > 0.12:
-            d = 1 if sma5 > sma20 else 0
-            signals.append({"name": "SmaCross", "dir": d, "conf": 0.5 + min(0.2, abs(sma5 - sma20))})
-
-    return signals, top_pattern
-
-ALL_ENGINE_NAMES = ["PatternExact", "PatternFuzzy", "GapTheory", "AltBreak", "Markov", "TrendFollow", "SmaCross"]
-
-def fuse_signals(signals: List[Dict[str, Any]], store: "Storage") -> Tuple[int, float, List[str]]:
-    """Log-odds fusion weighted by each sub-engine's OWN live (Wilson lower
-    bound) accuracy — an engine that isn't beating chance gets pushed
-    toward a near-zero vote automatically, every round, forever; nothing
-    is assumed good just because it sounds sophisticated."""
-    lo_sum, wt_sum = 0.0, 0.0
-    used = []
-    for s in signals:
-        ew = store.engine_weight(s["name"])
-        cw = max(0.0, s["conf"] - 0.5) * 2.0 * ew
-        if cw <= 1e-6:
+    records = {}
+    for item in obj:
+        if not isinstance(item, dict):
             continue
-        p = s["conf"] if s["dir"] == 1 else 1 - s["conf"]
-        lo_sum += logit(p) * cw
-        wt_sum += cw
-        used.append(s["name"])
-    if wt_sum < 1e-6:
-        return (1 if random.random() > 0.5 else 0), 0.5, []
-    p_final = sigmoid(lo_sum / wt_sum)
-    return (1 if p_final >= 0.5 else 0), max(p_final, 1 - p_final), used
-
-def apply_pre_pattern_priority(final_dir: int, final_conf: float, top_pattern: Optional[Dict[str, Any]],
-                                store: "Storage") -> Tuple[int, float, str]:
-    """A specific pattern with ≥65% of its OWN live, round-by-round graded
-    calls correct (Wilson lower bound, ≥8 graded rounds, not blacklisted)
-    outranks the weighted vote outright — UNLESS some engine's own proven
-    live accuracy is even higher than that."""
-    if not top_pattern:
-        return final_dir, final_conf, ""
-    lb, n_live = store.pattern_lower_bound(top_pattern["key"])
-    if n_live < 8 or lb < 0.65:
-        return final_dir, final_conf, ""
-    best_engine_lb = 0.0
-    for name in ALL_ENGINE_NAMES:
-        elb, en = store.engine_lb(name)
-        if en >= 15:
-            best_engine_lb = max(best_engine_lb, elb)
-    if best_engine_lb > lb:
-        return final_dir, final_conf, ""
-    return top_pattern["dir"], max(final_conf, lb), " +PRE65"
-
-# ============================================================
-# NUMBER PREDICTOR — deterministic (the old version used
-# random.randint() inside the "prediction", so the exact same history
-# could produce a different number guess every time it was asked; that's
-# not a prediction, it's noise wearing a label. Gap+frequency scoring is
-# stable: same history in, same number out.)
-# ============================================================
-def predict_number(history: List[Dict[str, Any]], direction: int) -> int:
-    cands = [5, 6, 7, 8, 9] if direction == 1 else [0, 1, 2, 3, 4]
-    nums = [x["num"] for x in history[-120:]]
-    if len(nums) < 8:
-        return cands[0]
-    n = len(nums)
-    gap = {}
-    for v in cands:
-        g = n
-        for i in range(n - 1, -1, -1):
-            if nums[i] == v:
-                g = n - 1 - i
-                break
-        gap[v] = g
-    freq = {v: 0.0 for v in cands}
-    for i, v in enumerate(nums):
-        if v in freq:
-            freq[v] += 1.0 / ((n - i) ** 0.4)
-    scored = []
-    for v in cands:
-        s = gap[v] * 0.8 + freq[v] * 1.0 + (9 - v) * 0.001   # tiny deterministic tie-break, not random
-        scored.append((s, v))
-    scored.sort(reverse=True)
-    return scored[0][1]
-
-# ============================================================
-# PREDICTION BUILD
-# ============================================================
-def build_prediction(history: List[Dict[str, Any]], issue: Any, store: "Storage") -> Dict[str, Any]:
-    if len(history) < CFG.min_history:
-        n = random.randint(0, 9)   # genuinely no data yet — an honest coin flip, not a fabricated "signal"
-        return {"issue": str(issue), "type": "SIZE", "size": "BIG" if n >= 5 else "SMALL", "num": n,
-                "raw_conf": 50, "logic": "WARMING UP", "stake": "0.5x", "details": {}}
-
-    seq_full = [x["size"] for x in history]
-    signals, top_pattern = gather_signals(history, store)
-    final_dir, final_conf, used = fuse_signals(signals, store)
-    final_dir, final_conf, pre_tag = apply_pre_pattern_priority(final_dir, final_conf, top_pattern, store)
-
-    # Cooldown now looks at the ENSEMBLE's own recent live record (Wilson
-    # lower bound over the last 10 resolved rounds) instead of a raw
-    # loss-streak trigger. 2-in-a-row is common even for a genuinely good
-    # predictor, and the old code both skipped AND flipped a pattern on
-    # that same noisy event — compounding into exactly the oscillation
-    # this rewrite is meant to fix.
-    recent_rows = store.recent_outcomes(10)
-    recent_results = [1 if ("WIN" in str(s) or "JACK" in str(s)) else 0 for _, _, s in recent_rows]
-    ens_lb = wilson_lb(sum(recent_results), len(recent_results), z=1.28) if len(recent_results) >= 8 else 0.55
-
-    if STATE.loss_streak >= 4 and ens_lb < 0.45:
-        return {"issue": str(issue), "type": "SIZE", "size": "SKIP", "num": 0, "raw_conf": 0,
-                "logic": f"COOLDOWN (streak={STATE.loss_streak}, live={ens_lb:.0%})", "stake": "0x", "details": {}}
-
-    pred_size = "BIG" if final_dir == 1 else "SMALL"
-    final_num = predict_number(history, final_dir)
-
-    logic_bits = []
-    if top_pattern:
-        logic_bits.append(f"PAT L{top_pattern['length']} n={top_pattern['n_hist']}")
-    if used:
-        logic_bits.append("+".join(used))
-    if pre_tag:
-        logic_bits.append(pre_tag.strip())
-    logic = " | ".join(logic_bits) if logic_bits else "ENSEMBLE"
-
-    conf_pct = int(clamp(final_conf, 0.50, 0.85) * 100)
-    stake = "2x" if conf_pct >= 72 else "1x" if conf_pct >= 60 else "0.5x"
-
-    shadow = {s["name"]: s["dir"] for s in signals}   # every engine's own call, graded live next round regardless of use
-
-    return {
-        "issue": str(issue), "type": "SIZE", "size": pred_size, "num": final_num,
-        "raw_conf": conf_pct, "logic": logic, "stake": stake,
-        "details": {
-            "signal_strength": signal_strength(history),
-            "regime": detect_regime(seq_full),
-            "pattern_key": top_pattern["key"] if top_pattern else None,
-            "shadow": shadow,
-        }
-    }
-
-# ============================================================
-# PARSE & FETCH
-# ============================================================
-def parse_history_payload(payload: Any) -> List[Dict[str, Any]]:
-    if payload is None: return []
-    if isinstance(payload, list): items = payload
-    elif isinstance(payload, dict):
-        if isinstance(payload.get("data"), list): items = payload["data"]
-        elif isinstance(payload.get("data"), dict): items = payload["data"].get("list", []) if isinstance(payload["data"].get("list"), list) else []
-        else: items = payload.get("result", payload.get("items", payload.get("history", [])))
-    else: items = []
-
-    out, seen = [], set()
-    for item in items:
-        if not isinstance(item, dict): continue
-        issue = normalize_issue(item.get("issueNumber", item.get("issue", "")))
-        if issue is None: continue
-        num = safe_int(item.get("number", item.get("value", 0)), 0)
-        if not (0 <= num <= 9): continue
+        issue = numeric(item.get("issueNumber", item.get("issue")))
+        number = numeric(item.get("number", item.get("value")))
+        if issue is None or number is None or not 0 <= number <= 9:
+            continue
         key = str(issue)
-        if key in seen: continue
-        seen.add(key)
-        out.append({"issue": key, "num": num, "size": 1 if num >= 5 else 0})
-    out.sort(key=lambda x: int(x["issue"]))
-    return out
+        if key in records and records[key]["num"] != number:
+            raise ValueError(f"Conflicting duplicate issue: {key}")
+        records[key] = {"issue": key, "num": number, "size": int(number >= 5)}
+    return sorted(records.values(), key=lambda x: int(x["issue"]))
 
-async def fetch_history(session):
-    for url in CFG.api_urls():
+
+def weighted_probability(observations):
+    sw = sum(w for _, w in observations)
+    sw2 = sum(w * w for _, w in observations)
+    effective_n = sw * sw / sw2 if sw2 else 0.0
+    probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
+    return probability, effective_n
+
+
+def logistic(weights, features):
+    z = sum(w * x for w, x in zip(weights, features))
+    return sigmoid(z)
+
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE ENGINE — 32 rich features
+# ─────────────────────────────────────────────────────────────
+def trend_features(seq):
+    if not seq:
+        return [0.0] * 32
+
+    def mean(k):
+        arr = seq[-k:]
+        return sum(arr) / len(arr) if arr else 0.5
+
+    def ema(k):
+        if not seq:
+            return 0.5
+        alpha = 2.0 / (k + 1)
+        val = float(seq[0])
+        for x in seq[1:]:
+            val = alpha * x + (1 - alpha) * val
+        return val
+
+    def rsi(period=14):
+        if len(seq) < period + 1:
+            return 50.0
+        gains = losses = 0.0
+        for i in range(-period, 0):
+            change = seq[i] - seq[i - 1]
+            if change > 0:
+                gains += change
+            else:
+                losses -= change
+        if losses == 0:
+            return 100.0
+        rs = gains / losses
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def std(k):
+        arr = seq[-k:]
+        if len(arr) < 2:
+            return 0.0
+        m = sum(arr) / len(arr)
+        return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
+
+    tail = seq[-24:]
+    alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
+    signed_run = (2 * seq[-1] - 1) * min(run_length(seq), 10) / 10.0
+    rsi_n = (rsi(14) / 100.0) * 2.0 - 1.0
+    macd = (ema(12) - ema(26)) * 2.0
+
+    autocorr = 0.0
+    if len(seq) >= 25 and std(24) > 0:
+        m24 = mean(24)
+        num = sum((seq[i] - m24) * (seq[i - 1] - m24) for i in range(-23, 0))
+        den = 24.0 * std(24) ** 2
+        autocorr = num / den if den > 0 else 0.0
+
+    return [
+        1.0,
+        2 * mean(3) - 1,
+        2 * mean(5) - 1,
+        2 * mean(10) - 1,
+        2 * mean(24) - 1,
+        2 * mean(48) - 1,
+        2 * mean(96) - 1,
+        mean(3) - mean(10),
+        mean(5) - mean(24),
+        mean(10) - mean(48),
+        signed_run,
+        2 * seq[-1] - 1,
+        (2 * alternation - 1) * (2 * seq[-1] - 1),
+        rsi_n,
+        macd,
+        (2 * std(10) - 1),
+        (2 * std(24) - 1),
+        entropy(seq[-24:]) - 1,
+        entropy(seq[-48:]) - 1,
+        autocorr,
+        1.0 if mean(5) > 0.5 else -1.0,
+        (2 * seq[-1] - 1) * (2 * mean(24) - 1),
+        abs(mean(24) - 0.5) * 2,
+        (2 * seq[-1] - 1) * (mean(10) - mean(48)),
+        (2 * mean(10) - 1) / (std(10) + 0.1),
+        (2 * mean(24) - 1) / (std(24) + 0.1),
+        (sum(seq[-10:]) / 10.0) - 0.5,
+        (sum(seq[-5:]) / 5.0) - 0.5,
+        (2 * mean(5) - 1) * (2 * mean(24) - 1),
+        math.tanh((mean(10) - 0.5) * 6),
+        math.tanh((mean(48) - 0.5) * 6),
+        (2 * mean(3) - 1) * (2 * mean(96) - 1),
+    ]
+
+
+EXPERT_NAMES = [
+    "patterns", "markov1", "markov2", "markov3", "markov4",
+    "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic",
+]
+
+
+# ─────────────────────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────────────────────
+class Database:
+    def __init__(self, path):
+        self.c = sqlite3.connect(path, isolation_level=None, timeout=20)
+        self.c.row_factory = sqlite3.Row
+        self.c.execute("PRAGMA journal_mode=WAL")
+        self.c.execute("PRAGMA synchronous=NORMAL")
+        self.c.executescript("""
+            CREATE TABLE IF NOT EXISTS history(
+                issue TEXT PRIMARY KEY,
+                num INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS predictions(
+                issue TEXT PRIMARY KEY,
+                created REAL NOT NULL,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                actual INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS models(
+                key TEXT PRIMARY KEY,
+                n REAL NOT NULL,
+                loss REAL NOT NULL,
+                inverse_loss REAL NOT NULL,
+                failures INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS outbox(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                issue TEXT,
+                text TEXT NOT NULL,
+                created REAL NOT NULL,
+                expires REAL,
+                sent INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
+    @contextmanager
+    def transaction(self):
+        self.c.execute("BEGIN IMMEDIATE")
         try:
-            async with session.get(url, timeout=CFG.request_timeout) as response:
-                if response.status != 200: continue
-                parsed = parse_history_payload(await response.json(content_type=None))
-                if parsed:
-                    STATE.history = parsed[-CFG.max_history:]
-                    STATE.save_cache()
-                    return True
-        except Exception: pass
-    return False
+            yield
+            self.c.execute("COMMIT")
+        except BaseException:
+            self.c.execute("ROLLBACK")
+            raise
 
-# ============================================================
-# FORMAT / SEND
-# ============================================================
-def normalize_recent_row(row: Any):
-    if not isinstance(row, (tuple, list)): return "", "", "", ""
-    if len(row) >= 3: return str(row[0]), str(row[1]), str(row[2]), ""
-    return "", "", "", ""
+    def get(self, key, default=None):
+        row = self.c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else default
 
-def format_prediction(pred: Dict[str, Any], recent_rows):
-    recent_lines = []
-    for r in recent_rows[-CFG.recent_limit:]:
-        issue, size, status, _ = normalize_recent_row(r)
-        if not issue: continue
-        recent_lines.append(f"➜ <code>{h(issue[-4:])}</code> {h(size)} → <b>{h(status)}</b>" if status else f"➜ <code>{h(issue[-4:])}</code> {h(size)}")
-    return f"""
-📌 <b>Period</b>: <code>{h(pred['issue'])}</code>
-📊 <b>Target Size</b>: <b>{h(pred['size'])}</b>
-🎯 <b>Target No</b>: <code>{h(pred['num'])}</code>
+    def set(self, key, value):
+        self.c.execute(
+            "INSERT INTO meta VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(value)),
+        )
 
-🧠 <b>Engine</b>: {h(pred.get('logic', 'N/A'))}
-📊 <b>Confidence</b>: <b>{pred['raw_conf']}%</b>
-💰 <b>Stake</b>: <b>{h(pred['stake'])}</b>
+    def ingest(self, records):
+        with self.transaction():
+            for r in records:
+                old = self.c.execute(
+                    "SELECT num FROM history WHERE issue=?", (r["issue"],)
+                ).fetchone()
+                if old and old["num"] != r["num"]:
+                    raise ValueError(f"Source changed settled issue {r['issue']}")
+                self.c.execute(
+                    "INSERT OR IGNORE INTO history VALUES (?,?)",
+                    (r["issue"], r["num"]),
+                )
+            self.c.execute(
+                "DELETE FROM history WHERE issue NOT IN "
+                "(SELECT issue FROM history "
+                "ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)",
+                (CFG.max_history,),
+            )
 
-━━━━━━━━━━━━━━━━━━
-🕒 <b>Recent</b>:
-{chr(10).join(recent_lines)}
-━━━━━━━━━━━━━━━━━━
-⚡ <i>{h(CFG.bot_name)}</i>
-"""
+    def history(self):
+        rows = self.c.execute(
+            "SELECT issue,num FROM history ORDER BY CAST(issue AS INTEGER)"
+        ).fetchall()
+        return [
+            {"issue": r["issue"], "num": r["num"], "size": int(r["num"] >= 5)}
+            for r in rows
+        ]
 
-def format_result(res: Dict[str, Any]):
-    return f"🎯 <b>Result</b>\nPeriod: <code>{h(res['issue'])}</code>\nPred: <b>{h(res['size'])} {h(res['num'])}</b>\nAct: {h(res['actual_size'])} {h(res['actual_num'])}\n<b>{h(res['status'])}</b>"
+    def memory(self, key):
+        row = self.c.execute("SELECT * FROM models WHERE key=?", (key,)).fetchone()
+        return dict(row) if row else {
+            "n": 0.0, "loss": 0.0, "inverse_loss": 0.0, "failures": 0,
+        }
 
-async def send_msg(bot, text: str, retries: int = 3):
-    for attempt in range(retries):
+    def learn(self, key, probability, actual):
+        m = self.memory(key)
+        n = CFG.decay * m["n"] + 1
+        loss = CFG.decay * m["loss"] + (probability - actual) ** 2
+        inv = CFG.decay * m["inverse_loss"] + (1 - probability - actual) ** 2
+        wrong = int(probability >= 0.5) != actual
+        failures = m["failures"] + 1 if wrong else 0
+        self.c.execute(
+            "INSERT INTO models VALUES (?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "n=excluded.n,loss=excluded.loss,"
+            "inverse_loss=excluded.inverse_loss,"
+            "failures=excluded.failures",
+            (key, n, loss, inv, failures),
+        )
+
+    def adapt(self, key, probability):
+        m = self.memory(key)
+        n = m["n"]
+        if n < 1:
+            return probability, 0.65, False
+
+        brier = m["loss"] / n
+        inverse_brier = m["inverse_loss"] / n
+
+        flipped = (
+            n >= 25
+            and inverse_brier + 0.04 < brier
+            and inverse_brier < 0.245
+        )
+        effective_loss = inverse_brier if flipped else brier
+        p = 1 - probability if flipped else probability
+
+        reliability = clip((0.28 - effective_loss) / 0.08, 0.0, 1.0)
+        maturity = min(n / 30.0, 1.0)
+        shrink = (1 - maturity) * 0.65 + maturity * reliability
+        p = 0.5 + (p - 0.5) * shrink
+
+        weight = clip(math.exp(-8 * (effective_loss - 0.25)), 0.15, 2.0)
+        if m["failures"] >= 3 and not flipped:
+            weight *= 0.35
+        return clip(p), weight, flipped
+
+    def queue(self, kind, issue, text, expires=None):
+        self.c.execute(
+            "INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)",
+            (kind, issue, text, time.time(), expires),
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# ENGINE
+# ─────────────────────────────────────────────────────────────
+class Engine:
+    def __init__(self, db):
+        self.db = db
+
+    # ---- pattern mining (exact + skip-gram + 1-mismatch) ----
+    def mine_patterns(self, seq):
+        n = len(seq)
+        candidates = {}
+
+        def weight(idx):
+            return 0.5 ** ((n - 1 - idx) / 300.0)
+
+        # 1) Exact suffix matches
+        for length in range(2, CFG.max_pattern + 1):
+            if n < length * 3:
+                break
+            suffix = tuple(seq[-length:])
+            obs = []
+            last = -length - 1
+            for i in range(length, n - length):
+                if tuple(seq[i - length:i]) == suffix and i - last >= length + 1:
+                    obs.append((seq[i], weight(i)))
+                    last = i
+            if len(obs) >= CFG.min_support:
+                p, eff_n = weighted_probability(obs)
+                if eff_n >= CFG.min_support * 0.5:
+                    bits = "".join("B" if x else "S" for x in suffix)
+                    key = f"exact:{bits}"
+                    rank = abs(p - 0.5) * math.sqrt(eff_n)
+                    candidates[key] = (rank, p, len(obs), eff_n, key)
+
+        # 2) Skip-gram patterns (1 wildcard, length 5-8)
+        for length in range(5, min(9, CFG.max_pattern + 1)):
+            if n < length * 3:
+                continue
+            for gap in range(length - 1):
+                suffix_items = tuple(x for i, x in enumerate(seq[-length:]) if i != gap)
+                obs = []
+                last = -length - 1
+                for i in range(length, n - length):
+                    cand = tuple(x for j, x in enumerate(seq[i - length:i]) if j != gap)
+                    if cand == suffix_items and i - last >= length + 1:
+                        obs.append((seq[i], weight(i) * 0.9))
+                        last = i
+                if len(obs) >= CFG.min_support + 3:
+                    p, eff_n = weighted_probability(obs)
+                    if eff_n >= (CFG.min_support + 3) * 0.5:
+                        bits = "".join("B" if x else "S" for x in suffix_items)
+                        key = f"gap{gap}:{bits}"
+                        rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.85
+                        if key not in candidates or candidates[key][0] < rank:
+                            candidates[key] = (rank, p, len(obs), eff_n, key)
+
+        # 3) Mismatch tolerance (Hamming ≤ 1, length 6-8)
+        for length in range(6, min(9, CFG.max_pattern + 1)):
+            if n < length * 3:
+                continue
+            suffix = tuple(seq[-length:])
+            obs = []
+            last = -length - 1
+            for i in range(length, n - length):
+                window = tuple(seq[i - length:i])
+                mm = sum(a != b for a, b in zip(window, suffix))
+                if mm <= 1 and i - last >= length + 1:
+                    w = weight(i) * (1.0 if mm == 0 else 0.55)
+                    obs.append((seq[i], w))
+                    last = i
+            if len(obs) >= CFG.min_support + 3:
+                p, eff_n = weighted_probability(obs)
+                if eff_n >= (CFG.min_support + 3) * 0.5:
+                    bits = "".join("B" if x else "S" for x in suffix)
+                    key = f"mm1:{bits}"
+                    rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.75
+                    if key not in candidates or candidates[key][0] < rank:
+                        candidates[key] = (rank, p, len(obs), eff_n, key)
+
+        ranked = sorted(candidates.values(), key=lambda x: x[0], reverse=True)
+        return ranked[:8]
+
+    # ---- 12 experts ----
+    def mine_experts(self, seq):
+        n = len(seq)
+        experts = {}
+
+        def weight(idx):
+            return 0.5 ** ((n - 1 - idx) / 300.0)
+
+        # Patterns expert
+        patterns = self.mine_patterns(seq)
+        if patterns:
+            num = den = 0.0
+            for rank, p, support, eff_n, key in patterns:
+                adjusted, w, _ = self.db.adapt(key, p)
+                w *= math.sqrt(eff_n)
+                num += adjusted * w
+                den += w
+            if den > 0:
+                experts["patterns"] = num / den
+
+        # Markov chains (order 1-4)
+        for order in (1, 2, 3, 4):
+            suffix = tuple(seq[-order:])
+            obs = [
+                (seq[i], weight(i))
+                for i in range(order, n - order)
+                if tuple(seq[i - order:i]) == suffix
+            ]
+            if len(obs) >= CFG.min_support:
+                experts[f"markov{order}"] = weighted_probability(obs)[0]
+
+        # Run expert
+        current_run = min(run_length(seq), 8)
+        run_obs = []
+        for i in range(24, n):
+            past = seq[max(0, i - 96):i]
+            if past and past[-1] == seq[-1] and min(run_length(past), 8) == current_run:
+                run_obs.append((seq[i], weight(i)))
+        if len(run_obs) >= CFG.min_support:
+            experts["run"] = weighted_probability(run_obs)[0]
+
+        # Regime expert
+        current_regime = regime(seq)
+        regime_obs = []
+        for i in range(24, n):
+            past = seq[max(0, i - 96):i]
+            if past and regime(past) == current_regime:
+                regime_obs.append((seq[i], weight(i)))
+        if len(regime_obs) >= CFG.min_support:
+            experts["regime"] = weighted_probability(regime_obs)[0]
+
+        # Base expert
+        experts["base"] = weighted_probability(
+            [(y, weight(i)) for i, y in enumerate(seq)]
+        )[0]
+
+        # Neighbors expert (KNN)
+        length = 10
+        if n >= 3 * length:
+            suffix = tuple(seq[-length:])
+            nearest = []
+            for i in range(length, n - length):
+                prev = seq[i - length:i]
+                dist = sum(a != b for a, b in zip(prev, suffix))
+                if dist <= 2:
+                    nearest.append((seq[i], weight(i) * 0.4 ** dist))
+            if len(nearest) >= 20:
+                experts["neighbors"] = weighted_probability(nearest)[0]
+
+        # Trend expert (logistic regression on 32 features)
+        features = trend_features(seq)
+        weights = self.db.get("trend_weights")
+        if not isinstance(weights, list) or len(weights) != len(features):
+            weights = [0.0] * len(features)
+        experts["trend"] = logistic(weights, features)
+
+        # Momentum expert
+        recent = seq[-5:]
+        momentum = sum(recent) / len(recent) if recent else 0.5
+        experts["momentum"] = 0.2 + (momentum * 0.6)
+
+        # Cyclic expert
+        cyclic_p = self._cyclic_expert(seq)
+        if cyclic_p is not None:
+            experts["cyclic"] = cyclic_p
+
+        return experts, patterns, features
+
+    def _cyclic_expert(self, seq):
+        n = len(seq)
+        if n < 30:
+            return None
+        best_period = None
+        best_match = 0.0
+        for period in range(2, 7):
+            if n < period * 4:
+                continue
+            matches = total = 0
+            for i in range(n - 1, max(-1, n - 30), -1):
+                if i - period < 0:
+                    break
+                total += 1
+                if seq[i] == seq[i - period]:
+                    matches += 1
+            if total > 0:
+                rate = matches / total
+                if rate > best_match:
+                    best_match = rate
+                    best_period = period
+        if best_period is None or best_match < 0.62:
+            return None
+        base_idx = n - best_period
+        if base_idx >= 0:
+            return float(seq[base_idx])
+        return None
+
+    # ---- meta-learner ----
+    def _meta_predict(self, experts):
+        feats = [logit(clip(experts.get(name, 0.5), 0.05, 0.95)) for name in EXPERT_NAMES]
+        feats.append(1.0)
+        weights = self.db.get("meta_weights")
+        if not isinstance(weights, list) or len(weights) != len(feats):
+            weights = [0.0] * len(feats)
+        z = sum(w * f for w, f in zip(weights, feats))
+        return sigmoid(z), feats
+
+    def _update_meta(self, feats, y, lr):
+        weights = self.db.get("meta_weights")
+        if not isinstance(weights, list) or len(weights) != len(feats):
+            weights = [0.0] * len(feats)
+        z = sum(w * f for w, f in zip(weights, feats))
+        p = sigmoid(z)
+        grad_scale = 2.0 * (y - p) * p * (1.0 - p)
+        new_weights = []
+        for w, f in zip(weights, feats):
+            nw = w * 0.999 + lr * grad_scale * f
+            new_weights.append(max(-4.0, min(4.0, nw)))
+        self.db.set("meta_weights", new_weights)
+        self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
+
+    # ---- calibration ----
+    def _calibrate(self, p_raw, current_regime):
+        bucket = min(19, int(p_raw * 20))
+        n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
+        p_global = (30 * p_raw + s_g) / (30 + n_g)
+        n_r, s_r = self.db.get(f"cal20:{current_regime}:{bucket}", [0.0, 0.0])
+        p_regime = (30 * p_raw + s_r) / (30 + n_r)
+        regime_weight = min(n_r / 40.0, 1.0)
+        p = regime_weight * p_regime + (1 - regime_weight) * p_global
+        return clip(p)
+
+    # ---- number predictor ----
+    def _predict_number(self, seq_nums, pred_side):
+        valid = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
+        if not seq_nums:
+            return random.choice(valid), {}
+
+        last_num = seq_nums[-1]
+        matrix = self.db.get("num_matrix", {})
+        trans = matrix.get(str(last_num), {})
+        total_trans = sum(trans.values()) if trans else 0
+
+        freq = self.db.get("num_freq", {})
+        total_freq = sum(freq.values()) if freq else 0
+
+        recent = seq_nums[-100:]
+        recent_count = Counter(recent)
+
+        scores = {}
+        for n in valid:
+            s = 0.0
+            if total_trans > 0:
+                s += 0.45 * (trans.get(str(n), 0) / total_trans)
+            if total_freq > 0:
+                s += 0.25 * (freq.get(str(n), 0) / total_freq)
+            if recent_count:
+                s += 0.30 * (recent_count.get(n, 0) / len(recent))
+            scores[n] = s
+
+        if not scores or max(scores.values()) == 0:
+            return random.choice(valid), scores
+        best = max(scores, key=scores.get)
+        return best, scores
+
+    # ---- Kelly stake ----
+    def _kelly_stake(self, selected_prob):
+        edge = 2.0 * selected_prob - 1.0
+        if edge <= 0:
+            return 0.5
+        raw = 0.1 * edge
+        mult = raw / 0.02
+        return max(0.5, min(CFG.kelly_cap, round(mult * 4) / 4))
+
+    # ───────────── MAIN PREDICT ─────────────
+    def predict(self, history, issue):
+        seq = [r["size"] for r in history]
+        nums = [r["num"] for r in history]
+
+        experts, patterns, features = self.mine_experts(seq)
+        current_regime = regime(seq)
+        current_streak = run_length(seq)
+
+        # 1) per-expert adaptation
+        adjusted = []
+        flipped_models = []
+        for name, p in experts.items():
+            key = f"expert:{name}:{current_regime}"
+            corrected, weight, flipped = self.db.adapt(key, p)
+            if name == "momentum" and current_streak >= 3:
+                weight *= 2.2
+            if name == "trend" and current_regime in ("RUN", "IMBAL"):
+                weight *= 1.4
+            adjusted.append((corrected, weight))
+            if flipped:
+                flipped_models.append(name)
+
+        # 2) weighted average
+        total_w = sum(w for _, w in adjusted)
+        p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
+
+        # 3) meta-learner blend
+        meta_p, meta_feats = self._meta_predict(experts)
+        n_meta = self.db.get("meta_n", 0)
+        alpha = min(n_meta / 80.0, 1.0)
+        p_raw = alpha * meta_p + (1 - alpha) * p_avg
+
+        # 4) momentum override during streak
+        if current_streak >= 3:
+            trend_side = seq[-1]
+            momentum_p = 0.65 if trend_side == 1 else 0.35
+            p_raw = 0.7 * p_raw + 0.3 * momentum_p
+
+        # 5) calibration
+        p_cal = self._calibrate(p_raw, current_regime)
+
+        # 6) decide side
+        pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+        selected_prob = p_cal if p_cal >= 0.5 else 1.0 - p_cal
+
+        # 7) number
+        pred_num, num_scores = self._predict_number(nums, pred_side)
+
+        # 8) agreement
+        big_count = sum(1 for p, w in adjusted if p >= 0.5)
+        total_count = len(adjusted)
+        agreement = max(big_count, total_count - big_count) / total_count if total_count else 0.5
+
+        # 9) stake
+        stake = self._kelly_stake(selected_prob)
+
+        return {
+            "issue": issue,
+            "p": p_cal,
+            "p_raw": p_raw,
+            "p_avg": p_avg,
+            "p_meta": meta_p,
+            "side": pred_side,
+            "num": pred_num,
+            "num_scores": {str(k): v for k, v in num_scores.items()},
+            "action": "SIGNAL",
+            "regime": current_regime,
+            "experts": experts,
+            "patterns": [
+                {"key": key, "p": prob, "support": supp}
+                for rank, prob, supp, eff_n, key in patterns
+            ],
+            "features": features,
+            "meta_feats": meta_feats,
+            "flipped": flipped_models,
+            "agreement": agreement,
+            "stake": stake,
+            "selected_prob": selected_prob,
+        }
+
+    # ───────────── SETTLE ─────────────
+    def settle(self, history):
+        lookup = {r["issue"]: r for r in history}
+
+        # Update transition matrix and frequency
+        num_matrix = self.db.get("num_matrix", {})
+        num_freq = self.db.get("num_freq", {})
+        for i in range(1, len(history)):
+            prev_num = str(history[i - 1]["num"])
+            curr_num = str(history[i]["num"])
+            if prev_num not in num_matrix:
+                num_matrix[prev_num] = {}
+            num_matrix[prev_num][curr_num] = num_matrix[prev_num].get(curr_num, 0) + 1
+            num_freq[curr_num] = num_freq.get(curr_num, 0) + 1
+        if sum(num_freq.values()) > 50000:
+            num_freq = {k: v * 0.5 for k, v in num_freq.items()}
+        self.db.set("num_matrix", num_matrix)
+        self.db.set("num_freq", num_freq)
+
+        pending = self.db.c.execute(
+            "SELECT issue,payload FROM predictions WHERE status='PENDING' "
+            "ORDER BY CAST(issue AS INTEGER)"
+        ).fetchall()
+
+        for row in pending:
+            actual = lookup.get(row["issue"])
+            if actual is None:
+                continue
+
+            prediction = json.loads(row["payload"])
+            y = actual["size"]
+            actual_num = actual["num"]
+            pred_num = prediction.get("num")
+
+            won_side = int(prediction["p"] >= 0.5) == y
+            won_num = (actual_num == pred_num) if pred_num is not None else False
+            status = "WIN" if won_side else "LOSS"
+
+            with self.db.transaction():
+                self.db.c.execute(
+                    "UPDATE predictions SET status=?,actual=? WHERE issue=?",
+                    (status, actual_num, row["issue"]),
+                )
+
+                # expert update
+                for name, p in prediction["experts"].items():
+                    self.db.learn(f"expert:{name}:{prediction['regime']}", p, y)
+
+                # pattern update
+                for pattern in prediction["patterns"]:
+                    self.db.learn(pattern["key"], pattern["p"], y)
+
+                # trend weights (logistic regression)
+                weights = self.db.get("trend_weights")
+                if isinstance(weights, list) and len(weights) == len(prediction["features"]):
+                    error = y - prediction["experts"].get("trend", 0.5)
+                    weights = [
+                        clip(w + CFG.learning_rate * (error * x - 0.01 * w), -4, 4)
+                        for w, x in zip(weights, prediction["features"])
+                    ]
+                    self.db.set("trend_weights", weights)
+
+                # meta update
+                meta_feats = prediction.get("meta_feats")
+                if meta_feats:
+                    self._update_meta(meta_feats, y, CFG.meta_lr)
+
+                # calibration update
+                p_raw = prediction.get("p_raw", prediction["p"])
+                regime_name = prediction["regime"]
+                bucket = min(19, int(p_raw * 20))
+                for scope in ("global", regime_name):
+                    key = f"cal20:{scope}:{bucket}"
+                    n, s = self.db.get(key, [0.0, 0.0])
+                    self.db.set(key, [0.995 * n + 1, 0.995 * s + y])
+
+                # stats
+                stats = self.db.get("stats", {"observed": 0, "wins": 0, "losses": 0, "brier": 0.0, "num_hits": 0})
+                stats["observed"] += 1
+                stats["brier"] += (prediction["p"] - y) ** 2
+                if won_side:
+                    stats["wins"] += 1
+                else:
+                    stats["losses"] += 1
+                if won_num:
+                    stats["num_hits"] = stats.get("num_hits", 0) + 1
+                self.db.set("stats", stats)
+
+                # streak / cooldown
+                streak = 0 if won_side else self.db.get("loss_streak", 0) + 1
+                self.db.set("loss_streak", streak)
+                if streak >= CFG.loss_limit:
+                    self.db.set("cooldown", CFG.cooldown_rounds)
+                    self.db.set("loss_streak", 0)
+
+                # emoji
+                if won_side and won_num:
+                    result_text = "🎰🎰🎰 <b>JACKPOT!</b>"
+                elif won_side:
+                    result_text = "🏆 <b>WIN</b>"
+                else:
+                    result_text = "❌ <b>LOSS</b>"
+
+                self.db.queue("result", row["issue"], result_text)
+                self.db.c.execute(
+                    "UPDATE outbox SET sent=2 "
+                    "WHERE kind='prediction' AND issue=? AND sent=0",
+                    (row["issue"],),
+                )
+
+
+# ─────────────────────────────────────────────────────────────
+# FORMATTER
+# ─────────────────────────────────────────────────────────────
+def format_prediction(p):
+    conf_percent = p["selected_prob"] * 100
+    filled = int(conf_percent // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+
+    color_emoji = "🔴" if p["side"] == "BIG" else "🔵"
+    side_word = "BIG" if p["side"] == "BIG" else "SMALL"
+
+    if conf_percent >= 70:
+        quality = "🔥 ULTRA VIP"
+        emoji_q = "💎"
+    elif conf_percent >= 64:
+        quality = "🔥 HIGH VIP"
+        emoji_q = "⭐"
+    elif conf_percent >= 58:
+        quality = "⭐ VIP"
+        emoji_q = "✨"
+    else:
+        quality = "✅ NORMAL"
+        emoji_q = "✅"
+
+    num_scores = p.get("num_scores", {})
+    if num_scores:
+        sorted_nums = sorted(num_scores.items(), key=lambda x: -x[1])
+        alts = [str(n) for n, sc in sorted_nums[1:4] if sc > 0]
+    else:
+        alts = []
+    alt_text = " • ".join(alts) if alts else "—"
+
+    stake = p.get("stake", 1.0)
+    agreement = p.get("agreement", 0.5) * 10
+
+    return (
+        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>TARGET:</b> {color_emoji} <b>{side_word}</b>  →  <code>{p.get('num', '')}</code>\n"
+        f"🎲 <b>ALT NUMBERS:</b> <code>{alt_text}</code>\n"
+        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>CONFIDENCE:</b> {conf_percent:.1f}% [{bar}]\n"
+        f"{emoji_q} <b>QUALITY:</b> {quality}\n"
+        f"💰 <b>STAKE:</b> {stake:.1f}x\n"
+        f"🧠 <b>AGREEMENT:</b> {agreement:.0f}/10 experts\n"
+        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# RUNTIME
+# ─────────────────────────────────────────────────────────────
+class Runtime:
+    def __init__(self, db):
+        self.db = db
+        self.engine = Engine(db)
+        self.stop = asyncio.Event()
+        self.last_fetch = 0.0
+        self.last_error = None
+
+    async def fetch(self, session):
+        best = None
+        for url in CFG.urls:
+            try:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    records = parse_history(await response.json(content_type=None))
+                    if records and (best is None or int(records[-1]["issue"]) > int(best[-1]["issue"])):
+                        best = records
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                LOG.warning("A history source failed")
+        if not best:
+            raise RuntimeError("No valid history source available")
+        return best
+
+    async def pause(self, seconds):
         try:
-            await asyncio.wait_for(bot.send_message(chat_id=CFG.parse_chat_id(), text=text, parse_mode="HTML"), timeout=CFG.request_timeout)
-            return True
-        except Exception: await asyncio.sleep(1)
-    return False
+            await asyncio.wait_for(self.stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
-# ============================================================
-# WORKER LOOP
-# ============================================================
-async def worker_loop(app, session):
-    last_processed_issue = None
-    while True:
-        try:
-            if await fetch_history(session):
-                history_by_issue = {str(x["issue"]): x for x in STATE.history}
-                for res in STORE.resolve_pending(history_by_issue):
-                    if res["win"]:
-                        STATE.win_streak += 1; STATE.loss_streak = 0; STATE.recovery_mode = False
-                    else:
-                        STATE.loss_streak += 1; STATE.win_streak = 0; STATE.recovery_mode = STATE.loss_streak >= 4
+    async def worker(self, session):
+        failures = 0
+        while not self.stop.is_set():
+            try:
+                records = await self.fetch(session)
+                self.db.ingest(records)
+                history = self.db.history()
+                self.last_fetch = time.time()
+                self.last_error = None
+                failures = 0
 
-                    details = res.get("details", {}) or {}
-                    pattern_key = details.get("pattern_key")
-                    if pattern_key:
-                        STORE.record_pattern_result(str(pattern_key), bool(res["win"]))
+                self.engine.settle(history)
 
-                    shadow = details.get("shadow") or {}
-                    actual_dir = 1 if res["actual_size"] == "BIG" else 0
-                    for name, d in shadow.items():
-                        STORE.record_engine_result(name, d == actual_dir)
+                latest = int(history[-1]["issue"])
+                seen = self.db.get("latest_seen")
+                self.db.set("latest_seen", latest)
 
-                    STORE.cleanup_pattern_stats()
-                    STATE.save_cache()
-                    await send_msg(app.bot, format_result(res))
-
-                if not STATE.history:
-                    await asyncio.sleep(CFG.fetch_every)
+                if seen is None or latest <= seen:
+                    await self.pause(CFG.fetch_every)
                     continue
 
-                latest_issue = STATE.history[-1]["issue"]
-                next_issue = str(max([normalize_issue(x["issue"]) for x in STATE.history if normalize_issue(x["issue"]) is not None], default=0) + 1)
+                if latest != seen + 1:
+                    LOG.warning("History gap or issue rollover: resynchronizing")
+                    await self.pause(CFG.fetch_every)
+                    continue
 
-                if latest_issue != last_processed_issue and not STORE.prediction_exists(next_issue):
-                    pred = build_prediction(STATE.history, next_issue, STORE)
+                start = len(history) - 1
+                while start > 0 and (int(history[start]["issue"]) == int(history[start - 1]["issue"]) + 1):
+                    start -= 1
+                continuous = history[start:]
+                if len(continuous) < 30:
+                    await self.pause(CFG.fetch_every)
+                    continue
 
-                    if pred["size"] == "SKIP":
-                        skip_msg = f"⚠️ <b>COOLDOWN ACTIVE</b>\n{h(pred['logic'])}\nPeriod: <code>{next_issue}</code>"
-                        await send_msg(app.bot, skip_msg)
-                        last_processed_issue = latest_issue
-                        await asyncio.sleep(CFG.fetch_every)
+                issue = str(latest + 1)
+                exists = self.db.c.execute(
+                    "SELECT 1 FROM predictions WHERE issue=?", (issue,)
+                ).fetchone()
+                if not exists:
+                    p = self.engine.predict(continuous, issue)
+                    with self.db.transaction():
+                        self.db.c.execute(
+                            "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                            (issue, time.time(), "PENDING", json.dumps(p)),
+                        )
+                        self.db.queue(
+                            "prediction",
+                            issue,
+                            format_prediction(p),
+                            time.time() + CFG.delivery_ttl,
+                        )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures += 1
+                self.last_error = type(exc).__name__
+                LOG.exception("Worker failure")
+
+            delay = min(60.0, CFG.fetch_every * 2 ** min(failures, 4))
+            await self.pause(delay + random.uniform(0, 0.3))
+
+    async def sender(self, session):
+        endpoint = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
+        backoff = 1.0
+
+        while not self.stop.is_set():
+            row = self.db.c.execute(
+                "SELECT * FROM outbox WHERE sent=0 ORDER BY id LIMIT 1"
+            ).fetchone()
+            if not row:
+                await self.pause(0.5)
+                continue
+
+            if row["expires"] and time.time() >= row["expires"]:
+                self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],))
+                continue
+
+            delay = backoff
+            try:
+                async with session.post(
+                    endpoint,
+                    json={
+                        "chat_id": CFG.chat,
+                        "text": row["text"],
+                        "parse_mode": "HTML",
+                    },
+                ) as response:
+                    data = await response.json(content_type=None)
+
+                    if response.status == 200 and data.get("ok"):
+                        self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
+                        backoff = 1.0
                         continue
 
-                    STORE.save_prediction({**pred, "type": "SIZE"})
-                    await send_msg(app.bot, format_prediction(pred, STORE.recent_outcomes(CFG.recent_limit)))
-                    last_processed_issue = latest_issue
+                    code = data.get("error_code", response.status)
+                    if code == 429:
+                        delay = float(data.get("parameters", {}).get("retry_after", 10))
+                    elif code in (400, 401, 403, 404):
+                        LOG.error("Telegram rejected delivery: code %s", code)
+                        delay = 60
+                    else:
+                        LOG.warning("Telegram delivery failed: code %s", code)
 
-            gc.collect()
-            await asyncio.sleep(CFG.fetch_every)
-        except Exception as e:
-            log.exception("Worker loop exception: %s", e)
-            await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                LOG.warning(f"Telegram transport failure: {type(e).__name__} - {str(e)}")
 
-async def health_check(request): return web.Response(text="FTW FINAL PATTERN V2 is Running")
+            await self.pause(delay)
+            backoff = min(60.0, backoff * 2)
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
-    await site.start()
+    async def health(self, request):
+        age = time.time() - self.last_fetch if self.last_fetch else None
+        healthy = age is not None and age < 90
+        stats = self.db.get("stats", {})
+        observed = stats.get("observed", 0)
+        wins = stats.get("wins", 0)
+        acc = (wins / observed * 100) if observed > 0 else 0
+        brier = (stats.get("brier", 0.0) / observed) if observed > 0 else 0.0
 
+        return web.json_response(
+            {
+                "status": "ok" if healthy else "degraded",
+                "last_fetch_age_seconds": round(age, 1) if age else age,
+                "last_error": self.last_error,
+                "metrics": {
+                    "observed": observed,
+                    "wins": wins,
+                    "losses": stats.get("losses", 0),
+                    "accuracy": round(acc, 2),
+                    "brier_avg": round(brier, 4),
+                    "num_hits": stats.get("num_hits", 0),
+                },
+                "pending_messages": self.db.c.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE sent=0"
+                ).fetchone()[0],
+            },
+            status=200 if healthy else 503,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
 async def main():
     CFG.validate()
-    STATE.load_cache()
-    app = Application.builder().token(CFG.telegram_token).connect_timeout(20).read_timeout(20).build()
-    await app.initialize()
-    await app.start()
-    log.info("Bot started: %s", (await app.bot.get_me()).username)
-    await start_web_server()
-    async with aiohttp.ClientSession() as session:
-        asyncio.create_task(worker_loop(app, session))
-        await asyncio.Event().wait()
+    db = Database(CFG.db_path)
+    runtime = Runtime(db)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, runtime.stop.set)
+
+    app = web.Application()
+    app.router.add_get("/", runtime.health)
+    runner = web.AppRunner(app)
+    tasks = []
+    stop_task = None
+
+    try:
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
+
+        timeout = aiohttp.ClientTimeout(total=CFG.timeout)
+        connector = aiohttp.TCPConnector(
+            limit=8, ttl_dns_cache=300, ssl=False, family=socket.AF_INET
+        )
+
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            tasks = [
+                asyncio.create_task(runtime.worker(session), name="worker"),
+                asyncio.create_task(runtime.sender(session), name="sender"),
+            ]
+            stop_task = asyncio.create_task(runtime.stop.wait())
+            LOG.info("FTW ULTRA V5 Predictor Started")
+
+            await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
+            runtime.stop.set()
+
+            for task in tasks:
+                if task.done() and not task.cancelled():
+                    exc = task.exception()
+                    if exc:
+                        raise exc
+
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    finally:
+        runtime.stop.set()
+        for task in tasks:
+            task.cancel()
+        if stop_task:
+            stop_task.cancel()
+        await asyncio.gather(*tasks, *([stop_task] if stop_task else []), return_exceptions=True)
+        await runner.cleanup()
+        db.c.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
