@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V9 - Mind Reader Final)
+# bot.py — FTW VIP PREDICTOR (HYPER V11 - Strict Family Block)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -22,31 +22,29 @@ import aiohttp
 from aiohttp import web
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG (Sahi Sticker IDs ke sath fix kiya gaya)
+# CONFIG
 # ─────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Config:
-    # Telegram Details
     token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
     chat: str = "-1004485961768"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
-    # Bot Settings
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v9.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v11.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
-    min_history: int = int(os.getenv("MIN_HISTORY", "120")) # 120 results ke baad start hoga
+    min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     learning_rate: float = 0.035
     meta_lr: float = 0.03
     decay: float = 0.985
-    max_pattern: int = 15   # Pattern length 5 to 15
+    max_pattern: int = 15 
     delivery_ttl: float = 40.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
     
-    # ✅ FIXED STICKERS (Main File IDs from JSON)
+    # ✅ Tumhare Stickers
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -248,7 +246,6 @@ class Database:
         brier = m["loss"] / n
         inverse_brier = m["inverse_loss"] / n
         
-        # 🧠 MISTAKE FIXER: Agar lagatar 2 baar fail hua, toh flip karo
         flip_due_to_failures = (m["failures"] >= 2)
         flip_due_to_loss = (n >= 25 and inverse_brier + 0.04 < brier and inverse_brier < 0.245)
         
@@ -256,7 +253,6 @@ class Database:
         effective_loss = inverse_brier if flipped else brier
         p = 1 - probability if flipped else probability
 
-        # 🪤 TRAP DETECTOR
         if p > 0.80 and effective_loss > 0.22: p = 0.5 - (p - 0.5) * 0.5 
         elif p < 0.20 and effective_loss > 0.22: p = 0.5 + (0.5 - p) * 0.5
 
@@ -273,17 +269,72 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Pattern Detector)
+# ENGINE (Strict Family Logic)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
         self.db = db
+
+    def get_runs(self, seq):
+        if not seq: return []
+        runs = []
+        curr = seq[0]
+        length = 1
+        for x in seq[1:]:
+            if x == curr: length += 1
+            else:
+                runs.append((curr, length))
+                curr = x
+                length = 1
+        runs.append((curr, length))
+        return runs
+
+    def mine_family_patterns(self, seq):
+        if not seq: return []
+        runs = self.get_runs(seq)
+        if len(runs) < 4: return []
+
+        candidates = []
+        
+        # Matching last 3 to 6 blocks exactly
+        for match_len in range(min(6, len(runs)), 2, -1):
+            target_completed = runs[-match_len:-1]
+            target_current_val = runs[-1][0]
+            
+            observations = []
+            for i in range(len(runs) - match_len - 1, -1, -1):
+                window = runs[i:i+match_len]
+                
+                # Strict Match: Completed blocks must match EXACTLY (e.g., B2 must be B2, not B1)
+                if [r for r in window[:-1]] == target_completed:
+                    # Current block just checks the direction (B or S)
+                    if window[-1][0] == target_current_val:
+                        if i + match_len < len(runs):
+                            next_run = runs[i + match_len]
+                            observations.append((next_run[0], 1.0))
+                            
+            if len(observations) >= 2:
+                p, eff_n = weighted_probability(observations)
+                bits = "-".join(f"{'B' if v else 'S'}{c}" for v, c in runs[-match_len:])
+                key = f"family:{bits}"
+                rank = abs(p - 0.5) * math.sqrt(eff_n) + 2.0 # Boost rank
+                candidates.append((rank, p, len(observations), eff_n, key))
+                break # Take the longest match found
+
+        return candidates
 
     def mine_patterns(self, seq):
         n = len(seq)
         candidates = {}
         def weight(idx): return 0.5 ** ((n - 1 - idx) / 300.0)
 
+        # 1. Family Patterns (Strict Blocks)
+        family_cands = self.mine_family_patterns(seq)
+        if family_cands:
+            for r, p, s, e, k in family_cands:
+                candidates[k] = (r, p, s, e, k) 
+
+        # 2. Exact Matches
         for length in range(5, CFG.max_pattern + 1):
             if n < length * 2: continue
             suffix = tuple(seq[-length:])
@@ -298,6 +349,7 @@ class Engine:
                     key = f"exact:{bits}"
                     candidates[key] = (abs(p - 0.5) * math.sqrt(eff_n), p, len(obs), eff_n, key)
 
+        # 3. Mismatch Matches
         for length in range(5, 11):
             if n < length * 2: continue
             suffix = tuple(seq[-length:])
@@ -313,43 +365,6 @@ class Engine:
                     bits = "".join("B" if x else "S" for x in suffix)
                     key = f"mm1:{bits}"
                     rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.85
-                    if key not in candidates or candidates[key][0] < rank:
-                        candidates[key] = (rank, p, len(obs), eff_n, key)
-
-        for length in range(5, 13):
-            if n < length * 2: continue
-            for gap in range(1, min(4, length - 1)):
-                suffix_items = tuple(x for i, x in enumerate(seq[-length:]) if i != gap)
-                obs, last = [], -length - 1
-                for i in range(length, n - length):
-                    cand = tuple(x for j, x in enumerate(seq[i - length:i]) if j != gap)
-                    if cand == suffix_items and i - last >= length + 1:
-                        obs.append((seq[i], weight(i) * 0.9)); last = i
-                if len(obs) >= CFG.min_support + 2:
-                    p, eff_n = weighted_probability(obs)
-                    if eff_n >= (CFG.min_support + 2) * 0.5:
-                        bits = "".join("B" if x else "S" for x in suffix_items)
-                        key = f"gap{gap}:{bits}"
-                        rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.8
-                        if key not in candidates or candidates[key][0] < rank:
-                            candidates[key] = (rank, p, len(obs), eff_n, key)
-
-        for length in range(4, min(11, CFG.max_pattern)):
-            if n < length * 2: continue
-            raw_suffix = seq[-length:]
-            delta_suffix = tuple(1 if raw_suffix[i] != raw_suffix[i-1] else 0 for i in range(1, length))
-            obs, last = [], -length - 1
-            for i in range(length, n - length):
-                raw_win = seq[i - length:i]
-                delta_win = tuple(1 if raw_win[j] != raw_win[j-1] else 0 for j in range(1, length))
-                if delta_win == delta_suffix and i - last >= length + 1:
-                    obs.append((seq[i], weight(i) * 0.85)); last = i
-            if len(obs) >= CFG.min_support + 3:
-                p, eff_n = weighted_probability(obs)
-                if eff_n >= (CFG.min_support + 3) * 0.5:
-                    bits = "".join(str(x) for x in delta_suffix)
-                    key = f"delta:{bits}"
-                    rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.9
                     if key not in candidates or candidates[key][0] < rank:
                         candidates[key] = (rank, p, len(obs), eff_n, key)
 
@@ -407,6 +422,10 @@ class Engine:
         adjusted = []
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
+            
+            # 🧠 PATTERN EXPERT KO 2.5x POWER (Strict Family ke liye)
+            if name == "patterns": weight *= 2.5
+            
             if name == "momentum" and current_streak >= 4: weight *= 2.0
             if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
             adjusted.append((corrected, weight))
@@ -414,7 +433,6 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
         
-        # 🧠 CONSENSUS PENALTY
         consensus = max(sum(1 for p,_ in adjusted if p>=0.5), sum(1 for p,_ in adjusted if p<0.5)) / len(adjusted)
         if consensus > 0.85: p_avg = 0.5 + (p_avg - 0.5) * 0.7
 
@@ -456,7 +474,9 @@ class Engine:
             bits = top_p[4].split(":")[-1]
             arrow = "⬆️" if top_p[1] >= 0.5 else "⬇️"
             
-            if p_type == "delta": pat_str = f"Δ <code>{bits}</code> {arrow}"
+            if p_type == "family": 
+                # e.g., B2-S3-B1-S1
+                pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
             elif p_type.startswith("gap"): pat_str = f"Skip <code>{bits}</code> {arrow}"
             elif p_type == "mm1": pat_str = f"~ <code>{bits}</code> {arrow}"
             else: pat_str = f"<code>{bits}</code> {arrow}"
@@ -512,19 +532,15 @@ class Engine:
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
                 self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
 
-                # SEND CORRECT STICKERS
-                if won_side and won_num: 
-                    sticker = CFG.jack_sticker
-                elif won_side: 
-                    sticker = CFG.win_sticker
-                else: 
-                    sticker = CFG.loss_sticker
+                if won_side and won_num: sticker = CFG.jack_sticker
+                elif won_side: sticker = CFG.win_sticker
+                else: sticker = CFG.loss_sticker
                 
                 self.db.queue("sticker", row["issue"], sticker)
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
 
 # ─────────────────────────────────────────────────────────────
-# FORMATTER (No ALT numbers)
+# FORMATTER
 # ─────────────────────────────────────────────────────────────
 def format_prediction(p):
     conf = max(p["p"], 1 - p["p"]) * 100
@@ -695,7 +711,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V9 Predictor Started (Mind Reader)")
+            LOG.info("HYPER V11 Predictor Started (Strict Family)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
