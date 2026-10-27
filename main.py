@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V11 - Strict Family Block)
+# bot.py — FTW VIP PREDICTOR (HYPER V13 - Sliding Window)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -30,7 +30,7 @@ class Config:
     chat: str = "-1004485961768"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v11.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v13.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -269,7 +269,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Strict Family Logic)
+# ENGINE (Sliding Window Logic)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -292,49 +292,45 @@ class Engine:
     def mine_family_patterns(self, seq):
         if not seq: return []
         runs = self.get_runs(seq)
-        if len(runs) < 4: return []
+        if len(runs) < 2: return []
 
-        candidates = []
-        
-        # Matching last 3 to 6 blocks exactly
-        for match_len in range(min(6, len(runs)), 2, -1):
-            target_completed = runs[-match_len:-1]
-            target_current_val = runs[-1][0]
+        # Sliding Window: Try longest pattern first, drop oldest if not found
+        # Example: S1-B3-S5-B1 -> B3-S5-B1 -> S5-B1 -> B1
+        for k in range(min(6, len(runs)), 1, -1):
+            target = runs[-k:]
             
             observations = []
-            for i in range(len(runs) - match_len - 1, -1, -1):
-                window = runs[i:i+match_len]
+            # Search backward in history
+            for i in range(len(runs) - k - 1, -1, -1):
+                window = runs[i:i+k]
                 
-                # Strict Match: Completed blocks must match EXACTLY (e.g., B2 must be B2, not B1)
-                if [r for r in window[:-1]] == target_completed:
-                    # Current block just checks the direction (B or S)
-                    if window[-1][0] == target_current_val:
-                        if i + match_len < len(runs):
-                            next_run = runs[i + match_len]
-                            observations.append((next_run[0], 1.0))
-                            
-            if len(observations) >= 2:
+                # STRICT MATCH: Both the direction (B/S) and exact length must match
+                if window == target:
+                    if i + k < len(runs):
+                        next_run = runs[i + k]
+                        observations.append((next_run[0], 1.0))
+                        
+            if observations:
                 p, eff_n = weighted_probability(observations)
-                bits = "-".join(f"{'B' if v else 'S'}{c}" for v, c in runs[-match_len:])
+                bits = "-".join(f"{'B' if v else 'S'}{c}" for v, c in target)
                 key = f"family:{bits}"
-                rank = abs(p - 0.5) * math.sqrt(eff_n) + 2.0 # Boost rank
-                candidates.append((rank, p, len(observations), eff_n, key))
-                break # Take the longest match found
+                rank = abs(p - 0.5) * math.sqrt(eff_n) + 10.0 # Massive boost
+                return [(rank, p, len(observations), eff_n, key)]
 
-        return candidates
+        return []
 
     def mine_patterns(self, seq):
         n = len(seq)
+        
+        # 1. Family Patterns get top priority
+        family_cands = self.mine_family_patterns(seq)
+        if family_cands:
+            return family_cands
+
+        # 2. Fallback to exact matching if no family pattern found
         candidates = {}
         def weight(idx): return 0.5 ** ((n - 1 - idx) / 300.0)
 
-        # 1. Family Patterns (Strict Blocks)
-        family_cands = self.mine_family_patterns(seq)
-        if family_cands:
-            for r, p, s, e, k in family_cands:
-                candidates[k] = (r, p, s, e, k) 
-
-        # 2. Exact Matches
         for length in range(5, CFG.max_pattern + 1):
             if n < length * 2: continue
             suffix = tuple(seq[-length:])
@@ -348,25 +344,6 @@ class Engine:
                     bits = "".join("B" if x else "S" for x in suffix)
                     key = f"exact:{bits}"
                     candidates[key] = (abs(p - 0.5) * math.sqrt(eff_n), p, len(obs), eff_n, key)
-
-        # 3. Mismatch Matches
-        for length in range(5, 11):
-            if n < length * 2: continue
-            suffix = tuple(seq[-length:])
-            obs, last = [], -length - 1
-            for i in range(length, n - length):
-                window = tuple(seq[i - length:i])
-                mm = sum(a != b for a, b in zip(window, suffix))
-                if mm <= 1 and i - last >= length + 1:
-                    obs.append((seq[i], weight(i) * (1.0 if mm == 0 else 0.55))); last = i
-            if len(obs) >= CFG.min_support + 2:
-                p, eff_n = weighted_probability(obs)
-                if eff_n >= (CFG.min_support + 2) * 0.5:
-                    bits = "".join("B" if x else "S" for x in suffix)
-                    key = f"mm1:{bits}"
-                    rank = abs(p - 0.5) * math.sqrt(eff_n) * 0.85
-                    if key not in candidates or candidates[key][0] < rank:
-                        candidates[key] = (rank, p, len(obs), eff_n, key)
 
         return sorted(candidates.values(), key=lambda x: x[0], reverse=True)[:8]
 
@@ -423,7 +400,7 @@ class Engine:
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
             
-            # 🧠 PATTERN EXPERT KO 2.5x POWER (Strict Family ke liye)
+            # Pattern expert ko extra power
             if name == "patterns": weight *= 2.5
             
             if name == "momentum" and current_streak >= 4: weight *= 2.0
@@ -448,6 +425,26 @@ class Engine:
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
 
+        # 🧠 TARGET OVERRIDE (Arrow Match) 🧠
+        pat_str = "None"
+        if patterns:
+            top_p = patterns[0]
+            p_pat = top_p[1]
+            p_type = top_p[4].split(":")[0]
+            bits = top_p[4].split(":")[-1]
+            arrow = "⬆️" if p_pat >= 0.5 else "⬇️"
+            
+            if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
+            elif p_type.startswith("gap"): pat_str = f"Skip <code>{bits}</code> {arrow}"
+            elif p_type == "mm1": pat_str = f"~ <code>{bits}</code> {arrow}"
+            else: pat_str = f"<code>{bits}</code> {arrow}"
+
+            # Force target to match pattern
+            if p_pat >= 0.55:
+                p_cal = max(p_cal, 0.60) 
+            elif p_pat <= 0.45:
+                p_cal = min(p_cal, 0.40) 
+
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
         
@@ -466,20 +463,6 @@ class Engine:
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
-
-        pat_str = "None"
-        if patterns:
-            top_p = patterns[0]
-            p_type = top_p[4].split(":")[0]
-            bits = top_p[4].split(":")[-1]
-            arrow = "⬆️" if top_p[1] >= 0.5 else "⬇️"
-            
-            if p_type == "family": 
-                # e.g., B2-S3-B1-S1
-                pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
-            elif p_type.startswith("gap"): pat_str = f"Skip <code>{bits}</code> {arrow}"
-            elif p_type == "mm1": pat_str = f"~ <code>{bits}</code> {arrow}"
-            else: pat_str = f"<code>{bits}</code> {arrow}"
 
         return {
             "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
@@ -711,7 +694,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V11 Predictor Started (Strict Family)")
+            LOG.info("HYPER V13 Predictor Started (Sliding Window)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
