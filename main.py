@@ -22,7 +22,7 @@ import aiohttp
 from aiohttp import web
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG (Yahan sab kuch set kar diya gaya hai)
+# CONFIG (Sahi Sticker IDs ke sath fix kiya gaya)
 # ─────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Config:
@@ -46,10 +46,10 @@ class Config:
     delivery_ttl: float = 40.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
     
-    # Stickers (Tumhare diye gaye File IDs)
-    win_sticker: str = "AAMCBQADGQEAAVbQjGrhCWKiJjLHf3FF7dqQvMa-pehKAAKODwACD8-AVzbn1gF3m2MGAQAHbQADPQQ"
-    loss_sticker: str = "AAMCBQADGQEAAVbQlmrhCvhA9K2qJCPJKg_UNAy-wVlrAAJXHQACm2shVfq7O2zptuhwAQAHbQADPQQ"
-    jack_sticker: str = "AAMCBQADGQEAAVbQimrhCUtsaBG7lHdMgiJJj_3PW427AAJLFAAC7XOBVyG9C9fn0qwcAQAHbQADPQQ"
+    # ✅ FIXED STICKERS (Main File IDs from JSON)
+    win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
+    loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
+    jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
@@ -512,7 +512,7 @@ class Engine:
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
                 self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
 
-                # SEND STICKERS
+                # SEND CORRECT STICKERS
                 if won_side and won_num: 
                     sticker = CFG.jack_sticker
                 elif won_side: 
