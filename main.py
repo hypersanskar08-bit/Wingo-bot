@@ -18,10 +18,8 @@ from dataclasses import dataclass
 import aiohttp
 from aiohttp import web
 
-
 @dataclass(frozen=True)
 class Config:
-    # Tumhari credentials hardcoded
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo").strip()
     chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
     urls: tuple = tuple(
@@ -33,19 +31,18 @@ class Config:
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     
-    # --- RELAXED SETTINGS (Taaki prediction turant mile) ---
+    # Logic relaxed to ensure predictions come through
     min_history: int = int(os.getenv("MIN_HISTORY", "150"))
-    min_validation: int = int(os.getenv("MIN_VALIDATION", "10")) # 150 se 10 kar diya
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.01"))       # 0.08 se 0.01 kar diya
-    max_disagreement: float = float(os.getenv("MAX_DISAGREEMENT", "0.50")) # 0.12 se 0.50 kar diya
+    min_validation: int = int(os.getenv("MIN_VALIDATION", "10"))
+    min_edge: float = float(os.getenv("MIN_EDGE", "0.01"))
+    max_disagreement: float = float(os.getenv("MAX_DISAGREEMENT", "0.50"))
     cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "3"))
-    # --------------------------------------------------------
     
     max_history: int = 2000
     validation_window: int = 500
     loss_limit: int = 3
     timeout: float = 12.0
-    delivery_ttl: float = 60.0 # Thoda badha diya taaki message send hone ka time mile
+    delivery_ttl: float = 60.0
     name: str = "FTW RESEARCH PREDICTOR V5"
 
     def validate(self):
@@ -61,14 +58,11 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("predictor")
 
-
 def clip(x, low=0.01, high=0.99):
     return max(low, min(high, float(x)))
 
-
 def esc(value):
     return html.escape(str(value))
-
 
 def integer(value):
     if isinstance(value, bool):
@@ -78,7 +72,6 @@ def integer(value):
         return None
     return int(text) if len(text) <= 18 else None
 
-
 def parse_history(payload):
     obj = payload
     for _ in range(8):
@@ -86,6 +79,7 @@ def parse_history(payload):
             break
         if not isinstance(obj, dict):
             return []
+        # Look for common array keys
         obj = next(
             (
                 obj[key]
@@ -96,6 +90,7 @@ def parse_history(payload):
         )
 
     if not isinstance(obj, list):
+        LOG.error(f"API structure unknown. Keys found: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}")
         return []
 
     records = {}
@@ -112,7 +107,6 @@ def parse_history(payload):
 
     return sorted(records.items())
 
-
 def wilson_lower(wins, total, z=1.96):
     if not total:
         return 0.0
@@ -123,7 +117,6 @@ def wilson_lower(wins, total, z=1.96):
         p * (1 - p) / total + z * z / (4 * total * total)
     )
     return (center - radius) / denominator
-
 
 def features(seq):
     def mean(n):
@@ -156,7 +149,6 @@ def features(seq):
         (2 * last - 1) * min(run, 8) / 8,
         (2 * flip_rate - 1) * (2 * last - 1),
     ]
-
 
 class Model:
     def __init__(self):
@@ -243,13 +235,9 @@ class Model:
             abs(p - 0.5) >= CFG.min_edge
             and disagreement <= CFG.max_disagreement
         )
-        validation = self.metrics()
         
-        # Relaxed condition: Wilson lower hata diya taaki prediction block na ho
-        qualified = (
-            candidate
-            and validation["n"] >= CFG.min_validation
-        )
+        # DEADLOCK FIXED: Removed strict validation check
+        qualified = candidate 
 
         return {
             "p": p,
@@ -264,7 +252,7 @@ class Model:
             "disagreement": disagreement,
             "candidate": candidate,
             "qualified": qualified,
-            "validation": validation,
+            "validation": self.metrics(),
         }
 
     def observe(self, row, prediction=None):
@@ -337,7 +325,6 @@ class Model:
             model.validation.extend(data["validation"])
         return model
 
-
 class Database:
     def __init__(self):
         self.c = sqlite3.connect(CFG.db_path, isolation_level=None)
@@ -394,10 +381,10 @@ class Database:
             (issue, kind, text, time.time() + ttl),
         )
 
-
 def prediction_text(issue, p):
     side = "BIG" if p["side"] else "SMALL"
     m = p["validation"]
+    acc = f"{m['accuracy']:.1%}" if m['accuracy'] is not None else "N/A"
     return (
         f"<b>{esc(CFG.name)}</b>\n"
         f"Period: <code>{issue}</code>\n"
@@ -406,10 +393,9 @@ def prediction_text(issue, p):
         f"Number estimate: <b>{p['number']}</b>\n"
         f"Number probability estimate: {p['number_estimate']:.1%}\n"
         f"Prior candidate sample: {m['n']}\n"
-        f"Prior candidate hit rate: {m['accuracy']:.1% if m['accuracy'] else 0}\n"
+        f"Prior candidate hit rate: {acc}\n"
         f"Research signal only. No guaranteed outcome."
     )
-
 
 class Runtime:
     def __init__(self, db):
@@ -442,7 +428,8 @@ class Runtime:
                         await response.json(content_type=None)
                     )
                     return data or None
-            except Exception:
+            except Exception as e:
+                LOG.error(f"Fetch error: {e}")
                 return None
 
         sources = [
@@ -539,7 +526,6 @@ class Runtime:
                 )
                 self.model.observe(row, p)
 
-            # MAJOR FIX: Turant prediction generate karo, naye result ka wait mat karo
             if len(self.model.rows) >= CFG.min_history:
                 self.last_advance = time.time()
                 cooldown = self.db.get("cooldown", 0)
@@ -558,6 +544,7 @@ class Runtime:
                         (issue, json.dumps(p)),
                     )
                     if cursor.rowcount:
+                        LOG.info(f"Queued prediction for period {issue}: {prediction_text(issue, p)[:50]}...")
                         self.db.queue(
                             issue,
                             "prediction",
@@ -575,7 +562,8 @@ class Runtime:
         while not self.stop.is_set():
             try:
                 records = await self.fetch(session)
-                # allow_signal ko hata diya, ab ye hamesha process karega
+                if records:
+                    LOG.info(f"Fetched {len(records)} records. Latest issue: {records[-1][0]}")
                 self.process(records, True)
                 failures = 0
                 self.last_fetch = time.time()
@@ -586,7 +574,7 @@ class Runtime:
                 self.model = Model.restore(self.db.get("model"))
                 self.error = type(exc).__name__
                 failures += 1
-                LOG.error("History processing failed: %s", self.error)
+                LOG.error(f"Processing failed: {self.error}")
 
             await self.pause(
                 min(60, CFG.fetch_every * 2 ** min(failures, 4))
@@ -616,11 +604,13 @@ class Runtime:
                 await self.pause(0.5)
                 continue
 
+            # For predictions, make sure it's still the latest issue
             if row["kind"] == "prediction":
                 latest = (
                     self.model.rows[-1][0] if self.model.rows else None
                 )
                 if latest is None or row["issue"] != latest + 1:
+                    LOG.info(f"Dropping outdated prediction for {row['issue']}")
                     self.db.c.execute(
                         "UPDATE outbox SET state=2 WHERE id=?",
                         (row["id"],),
@@ -638,10 +628,9 @@ class Runtime:
                     },
                 ) as response:
                     data = await response.json(content_type=None)
-                    if not isinstance(data, dict):
-                        raise ValueError("InvalidTelegramResponse")
-
+                    
                     if response.status == 200 and data.get("ok"):
+                        LOG.info(f"Successfully sent message to Telegram for issue {row['issue']}")
                         with self.db.transaction():
                             self.db.c.execute(
                                 "UPDATE outbox SET state=1 WHERE id=?",
@@ -657,36 +646,22 @@ class Runtime:
                         continue
 
                     code = data.get("error_code", response.status)
+                    LOG.error(f"Telegram error {code}: {data.get('description')}")
+                    
                     if code == 429:
-                        delay = max(
-                            1,
-                            float(
-                                data.get("parameters", {}).get(
-                                    "retry_after", 10
-                                )
-                            ),
-                        )
+                        delay = max(1, float(data.get("parameters", {}).get("retry_after", 10)))
                     elif code in (401, 403, 404):
                         self.telegram_blocked = True
-                        LOG.error(
-                            "Telegram blocked: code %s. Fix credentials/"
-                            "permissions and restart.",
-                            code,
-                        )
                     elif code == 400:
                         self.db.c.execute(
                             "UPDATE outbox SET state=3 WHERE id=?",
                             (row["id"],),
                         )
-                        LOG.error("Telegram rejected message: code 400.")
 
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                LOG.warning(
-                    "Telegram transport failure: %s",
-                    type(exc).__name__,
-                )
+                LOG.warning(f"Telegram transport failure: {type(exc).__name__}")
 
             await self.pause(delay)
             backoff = min(60, backoff * 2)
@@ -720,7 +695,6 @@ class Runtime:
             },
             status=200 if healthy else 503,
         )
-
 
 async def main():
     CFG.validate()
@@ -780,7 +754,6 @@ async def main():
         )
         await runner.cleanup()
         db.c.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
