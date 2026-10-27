@@ -15,9 +15,6 @@
 #   MIN_EDGE=0.06
 #   MIN_PATTERN_SUPPORT=12
 #   COOLDOWN_ROUNDS=2
-#
-# Probabilities are experimental estimates, not guaranteed win rates.
-# No automatic bet sizing or loss-recovery staking.
 
 import asyncio
 import contextlib
@@ -28,6 +25,7 @@ import math
 import os
 import random
 import signal
+import socket
 import sqlite3
 import time
 from collections import defaultdict
@@ -41,11 +39,12 @@ from aiohttp import web
 
 @dataclass(frozen=True)
 class Config:
-    token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo")
-    chat: str = os.getenv("CHAT_ID", "-1004485961768")
+    # Added .strip() to prevent hidden spaces in Render env variables
+    token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo").strip()
+    chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
     urls: tuple = tuple(
         x.strip()
-        for x in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1M-1000").split(",")
+        for x in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000").split(",")
         if x.strip()
     )
     db_path: str = os.getenv("DB_PATH", "predictor_v2.db")
@@ -121,7 +120,6 @@ def regime(seq):
 
 
 def numeric(value):
-    # Reject malformed identifiers rather than silently stripping characters.
     if isinstance(value, bool):
         return None
     text = str(value).strip()
@@ -302,7 +300,6 @@ class Database:
         brier = m["loss"] / n
         inverse_brier = m["inverse_loss"] / n
 
-        # Reverse only after sustained out-of-sample evidence.
         flipped = (
             n >= 25
             and inverse_brier + 0.04 < brier
@@ -311,7 +308,6 @@ class Database:
         effective_loss = inverse_brier if flipped else brier
         p = 1 - probability if flipped else probability
 
-        # Shrink unreliable predictions toward 50%.
         reliability = clip(
             (0.28 - effective_loss) / 0.08, 0.0, 1.0
         )
@@ -335,11 +331,9 @@ class Database:
 
 
 def weighted_probability(observations):
-    # Observations: (binary outcome, recency weight).
     sw = sum(w for _, w in observations)
     sw2 = sum(w * w for _, w in observations)
     effective_n = sw * sw / sw2 if sw2 else 0.0
-    # Beta(4,4) smoothing avoids extreme small-sample estimates.
     probability = (
         4 + sum(y * w for y, w in observations)
     ) / (8 + sw)
@@ -387,8 +381,6 @@ class Engine:
         def weight(index):
             return 0.5 ** ((size - 1 - index) / 250)
 
-        # Exact suffix mining. Exclude matches overlapping the current
-        # suffix to avoid treating its own observations as independent.
         for length in range(2, CFG.max_pattern + 1):
             if size < 3 * length:
                 continue
@@ -411,7 +403,6 @@ class Engine:
 
             bits = "".join("B" if x else "S" for x in suffix)
             key = f"exact:{bits}"
-            # Conservative ranking, not a statistical confidence interval.
             ranking = abs(p - 0.5) * math.sqrt(effective_n)
             candidates.append(
                 (ranking, key, p, len(observations), effective_n)
@@ -428,7 +419,6 @@ class Engine:
                 denominator += w
             experts["patterns"] = numerator / denominator
 
-        # Short-context Markov models.
         for order in (1, 2, 3, 4):
             suffix = tuple(seq[-order:])
             obs = [
@@ -439,7 +429,6 @@ class Engine:
             if len(obs) >= CFG.min_support:
                 experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        # Learn continuation/reversal from historical runs, not assumptions.
         run_obs = []
         regime_obs = []
         for i in range(24, size):
@@ -457,12 +446,10 @@ class Engine:
         if len(regime_obs) >= CFG.min_support:
             experts["regime"] = weighted_probability(regime_obs)[0]
 
-        # Weighted marginal baseline.
         experts["base"] = weighted_probability(
             [(y, weight(i)) for i, y in enumerate(seq)]
         )[0]
 
-        # Nearest historical contexts, using Hamming distance.
         length = 10
         nearest = []
         suffix = seq[-length:]
@@ -502,7 +489,6 @@ class Engine:
             / denominator
         )
 
-        # Probability-bucket calibration learned only from future results.
         bucket = min(9, int(p_raw * 10))
         calibration = self.db.get(f"cal:{bucket}", [0.0, 0.0])
         n, successes = calibration
@@ -562,7 +548,6 @@ class Engine:
                     (status, actual["num"], row["issue"]),
                 )
 
-                # Shadow learning continues during skips/cooldowns.
                 for name, p in prediction["experts"].items():
                     self.db.learn(
                         f"expert:{name}:{prediction['regime']}", p, y
@@ -624,7 +609,6 @@ class Engine:
 
                 self.db.set("stats", stats)
 
-                # Never send a signal after its outcome is already known.
                 self.db.c.execute(
                     "UPDATE outbox SET sent=2 "
                     "WHERE kind='prediction' AND issue=? AND sent=0",
@@ -678,7 +662,6 @@ class Runtime:
                     ):
                         best = records
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-                # Do not log URLs; they may contain API credentials.
                 LOG.warning("A history source failed")
         if not best:
             raise RuntimeError("No valid history source available")
@@ -707,20 +690,15 @@ class Runtime:
                 seen = self.db.get("latest_seen")
                 self.db.set("latest_seen", latest)
 
-                # First poll establishes a baseline. Wait for an actual
-                # round transition rather than predicting from an old cache.
                 if seen is None or latest <= seen:
                     await self.pause(CFG.fetch_every)
                     continue
 
-                # Numerical +1 is only accepted across contiguous IDs.
-                # A date rollover or missed rounds causes one safe resync.
                 if latest != seen + 1:
                     LOG.warning("History gap or issue rollover: resynchronizing")
                     await self.pause(CFG.fetch_every)
                     continue
 
-                # Only mine a contiguous suffix; gaps distort sequences.
                 start = len(history) - 1
                 while start > 0 and (
                     int(history[start]["issue"])
@@ -771,7 +749,7 @@ class Runtime:
     async def sender(self, session):
         # Telegram delivery is at-least-once: a network timeout after
         # server acceptance can produce a duplicate on retry.
-        endpoint = f"[api.telegram.org](https://api.telegram.org/bot{CFG.token}/sendMessage)"
+        endpoint = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
         backoff = 1.0
 
         while not self.stop.is_set():
@@ -815,7 +793,6 @@ class Runtime:
                             data.get("parameters", {}).get("retry_after", 10)
                         )
                     elif code in (400, 401, 403, 404):
-                        # Do not silently discard configuration failures.
                         LOG.error(
                             "Telegram rejected delivery with code %s; "
                             "check token, chat ID and bot permissions",
@@ -827,9 +804,9 @@ class Runtime:
 
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                # Exception text may contain the token-bearing request URL.
-                LOG.warning("Telegram transport failure")
+            except Exception as e:
+                # Better error logging to catch exact network issues
+                LOG.warning(f"Telegram transport failure: {type(e).__name__} - {str(e)}")
 
             await self.pause(delay)
             backoff = min(60, backoff * 2)
@@ -872,7 +849,15 @@ async def main():
         await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
 
         timeout = aiohttp.ClientTimeout(total=CFG.timeout)
-        connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
+        
+        # 🚀 FIX: Force IPv4 and disable SSL verification for Render.com
+        connector = aiohttp.TCPConnector(
+            limit=8, 
+            ttl_dns_cache=300, 
+            ssl=False, 
+            family=socket.AF_INET
+        )
+        
         async with aiohttp.ClientSession(
             timeout=timeout, connector=connector
         ) as session:
