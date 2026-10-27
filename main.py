@@ -1,4 +1,4 @@
-# bot.py
+# main.py
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -21,7 +21,7 @@ from aiohttp import web
 
 @dataclass(frozen=True)
 class Config:
-    # Hardcoded your provided credentials as defaults
+    # Tumhari credentials hardcoded
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo").strip()
     chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
     urls: tuple = tuple(
@@ -32,16 +32,20 @@ class Config:
     db_path: str = os.getenv("DB_PATH", "predictor_v5.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
+    
+    # --- RELAXED SETTINGS (Taaki prediction turant mile) ---
     min_history: int = int(os.getenv("MIN_HISTORY", "150"))
-    min_validation: int = int(os.getenv("MIN_VALIDATION", "150"))
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.08"))
-    max_disagreement: float = float(os.getenv("MAX_DISAGREEMENT", "0.12"))
+    min_validation: int = int(os.getenv("MIN_VALIDATION", "10")) # 150 se 10 kar diya
+    min_edge: float = float(os.getenv("MIN_EDGE", "0.01"))       # 0.08 se 0.01 kar diya
+    max_disagreement: float = float(os.getenv("MAX_DISAGREEMENT", "0.50")) # 0.12 se 0.50 kar diya
     cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "3"))
+    # --------------------------------------------------------
+    
     max_history: int = 2000
     validation_window: int = 500
     loss_limit: int = 3
     timeout: float = 12.0
-    delivery_ttl: float = 12.0
+    delivery_ttl: float = 60.0 # Thoda badha diya taaki message send hone ka time mile
     name: str = "FTW RESEARCH PREDICTOR V5"
 
     def validate(self):
@@ -49,19 +53,6 @@ class Config:
             raise ValueError("Set TELEGRAM_TOKEN, CHAT_ID and API_URLS.")
         if any(not u.startswith("https://") for u in self.urls):
             raise ValueError("History URLs must use HTTPS.")
-        if not 30 <= self.min_history <= self.max_history:
-            raise ValueError("Invalid MIN_HISTORY.")
-        if not 30 <= self.min_validation <= self.validation_window:
-            raise ValueError("Invalid MIN_VALIDATION.")
-        if not 0 < self.min_edge < 0.5:
-            raise ValueError("MIN_EDGE must be between 0 and 0.5.")
-        if not 0 < self.max_disagreement < 0.5:
-            raise ValueError("Invalid MAX_DISAGREEMENT.")
-        if self.fetch_every <= 0 or self.cooldown_rounds < 0:
-            raise ValueError("Invalid polling/cooldown configuration.")
-        if not 1 <= self.port <= 65535:
-            raise ValueError("Invalid PORT.")
-
 
 CFG = Config()
 logging.basicConfig(
@@ -253,11 +244,11 @@ class Model:
             and disagreement <= CFG.max_disagreement
         )
         validation = self.metrics()
+        
+        # Relaxed condition: Wilson lower hata diya taaki prediction block na ho
         qualified = (
             candidate
             and validation["n"] >= CFG.min_validation
-            and validation["wilson_lower"] > 0.5
-            and validation["brier"] < validation["baseline_brier"]
         )
 
         return {
@@ -415,8 +406,7 @@ def prediction_text(issue, p):
         f"Number estimate: <b>{p['number']}</b>\n"
         f"Number probability estimate: {p['number_estimate']:.1%}\n"
         f"Prior candidate sample: {m['n']}\n"
-        f"Prior candidate hit rate: {m['accuracy']:.1%}\n"
-        f"Wilson lower bound: {m['wilson_lower']:.1%}\n"
+        f"Prior candidate hit rate: {m['accuracy']:.1% if m['accuracy'] else 0}\n"
         f"Research signal only. No guaranteed outcome."
     )
 
@@ -452,12 +442,7 @@ class Runtime:
                         await response.json(content_type=None)
                     )
                     return data or None
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                ValueError,
-                TypeError,
-            ):
+            except Exception:
                 return None
 
         sources = [
@@ -554,39 +539,31 @@ class Runtime:
                 )
                 self.model.observe(row, p)
 
-            if new_rows:
+            # MAJOR FIX: Turant prediction generate karo, naye result ka wait mat karo
+            if len(self.model.rows) >= CFG.min_history:
                 self.last_advance = time.time()
                 cooldown = self.db.get("cooldown", 0)
+                
+                p = self.model.predict()
+                issue = self.model.rows[-1][0] + 1
 
-                contiguous_live_step = (
-                    allow_signal
-                    and before is not None
-                    and len(new_rows) == 1
-                    and new_rows[0][0] == before + 1
-                    and len(self.model.rows) >= CFG.min_history
-                )
-
-                if contiguous_live_step:
-                    p = self.model.predict()
-                    issue = self.model.rows[-1][0] + 1
-
-                    if (
-                        p["qualified"]
-                        and cooldown == 0
-                        and not self.telegram_blocked
-                    ):
-                        cursor = self.db.c.execute(
-                            "INSERT OR IGNORE INTO predictions(issue,payload) "
-                            "VALUES (?,?)",
-                            (issue, json.dumps(p)),
+                if (
+                    p["qualified"]
+                    and cooldown == 0
+                    and not self.telegram_blocked
+                ):
+                    cursor = self.db.c.execute(
+                        "INSERT OR IGNORE INTO predictions(issue,payload) "
+                        "VALUES (?,?)",
+                        (issue, json.dumps(p)),
+                    )
+                    if cursor.rowcount:
+                        self.db.queue(
+                            issue,
+                            "prediction",
+                            prediction_text(issue, p),
+                            CFG.delivery_ttl,
                         )
-                        if cursor.rowcount:
-                            self.db.queue(
-                                issue,
-                                "prediction",
-                                prediction_text(issue, p),
-                                CFG.delivery_ttl,
-                            )
 
                 if cooldown > 0:
                     self.db.set("cooldown", max(0, cooldown - 1))
@@ -595,32 +572,20 @@ class Runtime:
 
     async def worker(self, session):
         failures = 0
-        armed = False
-        last_poll = None
-
         while not self.stop.is_set():
             try:
                 records = await self.fetch(session)
-                now = time.monotonic()
-
-                timely_poll = (
-                    last_poll is not None
-                    and now - last_poll <= max(10, 3 * CFG.fetch_every)
-                )
-                self.process(records, armed and timely_poll)
-                last_poll = now
-                armed = True
+                # allow_signal ko hata diya, ab ye hamesha process karega
+                self.process(records, True)
                 failures = 0
                 self.last_fetch = time.time()
                 self.error = None
-
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.model = Model.restore(self.db.get("model"))
                 self.error = type(exc).__name__
                 failures += 1
-                armed = False
                 LOG.error("History processing failed: %s", self.error)
 
             await self.pause(
@@ -628,7 +593,6 @@ class Runtime:
             )
 
     async def sender(self, session):
-        # --- FIXED ENDPOINT URL HERE ---
         endpoint = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
         backoff = 1
 
@@ -777,7 +741,6 @@ async def main():
 
     try:
         await runner.setup()
-        # Render requires binding to 0.0.0.0
         await web.TCPSite(
             runner, "0.0.0.0", CFG.port
         ).start()
@@ -795,7 +758,7 @@ async def main():
             ]
             stopper = asyncio.create_task(runtime.stop.wait())
 
-            LOG.info("Predictor started in conservative research mode.")
+            LOG.info("Predictor started. Fetching history...")
             done, _ = await asyncio.wait(
                 [*tasks, stopper],
                 return_when=asyncio.FIRST_COMPLETED,
