@@ -32,7 +32,7 @@ class Config:
         for x in os.getenv("API_URLS", "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000").split(",")
         if x.strip()
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_v2.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v4.db") # Upgraded DB
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -47,7 +47,7 @@ class Config:
     max_pattern: int = 12
     round_seconds: float = 60.0
     delivery_ttl: float = 40.0
-    name: str = "FTW VIP PREDICTOR"
+    name: str = "FTW VIP PREDICTOR (ULTRA)"
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
@@ -56,8 +56,6 @@ class Config:
             raise ValueError("Invalid polling interval or history minimum.")
         if self.min_support < 3 or not 0 < self.min_edge < 0.5:
             raise ValueError("Invalid support or edge configuration.")
-        if self.cooldown_rounds < 0:
-            raise ValueError("COOLDOWN_ROUNDS cannot be negative.")
 
 
 CFG = Config()
@@ -291,16 +289,12 @@ class Database:
         effective_loss = inverse_brier if flipped else brier
         p = 1 - probability if flipped else probability
 
-        reliability = clip(
-            (0.28 - effective_loss) / 0.08, 0.0, 1.0
-        )
+        reliability = clip((0.28 - effective_loss) / 0.08, 0.0, 1.0)
         maturity = min(n / 30, 1)
         shrink = (1 - maturity) * 0.65 + maturity * reliability
         p = 0.5 + (p - 0.5) * shrink
 
-        weight = clip(
-            math.exp(-8 * (effective_loss - 0.25)), 0.15, 2.0
-        )
+        weight = clip(math.exp(-8 * (effective_loss - 0.25)), 0.15, 2.0)
         if m["failures"] >= 3 and not flipped:
             weight *= 0.35
         return clip(p), weight, flipped
@@ -317,22 +311,39 @@ def weighted_probability(observations):
     sw = sum(w for _, w in observations)
     sw2 = sum(w * w for _, w in observations)
     effective_n = sw * sw / sw2 if sw2 else 0.0
-    probability = (
-        4 + sum(y * w for y, w in observations)
-    ) / (8 + sw)
+    probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
 
 
 def trend_features(seq):
     def mean(n):
         arr = seq[-n:]
-        return sum(arr) / len(arr)
+        return sum(arr) / len(arr) if arr else 0.5
+
+    def ema(n, alpha=0.3):
+        if not seq: return 0.5
+        val = seq[0]
+        for x in seq[1:]:
+            val = alpha * x + (1 - alpha) * val
+        return val
+        
+    def rsi(period=14):
+        if len(seq) < period + 1: return 50.0
+        gains = losses = 0.0
+        for i in range(-period, 0):
+            change = seq[i] - seq[i-1]
+            if change > 0: gains += change
+            else: losses -= change
+        if losses == 0: return 100.0
+        rs = gains / losses
+        return 100 - (100 / (1 + rs))
 
     tail = seq[-24:]
-    alternation = sum(
-        a != b for a, b in zip(tail, tail[1:])
-    ) / max(1, len(tail) - 1)
+    alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
     signed_run = (2 * seq[-1] - 1) * min(run_length(seq), 10) / 10
+    rsi_norm = (rsi(14) / 100.0) * 2 - 1
+    macd = (ema(12) - ema(26)) * 2
+    
     return [
         1.0,
         2 * mean(8) - 1,
@@ -342,6 +353,8 @@ def trend_features(seq):
         signed_run,
         2 * seq[-1] - 1,
         (2 * alternation - 1) * (2 * seq[-1] - 1),
+        rsi_norm,
+        macd
     ]
 
 
@@ -365,31 +378,24 @@ class Engine:
             return 0.5 ** ((size - 1 - index) / 250)
 
         for length in range(2, CFG.max_pattern + 1):
-            if size < 3 * length:
-                continue
+            if size < 3 * length: continue
             suffix = tuple(seq[-length:])
             observations = []
             last_index = -length - 1
             for i in range(length, size - length):
-                if tuple(seq[i - length:i]) != suffix:
-                    continue
-                if i - last_index < length + 1:
-                    continue
+                if tuple(seq[i - length:i]) != suffix: continue
+                if i - last_index < length + 1: continue
                 observations.append((seq[i], weight(i)))
                 last_index = i
 
-            if len(observations) < CFG.min_support:
-                continue
+            if len(observations) < CFG.min_support: continue
             p, effective_n = weighted_probability(observations)
-            if effective_n < CFG.min_support * 0.6:
-                continue
+            if effective_n < CFG.min_support * 0.6: continue
 
             bits = "".join("B" if x else "S" for x in suffix)
             key = f"exact:{bits}"
             ranking = abs(p - 0.5) * math.sqrt(effective_n)
-            candidates.append(
-                (ranking, key, p, len(observations), effective_n)
-            )
+            candidates.append((ranking, key, p, len(observations), effective_n))
 
         candidates.sort(reverse=True)
         top = candidates[:5]
@@ -416,10 +422,7 @@ class Engine:
         regime_obs = []
         for i in range(24, size):
             past = seq[max(0, i - 96):i]
-            if (
-                past[-1] == seq[-1]
-                and min(run_length(past), 8) == current_run
-            ):
+            if past[-1] == seq[-1] and min(run_length(past), 8) == current_run:
                 run_obs.append((seq[i], weight(i)))
             if regime(past) == current_regime:
                 regime_obs.append((seq[i], weight(i)))
@@ -440,37 +443,88 @@ class Engine:
             previous = seq[i - length:i]
             distance = sum(a != b for a, b in zip(previous, suffix))
             if distance <= 2:
-                nearest.append(
-                    (seq[i], weight(i) * 0.4 ** distance)
-                )
+                nearest.append((seq[i], weight(i) * 0.4 ** distance))
         if len(nearest) >= 20:
             experts["neighbors"] = weighted_probability(nearest)[0]
 
         features = trend_features(seq)
         weights = self.db.get("trend_weights", [0.0] * len(features))
         experts["trend"] = logistic(weights, features)
+        
+        # --- NEW: MOMENTUM EXPERT (Forces trend following) ---
+        recent_5 = seq[-5:]
+        momentum = sum(recent_5) / 5.0
+        experts["momentum"] = 0.2 + (momentum * 0.6) # Maps 0-1 to 0.2-0.8
+
         return experts, top, features
+
+    def predict_number(self, seq, predicted_side):
+        last_num = seq[-1] if seq else 5
+        matrix = self.db.get("num_matrix", {})
+        transitions = matrix.get(str(last_num), {})
+        valid_nums = range(5, 10) if predicted_side == "BIG" else range(0, 5)
+        
+        if transitions:
+            best_num = max(valid_nums, key=lambda n: transitions.get(str(n), 0))
+            if transitions.get(str(best_num), 0) > 0:
+                return best_num
+        return random.randint(5, 9) if predicted_side == "BIG" else random.randint(0, 4)
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
+        nums = [r["num"] for r in history]
+        
         experts, patterns, features = self.mine(seq)
         current_regime = regime(seq)
 
         adjusted = []
         flipped_models = []
+        
+        # Increase weight of momentum if streak is strong
+        current_streak = run_length(seq)
+        
         for name, p in experts.items():
             key = f"expert:{name}:{current_regime}"
             corrected, weight, flipped = self.db.adapt(key, p)
+            
+            # If streak >= 3, heavily boost momentum weight
+            if name == "momentum" and current_streak >= 3:
+                weight *= 2.5 
+                
             adjusted.append((corrected, weight))
             if flipped:
                 flipped_models.append(name)
 
         denominator = sum(w for _, w in adjusted)
         p_raw = sum(p * w for p, w in adjusted) / denominator
-        disagreement = math.sqrt(
-            sum(w * (p - p_raw) ** 2 for p, w in adjusted)
-            / denominator
-        )
+        
+        # --- DEEP UPGRADE: MICRO-TREND OVERRIDE & STUBBORNNESS PENALTY ---
+        recent_10 = seq[-10:]
+        recent_small_count = recent_10.count(0)
+        recent_big_count = recent_10.count(1)
+        
+        # 1. Stubbornness Penalty (If lost 2 consecutive times predicting same side)
+        loss_streak = self.db.get("loss_streak", 0)
+        last_pred_side = self.db.get("last_pred_side", None)
+        
+        if loss_streak >= 2 and current_streak >= 2:
+            # We are losing and there is a streak. FORCE override.
+            trend_side = seq[-1]
+            if trend_side == 1: # BIG trending
+                p_raw = max(p_raw, 0.65) 
+            else: # SMALL trending
+                p_raw = min(p_raw, 0.35)
+
+        # 2. Micro-Trend Override (If 4 of last 5 are same, follow trend)
+        if current_streak >= 3 or recent_small_count >= 7 or recent_big_count >= 7:
+            trend_side = 1 if recent_big_count > recent_small_count else 0
+            if trend_side == 1:
+                p_raw = max(p_raw, 0.60)
+            else:
+                p_raw = min(p_raw, 0.40)
+
+        # Recalculate disagreement for UI (optional)
+        disagreement = math.sqrt(sum(w * (p - p_raw) ** 2 for p, w in adjusted) / denominator)
 
         bucket = min(9, int(p_raw * 10))
         calibration = self.db.get(f"cal:{bucket}", [0.0, 0.0])
@@ -479,7 +533,10 @@ class Engine:
         p = clip(p)
 
         pred_side = "BIG" if p >= 0.5 else "SMALL"
-        pred_num = random.randint(5, 9) if pred_side == "BIG" else random.randint(0, 4)
+        pred_num = self.predict_number(nums, pred_side)
+        
+        # Save current prediction side to DB to track stubbornness next time
+        self.db.set("last_pred_side", pred_side)
 
         return {
             "issue": issue,
@@ -489,7 +546,6 @@ class Engine:
             "side": pred_side,
             "num": pred_num,
             "action": "SIGNAL",
-            "reasons": ["SIGNAL GENERATED"],
             "regime": current_regime,
             "experts": experts,
             "patterns": [
@@ -508,18 +564,24 @@ class Engine:
             "ORDER BY CAST(issue AS INTEGER)"
         ).fetchall()
 
+        # Build Number Transition Matrix
+        num_matrix = self.db.get("num_matrix", {})
+        for i in range(1, len(history)):
+            prev_num = str(history[i-1]["num"])
+            curr_num = str(history[i]["num"])
+            if prev_num not in num_matrix:
+                num_matrix[prev_num] = {}
+            num_matrix[prev_num][curr_num] = num_matrix[prev_num].get(curr_num, 0) + 1
+        self.db.set("num_matrix", num_matrix)
+
         for row in pending:
             actual = lookup.get(row["issue"])
-            if actual is None:
-                continue
+            if actual is None: continue
 
             prediction = json.loads(row["payload"])
             y = actual["size"]
             
-            # Check karein ki Size sahi laga ya nahi
             won_side = int(prediction["p"] >= 0.5) == y
-            
-            # Check karein ki Number bhi match hua ya nahi (Jackpot ke liye)
             actual_num = actual["num"]
             pred_num = prediction.get("num")
             won_num = (actual_num == pred_num) if pred_num is not None else False
@@ -533,37 +595,23 @@ class Engine:
                 )
 
                 for name, p in prediction["experts"].items():
-                    self.db.learn(
-                        f"expert:{name}:{prediction['regime']}", p, y
-                    )
+                    self.db.learn(f"expert:{name}:{prediction['regime']}", p, y)
                 for pattern in prediction["patterns"]:
                     self.db.learn(pattern["key"], pattern["p"], y)
 
-                weights = self.db.get(
-                    "trend_weights",
-                    [0.0] * len(prediction["features"]),
-                )
+                weights = self.db.get("trend_weights", [0.0] * len(prediction["features"]))
                 error = y - prediction["experts"]["trend"]
                 weights = [
-                    clip(
-                        w + CFG.learning_rate * (error * x - 0.01 * w),
-                        -4,
-                        4,
-                    )
+                    clip(w + CFG.learning_rate * (error * x - 0.01 * w), -4, 4)
                     for w, x in zip(weights, prediction["features"])
                 ]
                 self.db.set("trend_weights", weights)
 
                 key = f"cal:{prediction['bucket']}"
                 n, successes = self.db.get(key, [0.0, 0.0])
-                self.db.set(
-                    key, [0.995 * n + 1, 0.995 * successes + y]
-                )
+                self.db.set(key, [0.995 * n + 1, 0.995 * successes + y])
 
-                stats = self.db.get(
-                    "stats",
-                    {"observed": 0, "signals": 0, "wins": 0, "brier": 0.0},
-                )
+                stats = self.db.get("stats", {"observed": 0, "signals": 0, "wins": 0, "brier": 0.0})
                 stats["observed"] += 1
                 stats["brier"] += (prediction["p"] - y) ** 2
                 stats["signals"] += 1
@@ -575,22 +623,15 @@ class Engine:
                     self.db.set("cooldown", CFG.cooldown_rounds)
                     self.db.set("loss_streak", 0)
 
-                # 🚀 CHANGE: Sabhi emojis bade size me dikhenge (sirf emoji bhejna hai, bina space ke)
+                # Jumbo Emojis
                 if won_side and won_num:
-                    # Size aur Number dono win (Jackpot) - 3 Slot Machines (Jumbo Size)
                     result_text = "🎰🎰🎰" 
                 elif won_side:
-                    # Sirf Size win (Normal Win) - Bada Trophy
                     result_text = "🏆" 
                 else:
-                    # Loss - Bada Cross
                     result_text = "❌" 
                 
-                self.db.queue(
-                    "result",
-                    row["issue"],
-                    result_text, 
-                )
+                self.db.queue("result", row["issue"], result_text)
 
                 self.db.set("stats", stats)
 
@@ -605,14 +646,11 @@ def format_prediction(p):
     selected_probability = max(p["p"], 1 - p["p"])
     conf_percent = selected_probability * 100
     
-    # Progress Bar (10 blocks)
     filled = int(conf_percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
     
-    # Target Color Emoji
     color_emoji = "🔴" if p['side'] == "BIG" else "🔵"
     
-    # Quality & Stake based on Confidence
     if conf_percent >= 65:
         quality = "🔥 HIGH VIP (Stake: 1x)"
     elif conf_percent >= 60:
@@ -645,13 +683,8 @@ class Runtime:
             try:
                 async with session.get(url) as response:
                     response.raise_for_status()
-                    records = parse_history(
-                        await response.json(content_type=None)
-                    )
-                    if records and (
-                        best is None
-                        or int(records[-1]["issue"]) > int(best[-1]["issue"])
-                    ):
+                    records = parse_history(await response.json(content_type=None))
+                    if records and (best is None or int(records[-1]["issue"]) > int(best[-1]["issue"])):
                         best = records
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
                 LOG.warning("A history source failed")
@@ -692,10 +725,7 @@ class Runtime:
                     continue
 
                 start = len(history) - 1
-                while start > 0 and (
-                    int(history[start]["issue"])
-                    == int(history[start - 1]["issue"]) + 1
-                ):
+                while start > 0 and (int(history[start]["issue"]) == int(history[start - 1]["issue"]) + 1):
                     start -= 1
                 continuous = history[start:]
                 if len(continuous) < 30:
@@ -703,20 +733,13 @@ class Runtime:
                     continue
 
                 issue = str(latest + 1)
-                exists = self.db.c.execute(
-                    "SELECT 1 FROM predictions WHERE issue=?", (issue,)
-                ).fetchone()
+                exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
                 if not exists:
                     p = self.engine.predict(continuous, issue)
                     with self.db.transaction():
                         self.db.c.execute(
                             "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                            (
-                                issue,
-                                time.time(),
-                                "PENDING",
-                                json.dumps(p),
-                            ),
+                            (issue, time.time(), "PENDING", json.dumps(p)),
                         )
                         self.db.queue(
                             "prediction",
@@ -732,10 +755,7 @@ class Runtime:
                 self.last_error = type(exc).__name__
                 LOG.exception("Worker failure")
 
-            delay = min(
-                60,
-                CFG.fetch_every * 2 ** min(failures, 4),
-            )
+            delay = min(60, CFG.fetch_every * 2 ** min(failures, 4))
             await self.pause(delay + random.uniform(0, 0.3))
 
     async def sender(self, session):
@@ -743,18 +763,13 @@ class Runtime:
         backoff = 1.0
 
         while not self.stop.is_set():
-            row = self.db.c.execute(
-                "SELECT * FROM outbox WHERE sent=0 "
-                "ORDER BY id LIMIT 1"
-            ).fetchone()
+            row = self.db.c.execute("SELECT * FROM outbox WHERE sent=0 ORDER BY id LIMIT 1").fetchone()
             if not row:
                 await self.pause(0.5)
                 continue
 
             if row["expires"] and time.time() >= row["expires"]:
-                self.db.c.execute(
-                    "UPDATE outbox SET sent=2 WHERE id=?", (row["id"],)
-                )
+                self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],))
                 continue
 
             delay = backoff
@@ -764,30 +779,21 @@ class Runtime:
                     json={
                         "chat_id": CFG.chat,
                         "text": row["text"],
-                        "parse_mode": "HTML" # Added for bold, code, and formatting
+                        "parse_mode": "HTML"
                     },
                 ) as response:
                     data = await response.json(content_type=None)
 
                     if response.status == 200 and data.get("ok"):
-                        self.db.c.execute(
-                            "UPDATE outbox SET sent=1 WHERE id=?",
-                            (row["id"],),
-                        )
+                        self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
                         backoff = 1.0
                         continue
 
                     code = data.get("error_code", response.status)
                     if code == 429:
-                        delay = float(
-                            data.get("parameters", {}).get("retry_after", 10)
-                        )
+                        delay = float(data.get("parameters", {}).get("retry_after", 10))
                     elif code in (400, 401, 403, 404):
-                        LOG.error(
-                            "Telegram rejected delivery with code %s; "
-                            "check token, chat ID and bot permissions",
-                            code,
-                        )
+                        LOG.error("Telegram rejected delivery: code %s", code)
                         delay = 60
                     else:
                         LOG.warning("Telegram delivery failed: code %s", code)
@@ -809,9 +815,7 @@ class Runtime:
                 "last_fetch_age_seconds": round(age, 1) if age else age,
                 "last_error": self.last_error,
                 "metrics": self.db.get("stats", {}),
-                "pending_messages": self.db.c.execute(
-                    "SELECT COUNT(*) FROM outbox WHERE sent=0"
-                ).fetchone()[0],
+                "pending_messages": self.db.c.execute("SELECT COUNT(*) FROM outbox WHERE sent=0").fetchone()[0],
             },
             status=200 if healthy else 503,
         )
@@ -838,27 +842,17 @@ async def main():
         await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
 
         timeout = aiohttp.ClientTimeout(total=CFG.timeout)
-        connector = aiohttp.TCPConnector(
-            limit=8, 
-            ttl_dns_cache=300, 
-            ssl=False, 
-            family=socket.AF_INET
-        )
+        connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300, ssl=False, family=socket.AF_INET)
         
-        async with aiohttp.ClientSession(
-            timeout=timeout, connector=connector
-        ) as session:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             tasks = [
                 asyncio.create_task(runtime.worker(session), name="worker"),
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Adaptive predictor started")
+            LOG.info("FTW ULTRA Predictor Started")
 
-            await asyncio.wait(
-                [*tasks, stop_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
             for task in tasks:
@@ -877,11 +871,7 @@ async def main():
             task.cancel()
         if stop_task:
             stop_task.cancel()
-        await asyncio.gather(
-            *tasks,
-            *([stop_task] if stop_task else []),
-            return_exceptions=True,
-        )
+        await asyncio.gather(*tasks, *([stop_task] if stop_task else []), return_exceptions=True)
         await runner.cleanup()
         db.c.close()
 
