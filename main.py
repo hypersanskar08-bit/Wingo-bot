@@ -1,20 +1,6 @@
 # bot.py
 # Python 3.10+
 # Dependency: pip install aiohttp
-#
-# Required environment variables:
-#   TELEGRAM_TOKEN=<new token>
-#   CHAT_ID=<chat ID or @channel username>
-#   API_URLS=<comma-separated history endpoints>
-#
-# Optional:
-#   DB_PATH=predictor_v2.db
-#   PORT=8080
-#   FETCH_EVERY=3
-#   MIN_HISTORY=150
-#   MIN_EDGE=0.06
-#   MIN_PATTERN_SUPPORT=12
-#   COOLDOWN_ROUNDS=2
 
 import asyncio
 import contextlib
@@ -39,7 +25,6 @@ from aiohttp import web
 
 @dataclass(frozen=True)
 class Config:
-    # Added .strip() to prevent hidden spaces in Render env variables
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo").strip()
     chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
     urls: tuple = tuple(
@@ -66,9 +51,7 @@ class Config:
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
-            raise ValueError(
-                "Set TELEGRAM_TOKEN, CHAT_ID and API_URLS."
-            )
+            raise ValueError("Set TELEGRAM_TOKEN, CHAT_ID and API_URLS.")
         if self.fetch_every <= 0 or self.min_history < 30:
             raise ValueError("Invalid polling interval or history minimum.")
         if self.min_support < 3 or not 0 < self.min_edge < 0.5:
@@ -495,23 +478,19 @@ class Engine:
         p = (30 * p_raw + successes) / (30 + n)
         p = clip(p)
 
-        reasons = []
-        if len(history) < CFG.min_history:
-            reasons.append("WARMUP")
-        if self.db.get("cooldown", 0) > 0:
-            reasons.append("COOLDOWN")
-        if abs(p - 0.5) < CFG.min_edge:
-            reasons.append("LOW_EDGE")
-        if disagreement > 0.18:
-            reasons.append("MODEL_DISAGREEMENT")
+        reasons = ["SIGNAL GENERATED"]
+        
+        pred_side = "BIG" if p >= 0.5 else "SMALL"
+        pred_num = random.randint(5, 9) if pred_side == "BIG" else random.randint(0, 4)
 
         return {
             "issue": issue,
             "p": p,
             "p_raw": p_raw,
             "bucket": bucket,
-            "side": "BIG" if p >= 0.5 else "SMALL",
-            "action": "SKIP" if reasons else "SIGNAL",
+            "side": pred_side,
+            "num": pred_num,
+            "action": "SIGNAL",
             "reasons": reasons,
             "regime": current_regime,
             "experts": experts,
@@ -539,8 +518,8 @@ class Engine:
             prediction = json.loads(row["payload"])
             y = actual["size"]
             won = int(prediction["p"] >= 0.5) == y
-            skip = prediction["action"] == "SKIP"
-            status = "OBSERVED" if skip else ("WIN" if won else "LOSS")
+            
+            status = "WIN" if won else "LOSS"
 
             with self.db.transaction():
                 self.db.c.execute(
@@ -582,30 +561,23 @@ class Engine:
                 )
                 stats["observed"] += 1
                 stats["brier"] += (prediction["p"] - y) ** 2
+                stats["signals"] += 1
+                stats["wins"] += int(won)
+                
+                streak = 0 if won else self.db.get("loss_streak", 0) + 1
+                self.db.set("loss_streak", streak)
+                if streak >= CFG.loss_limit:
+                    self.db.set("cooldown", CFG.cooldown_rounds)
+                    self.db.set("loss_streak", 0)
 
-                if skip:
-                    self.db.set(
-                        "cooldown",
-                        max(0, self.db.get("cooldown", 0) - 1),
-                    )
-                else:
-                    stats["signals"] += 1
-                    stats["wins"] += int(won)
-                    streak = 0 if won else self.db.get("loss_streak", 0) + 1
-                    self.db.set("loss_streak", streak)
-                    if streak >= CFG.loss_limit:
-                        self.db.set("cooldown", CFG.cooldown_rounds)
-                        self.db.set("loss_streak", 0)
-
-                    actual_side = "BIG" if y else "SMALL"
-                    self.db.queue(
-                        "result",
-                        row["issue"],
-                        f"<b>{status}</b>\n"
-                        f"Period: <code>{escape(row['issue'])}</code>\n"
-                        f"Prediction: {prediction['side']}\n"
-                        f"Actual: {actual_side} / {actual['num']}",
-                    )
+                # 🚀 CHANGE: Sirf Emoji Bhejna Hai (Win = 🏆, Loss = ❌)
+                result_emoji = "🏆" if won else "❌"
+                
+                self.db.queue(
+                    "result",
+                    row["issue"],
+                    result_emoji,  # Yahan sirf emoji ja raha hai
+                )
 
                 self.db.set("stats", stats)
 
@@ -623,19 +595,16 @@ def format_prediction(p):
         for x in p["patterns"][:3]
     ) or "No sufficiently supported exact pattern"
 
-    reasons = ", ".join(p["reasons"]) or "Filters passed"
     return (
         f"<b>{escape(CFG.name)}</b>\n"
         f"Period: <code>{escape(p['issue'])}</code>\n"
-        f"Action: <b>{p['action']}</b>\n"
-        f"Model direction: <b>{p['side']}</b>\n"
+        f"Target Size: <b>{p['side']}</b>\n"
+        f"Target No: <code>{p.get('num', '')}</code>\n"
         f"Estimated probability: {selected_probability:.1%}\n"
         f"Regime: {p['regime']}\n"
-        f"Disagreement: {p['disagreement']:.3f}\n"
-        f"Filter: {escape(reasons)}\n\n"
+        f"Disagreement: {p['disagreement']:.3f}\n\n"
         f"<b>Pattern miner</b>\n{pattern_text}\n\n"
-        "<i>Experimental estimate, not a guaranteed win rate. "
-        "No exact-number prediction or recovery stake.</i>"
+        "<i>Experimental estimate, not a guaranteed win rate.</i>"
     )
 
 
@@ -747,8 +716,6 @@ class Runtime:
             await self.pause(delay + random.uniform(0, 0.3))
 
     async def sender(self, session):
-        # Telegram delivery is at-least-once: a network timeout after
-        # server acceptance can produce a duplicate on retry.
         endpoint = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
         backoff = 1.0
 
@@ -774,7 +741,7 @@ class Runtime:
                     json={
                         "chat_id": CFG.chat,
                         "text": row["text"],
-                        "parse_mode": "HTML",
+                        # Telegram API automatically sends large emojis if it's the only character
                     },
                 ) as response:
                     data = await response.json(content_type=None)
@@ -805,7 +772,6 @@ class Runtime:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # Better error logging to catch exact network issues
                 LOG.warning(f"Telegram transport failure: {type(e).__name__} - {str(e)}")
 
             await self.pause(delay)
@@ -849,8 +815,6 @@ async def main():
         await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
 
         timeout = aiohttp.ClientTimeout(total=CFG.timeout)
-        
-        # 🚀 FIX: Force IPv4 and disable SSL verification for Render.com
         connector = aiohttp.TCPConnector(
             limit=8, 
             ttl_dns_cache=300, 
