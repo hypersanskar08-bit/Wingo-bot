@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - Upgraded Engine + Old Format)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - Deep Context Lookback)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -37,10 +37,18 @@ class Config:
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
+    
+    # ✅ SIZE PATTERN RANGE (5 to 16)
+    min_pattern_length: int = 5
+    max_pattern: int = 16 
+    
+    # ✅ NUMBER PATTERN RANGE (2 to 10)
+    min_number_length: int = 2
+    max_number_length: int = 10
+    
     learning_rate: float = 0.035
     meta_lr: float = 0.03
     decay: float = 0.985
-    max_pattern: int = 15 
     delivery_ttl: float = 40.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
     
@@ -269,7 +277,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Cross-Engine Arbitration) - Base Engine (100% Preserved)
+# ENGINE (Cross-Engine Arbitration) - Base Engine 
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -294,8 +302,13 @@ class Engine:
         runs = self.get_runs(seq)
         if len(runs) < 2: return []
 
-        for k in range(min(6, len(runs)), 1, -1):
+        for k in range(min(CFG.max_pattern, len(runs)), 1, -1):
             target = runs[-k:]
+            
+            total_length = sum(length for _, length in target)
+            if total_length < CFG.min_pattern_length or total_length > CFG.max_pattern:
+                continue 
+
             observations = []
             for i in range(len(runs) - k - 1, -1, -1):
                 window = runs[i:i+k]
@@ -320,7 +333,7 @@ class Engine:
         candidates = {}
         def weight(idx): return 0.5 ** ((n - 1 - idx) / 300.0)
 
-        for length in range(5, CFG.max_pattern + 1):
+        for length in range(CFG.min_pattern_length, CFG.max_pattern + 1):
             if n < length * 2: continue
             suffix = tuple(seq[-length:])
             obs, last = [], -length - 1
@@ -380,10 +393,7 @@ class Engine:
 
     def _predict_number(self, seq_nums):
         ngram_db = self.db.get("num_ngrams", {})
-        
-        best_num = None
-        best_prob = 0.0
-        
+        best_num, best_prob = None, 0.0
         for length in range(min(10, len(seq_nums)), 1, -1):
             seq_key = ",".join(str(x) for x in seq_nums[-length:])
             if seq_key in ngram_db:
@@ -392,23 +402,16 @@ class Engine:
                 if total_occurrences > 0:
                     max_num = max(trans, key=trans.get)
                     max_prob = trans[max_num] / total_occurrences
-                    
                     if max_prob > best_prob:
                         best_prob = max_prob
                         best_num = int(max_num)
-                        
-                    if best_prob >= 0.70:
-                        break
-                        
-        if best_num is not None:
-            return best_num, best_prob
-            
+                    if best_prob >= 0.70: break
+        if best_num is not None: return best_num, best_prob
         freq = self.db.get("num_freq", {})
         if freq:
             total_freq = sum(freq.values())
             max_num = max(freq, key=freq.get)
             return int(max_num), freq[max_num] / total_freq
-            
         return random.randint(0, 9), 0.10
 
     def predict(self, history, issue):
@@ -460,11 +463,6 @@ class Engine:
             if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
             else: pat_str = f"<code>{bits}</code> {arrow}"
 
-            if p_pat >= 0.55:
-                p_cal = max(p_cal, 0.60) 
-            elif p_pat <= 0.45:
-                p_cal = min(p_cal, 0.40) 
-
         num_pred, num_conf = self._predict_number(nums)
         size_conf = max(p_cal, 1 - p_cal)
         
@@ -507,20 +505,15 @@ class Engine:
 
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
-        
-        num_ngrams = {}
-        num_freq = {}
+        num_ngrams, num_freq = {}, {}
         for i in range(1, len(history)):
             curr_num = history[i]["num"]
             num_freq[str(curr_num)] = num_freq.get(str(curr_num), 0) + 1
-            
-            for length in range(2, 11):
+            for length in range(CFG.min_number_length, CFG.max_number_length + 1):
                 if i >= length:
                     seq_key = ",".join(str(history[j]["num"]) for j in range(i-length, i))
-                    if seq_key not in num_ngrams:
-                        num_ngrams[seq_key] = {}
+                    if seq_key not in num_ngrams: num_ngrams[seq_key] = {}
                     num_ngrams[seq_key][str(curr_num)] = num_ngrams[seq_key].get(str(curr_num), 0) + 1
-                    
         self.db.set("num_ngrams", num_ngrams)
         self.db.set("num_freq", num_freq)
 
@@ -528,7 +521,6 @@ class Engine:
         for row in pending:
             actual = lookup.get(row["issue"])
             if actual is None: continue
-            
             p = json.loads(row["payload"])
             y = actual["size"]
             won_side = int(p["p"] >= 0.5) == y
@@ -564,10 +556,10 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (Evidence-Based)
+# UPGRADED ENGINE (Contextual Trend Pattern - 1 to 5 Lookback)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
-    """Evidence-based forecasting"""
+    """Evidence-based forecasting with contextual trend analysis (1-5 lookback)"""
     
     @staticmethod
     def normalize(values):
@@ -576,91 +568,135 @@ class UpgradedEngine(Engine):
         return [v / total for v in values]
 
     def get_number_distribution(self, nums):
-        """Creates a 0-9 probability distribution based on historical n-grams"""
         ngram_db = self.db.get("num_ngrams", {})
-        dist = [1.0] * 10 # Base uniform smoothing
-        
-        for length in range(min(10, len(nums)), 1, -1):
+        dist = [1.0] * 10 
+        for length in range(min(CFG.max_number_length, len(nums)), CFG.min_number_length - 1, -1):
             seq_key = ",".join(str(x) for x in nums[-length:])
             if seq_key in ngram_db:
                 trans = ngram_db[seq_key]
                 total = sum(trans.values())
-                if total >= 5: # Min support
+                if total >= 5: 
                     for k, v in trans.items():
-                        dist[int(k)] += (v / total) * length # Longer matches carry more weight
+                        dist[int(k)] += (v / total) * length 
                     break
-        
         return self.normalize(dist)
 
     def calculate_change_score(self, seq):
-        """Fast/slow imbalance + switching rate"""
         if len(seq) < 20: return 0.0
-        
         fast = sum(seq[-5:]) / 5.0
         slow = sum(seq[-20:]) / 20.0
-        imbalance = abs(fast - slow) * 2.0 # 0.0 to 1.0
-        
+        imbalance = abs(fast - slow) * 2.0 
         recent = seq[-10:]
         switches = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1]) / 9.0
-        
         score = (imbalance * 0.6) + (switches * 0.4)
         return clip(score, 0.0, 1.0)
+
+    def get_contextual_trend_prob(self, seq):
+        """Checks history for exact preceding pattern (1 to 5 lookback) + streak to see if it continued or broke"""
+        if len(seq) < 30: return 0.5, 0, "None"
+        
+        current_run = run_length(seq)
+        if current_run < 3: return 0.5, 0, "None"
+        
+        current_side = seq[-1]
+        
+        # Loop from 5 periods before, down to 1 period before
+        for lookback in range(5, 0, -1):
+            ctx_len = current_run + lookback
+            if len(seq) < ctx_len + 1: continue
+            
+            target_seq = tuple(seq[-ctx_len:])
+            cont_wins = 0
+            total = 0
+            
+            # Search entire history for this exact context
+            for i in range(ctx_len, len(seq) - 1):
+                if tuple(seq[i-ctx_len:i]) == target_seq:
+                    total += 1
+                    if seq[i] == current_side: cont_wins += 1
+                    
+            if total >= 3: # Minimum 3 historical matches for reliability
+                match_desc = f"Ctx -{lookback}"
+                return cont_wins / total, total, match_desc
+                
+        # Fallback: Just streak length if no deep context is found
+        cont_wins = 0
+        total = 0
+        for i in range(current_run, len(seq) - 1):
+            if run_length(seq[:i]) == current_run:
+                total += 1
+                if seq[i] == current_side: cont_wins += 1
+        if total >= 5:
+            return cont_wins / total, total, "Streak Only"
+            
+        return 0.5, 0, "None"
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
         
-        # 1. Get base experts from old engine
-        experts, patterns, features, current_regime = self.mine_experts(seq)
+        base_pred = super().predict(history, issue)
+        p_size_engine = base_pred["p"]
         
-        # 2. Number Engine (0-9 Distribution)
         num_dist = self.get_number_distribution(nums)
-        big_prob = sum(num_dist[5:])
-        p_cal = big_prob
+        p_num_engine = sum(num_dist[5:]) 
         
-        # 3. Size determination based on Number Distribution
+        p_cal = (p_size_engine * 0.6) + (p_num_engine * 0.4)
+        
+        current_streak = run_length(seq)
+        p_cont, samples, match_type = self.get_contextual_trend_prob(seq)
+        
+        is_trend_follow = False
+        is_trend_fade = False
+        
+        if current_streak >= 3 and samples >= 3:
+            current_side = seq[-1]
+            p_trend_big = p_cont if current_side == 1 else (1.0 - p_cont)
+            
+            p_cal = (p_trend_big * 0.65) + (p_cal * 0.35)
+            
+            if p_cont >= 0.60: is_trend_follow = True
+            elif p_cont <= 0.40: is_trend_fade = True
+            
+        p_cal = clip(p_cal, 0.05, 0.95)
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         
-        # 4. Long-run handling (Historical Continuation/Break)
-        current_streak = run_length(seq)
-        if current_streak >= 4:
-            cont_wins = 0
-            cont_total = 0
-            for i in range(4, len(seq)):
-                if run_length(seq[:i]) >= 4:
-                    cont_total += 1
-                    if seq[i] == seq[i-1]: cont_wins += 1
-            if cont_total > 10:
-                hist_cont_prob = cont_wins / cont_total
-                blend = 0.5
-                p_cont_big = hist_cont_prob if seq[-1] == 1 else (1.0 - hist_cont_prob)
-                p_cal = (p_cal * (1 - blend)) + (p_cont_big * blend)
-                pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
-
-        # 5. Change Score
         change_score = self.calculate_change_score(seq)
         
-        # 6. Pick best number for the predicted side
-        valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
+        valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
         best_num = max(valid_nums, key=lambda x: num_dist[x])
         num_prob = num_dist[best_num]
         
-        # 7. Pattern String (For old format)
+        size_says_big = p_size_engine >= 0.5
+        num_says_big = p_num_engine >= 0.5
+        
+        source = "⚖️ Combined"
+        if is_trend_follow:
+            source = f"📈 Trend Follow ({int(p_cont*100)}% | {match_type})"
+        elif is_trend_fade:
+            source = f"🔄 Trend Fade ({int(100-p_cont*100)}% | {match_type})"
+        elif size_says_big == num_says_big:
+            source = "⚖️ Both (Size+Num)"
+        elif size_says_big:
+            source = "📊 Size Engine"
+        elif num_says_big:
+            source = "🎯 Number Engine"
+            
         pat_str = "None"
+        patterns = base_pred["patterns"]
         if patterns:
             top_p = patterns[0]
-            p_pat = top_p[1]
-            p_type = top_p[4].split(":")[0]
-            bits = top_p[4].split(":")[-1]
+            p_pat = top_p["p"]
+            key = top_p["key"]
+            p_type = key.split(":")[0]
+            bits = key.split(":")[-1]
             arrow = "⬆️" if p_pat >= 0.5 else "⬇️"
             
             if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
             else: pat_str = f"<code>{bits}</code> {arrow}"
         
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
-        trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
-
-        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
+        trend_shift = f"{prev_regime} ➡️ {base_pred['regime']}" if prev_regime != base_pred['regime'] else None
 
         return {
             "issue": issue, 
@@ -669,20 +705,22 @@ class UpgradedEngine(Engine):
             "side": pred_side,
             "num": best_num, 
             "num_probability": num_prob,
+            "size_probability": p_size_engine,
+            "number_big_prob": p_num_engine,
             "change_score": change_score,
-            "regime": current_regime, 
-            "display_regime": current_regime,
-            "source": "🎯 Evidence Engine",
+            "regime": base_pred["regime"], 
+            "display_regime": base_pred["regime"],
+            "source": source,
             "trend_shift": trend_shift, 
             "pattern_str": pat_str, 
-            "experts": experts, 
-            "features": features, 
-            "meta_feats": m_feats,
-            "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
+            "experts": base_pred["experts"], 
+            "features": base_pred["features"], 
+            "meta_feats": base_pred["meta_feats"],
+            "patterns": patterns
         }
 
 # ─────────────────────────────────────────────────────────────
-# FORMATTER (Purana Wala Premium Format)
+# FORMATTER
 # ─────────────────────────────────────────────────────────────
 def format_prediction(p):
     conf = max(p["p"], 1 - p["p"]) * 100
@@ -697,6 +735,10 @@ def format_prediction(p):
     shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
     source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
+    
+    size_str = "BIG" if p.get("size_probability", 0.5) >= 0.5 else "SMALL"
+    num_str = "BIG" if p.get("number_big_prob", 0.5) >= 0.5 else "SMALL"
+    breakdown_text = f"\n📊 <b>BREAKDOWN:</b> Size ({size_str} {p.get('size_probability', 0.5)*100:.0f}%) | Num ({num_str} {p.get('number_big_prob', 0.5)*100:.0f}%)"
 
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
@@ -706,7 +748,7 @@ def format_prediction(p):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
         f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
-        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{source_text}{shift_text}{pat_text}\n"
+        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{source_text}{breakdown_text}{shift_text}{pat_text}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -716,7 +758,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = UpgradedEngine(db) # ✅ Uses new Engine
+        self.engine = UpgradedEngine(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
         self.error = None
@@ -854,7 +896,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Upgraded Engine + Old Format)")
+            LOG.info("HYPER V16 Predictor Started (Deep 1-5 Lookback)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
