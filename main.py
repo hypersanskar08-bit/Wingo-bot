@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - Strict Logic with Overruled/High VIP)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - GOKU + Old Logic)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -38,9 +38,11 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     
+    # ✅ SIZE PATTERN RANGE (5 to 16) - Old Logic
     min_pattern_length: int = 5
     max_pattern: int = 16 
     
+    # ✅ NUMBER PATTERN RANGE (2 to 10) - Old Logic
     min_number_length: int = 2
     max_number_length: int = 10
     
@@ -70,14 +72,6 @@ def clip(x, low=0.02, high=0.98):
 
 def escape(x):
     return html.escape(str(x))
-
-def run_length(seq):
-    if not seq: return 0
-    n = 0
-    for x in reversed(seq):
-        if x != seq[-1]: break
-        n += 1
-    return n
 
 def numeric(value):
     if isinstance(value, bool): return None
@@ -109,6 +103,14 @@ def weighted_probability(observations):
     effective_n = sw * sw / sw2 if sw2 else 0.0
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
+
+def run_length(seq):
+    if not seq: return 0
+    n = 0
+    for x in reversed(seq):
+        if x != seq[-1]: break
+        n += 1
+    return n
 
 # ─────────────────────────────────────────────────────────────
 # DATABASE
@@ -157,12 +159,12 @@ class Database:
         rows = self.c.execute("SELECT issue,num FROM history ORDER BY CAST(issue AS INTEGER)").fetchall()
         return [{"issue": r["issue"], "num": r["num"], "size": int(r["num"] >= 5)} for r in rows]
 
-    def learn(self, key, probability, actual):
+    def memory(self, key):
         row = self.c.execute("SELECT * FROM models WHERE key=?", (key,)).fetchone()
-        if not row:
-            self.c.execute("INSERT INTO models VALUES (?,?,?,?,?)", (key, 1.0, (probability - actual)**2, (1-probability - actual)**2, 0))
-            return
-        m = dict(row)
+        return dict(row) if row else {"n": 0.0, "loss": 0.0, "inverse_loss": 0.0, "failures": 0}
+
+    def learn(self, key, probability, actual):
+        m = self.memory(key)
         n = CFG.decay * m["n"] + 1
         loss = CFG.decay * m["loss"] + (probability - actual) ** 2
         inv = CFG.decay * m["inverse_loss"] + (1 - probability - actual) ** 2
@@ -174,7 +176,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# BASE ENGINE (Pattern & Settlement)
+# BASE ENGINE (Old Logic - Patterns & Settlement)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -265,14 +267,13 @@ class Engine:
             actual = lookup.get(row["issue"])
             if actual is None: continue
             p = json.loads(row["payload"])
-            
             y = actual["size"]
             won_side = int(p["p"] >= 0.5) == y
             won_num = p.get("num") == actual["num"]
             
             with self.db.transaction():
                 self.db.c.execute("UPDATE predictions SET status=?,actual=? WHERE issue=?", ("WIN" if won_side else "LOSS", actual["num"], row["issue"]))
-                for pat in p["patterns"]: self.db.learn(pat["key"], pat["p"], y)
+                for pat in p.get("patterns", []): self.db.learn(pat["key"], pat["p"], y)
 
                 if won_side and won_num: sticker = CFG.jack_sticker
                 elif won_side: sticker = CFG.win_sticker
@@ -283,15 +284,24 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (Strict Logic: Trend -> Size Pattern -> Number)
+# UPGRADED ENGINE (GOKU MODES Triggers + Old Size/Number Logic)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
-    
-    @staticmethod
-    def normalize(values):
-        total = sum(values)
-        if total <= 0: return [1.0 / len(values)] * len(values)
-        return [v / total for v in values]
+    def __init__(self, db):
+        super().__init__(db)
+        # GOKU MODES Special Triggers
+        self.sureshot_ngrams = {
+            'BBBSBBSSBSBBBBS': 'SMALL', 'BBBBBBBB': 'SMALL', 'SSSSSSSS': 'BIG',
+            'SBSBSBSB': 'SMALL', 'BSBSBSBS': 'BIG', 'BBSSBBSS': 'BIG',
+            'SSBBSSBB': 'SMALL', 'BBBSSSB': 'BIG', 'SSSBBBS': 'SMALL',
+            'BSBBSB': 'BIG', 'SBSBBS': 'SMALL', 'BBBBSB': 'BIG', 'SSSSBS': 'SMALL'
+        }
+        self.digit_matrix = {
+            0: [5, 2, 8, 4, 1], 1: [6, 3, 7, 9, 2], 2: [7, 4, 8, 0, 3],
+            3: [8, 5, 9, 1, 4], 4: [9, 6, 0, 2, 5], 5: [0, 7, 3, 5, 8],
+            6: [1, 8, 4, 6, 9], 7: [2, 9, 5, 1, 0], 8: [3, 0, 6, 2, 7],
+            9: [4, 1, 7, 3, 8]
+        }
 
     def get_number_distribution(self, nums):
         ngram_db = self.db.get("num_ngrams", {})
@@ -305,42 +315,46 @@ class UpgradedEngine(Engine):
                     for k, v in trans.items():
                         dist[int(k)] += (v / total) * length 
                     break
-        return self.normalize(dist)
+        total = sum(dist)
+        return [d / total for d in dist]
 
-    def detect_trend_shift(self, seq):
-        if len(seq) < 30: return 0.5, "None", 0
-        current_run = run_length(seq)
-        if current_run < 3: return 0.5, "None", 0
-        current_side = seq[-1]
+    def detect_special_trigger(self, nums):
+        if len(nums) < 2: return None
+        n1, n2 = nums[-1], nums[-2]
         
-        for lookback in range(5, 0, -1):
-            ctx_len = current_run + lookback
-            if len(seq) < ctx_len + 1: continue
-            target_seq = tuple(seq[-ctx_len:])
-            cont_wins, total = 0, 0
-            for i in range(ctx_len, len(seq) - 1):
-                if tuple(seq[i-ctx_len:i]) == target_seq:
-                    total += 1
-                    if seq[i] == current_side: cont_wins += 1
-            if total >= 3: return cont_wins / total, f"Ctx -{lookback}", total
-                
-        cont_wins, total = 0, 0
-        for i in range(current_run, len(seq) - 1):
-            if run_length(seq[:i]) == current_run:
-                total += 1
-                if seq[i] == current_side: cont_wins += 1
-        if total >= 5: return cont_wins / total, "Streak Only", total
-        return 0.5, "None", 0
+        if n1 == 5 and n2 == 5: return {"side": "BIG", "conf": 0.986, "name": "DOUBLE 5 VIOLET BRIDGE"}
+        if n1 == 4 and n2 == 4: return {"side": "SMALL", "conf": 0.984, "name": "DOUBLE 4 RED PIVOT"}
+        if n1 == 0 and n2 in (0, 5): return {"side": "BIG", "conf": 0.982, "name": "ZERO VIOLET GATE"}
+        if n1 == 9 and n2 == 9: return {"side": "SMALL", "conf": 0.985, "name": "9-9 CEILING BOUNCE"}
+        return None
+
+    def detect_dragon_streak(self, seq_str):
+        streak = run_length([1 if c == "B" else 0 for c in seq_str])
+        current = seq_str[-1]
+        flip = "S" if current == "B" else "B"
+        
+        if streak >= 10: return {"side": flip, "conf": 0.985, "name": f"TITAN STREAK ({streak}x)"}
+        if streak >= 8: return {"side": flip, "conf": 0.950, "name": f"SUPER DRAGON ({streak}x)"}
+        if streak >= 6: return {"side": flip, "conf": 0.750, "name": f"MEGA DRAGON ({streak}x)"}
+        if streak >= 3: return {"side": current, "conf": 0.650, "name": f"MOMENTUM DRAGON ({streak}x)"}
+        return None
+
+    def detect_zigzag(self, seq_str):
+        if len(seq_str) < 6: return None
+        zig = 1
+        for i in range(len(seq_str)-1, 0, -1):
+            if seq_str[i] != seq_str[i-1]: zig += 1
+            else: break
+        if zig >= 7:
+            return {"side": seq_str[-1], "conf": 0.968, "name": f"ZIGZAG EXHAUSTION ({zig}x)"}
+        return None
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
+        seq_str = "".join("B" if s == 1 else "S" for s in seq)
         
-        # 1. Number Engine
-        num_dist = self.get_number_distribution(nums)
-        p_num_big = sum(num_dist[5:]) 
-        
-        # 2. Size Pattern Engine
+        # 1. Old Logic: Size Patterns (5-16)
         patterns = self.mine_patterns(seq)
         p_pattern_big = 0.5
         pat_str = "None"
@@ -359,61 +373,88 @@ class UpgradedEngine(Engine):
             weight_factor = support / (support + 5.0) 
             p_pattern_big = 0.5 + (raw_p - 0.5) * weight_factor
 
-        # 3. Trend Shift (Supreme)
-        p_cont, ctx_desc, samples = self.detect_trend_shift(seq)
+        # 2. Old Logic: Number Distribution (2-10)
+        num_dist = self.get_number_distribution(nums)
+        p_num_big = sum(num_dist[5:])
         
-        p_cal = 0.5
-        source = "⚖️ Neutral"
-        shift_alert = ""
+        # 3. GOKU MODES Triggers
+        goku_triggers = []
         
-        # ✅ Arbitration Hierarchy
-        if samples >= 3 and (p_cont >= 0.65 or p_cont <= 0.35):
-            current_side = seq[-1]
-            p_trend_big = p_cont if current_side == 1 else (1.0 - p_cont)
-            p_cal = p_trend_big
-            if p_cont >= 0.65:
-                source = f"📈 Trend Continue ({ctx_desc})"
-                shift_alert = "🟢 STRONG CONTINUATION"
-            else:
-                source = f"🔄 Trend Shift Detected ({ctx_desc})"
-                shift_alert = "🔴 STRONG SHIFT"
+        special = self.detect_special_trigger(nums)
+        if special: goku_triggers.append(special)
+        
+        for pattern, pred in self.sureshot_ngrams.items():
+            if seq_str.endswith(pattern):
+                goku_triggers.append({"side": "B" if pred == "BIG" else "S", "conf": 0.98, "name": f"N-GRAM {pattern}"})
+                break
                 
-        elif pat_str != "None" and abs(p_pattern_big - 0.5) >= 0.08:
-            # Strong Size Pattern
-            p_cal = p_pattern_big
-            source = "🧩 Strong Size Pattern"
+        dragon = self.detect_dragon_streak(seq_str)
+        if dragon: goku_triggers.append(dragon)
             
+        zigzag = self.detect_zigzag(seq_str)
+        if zigzag: goku_triggers.append(zigzag)
+        
+        # 4. Final Arbitration (Strict Priority)
+        final_side = None
+        final_conf = 0.0
+        source_name = "⚖️ Neutral"
+        
+        # Priority A: GOKU Triggers (If very strong)
+        if goku_triggers:
+            goku_triggers.sort(key=lambda x: x["conf"], reverse=True)
+            if goku_triggers[0]["conf"] >= 0.75: # Only take if strong
+                best = goku_triggers[0]
+                final_side = best["side"]
+                final_conf = best["conf"]
+                source_name = f"🎯 {best['name']}"
+                
+        # Priority B: Size Pattern (Old Logic)
+        if not final_side and pat_str != "None" and abs(p_pattern_big - 0.5) >= 0.08:
+            final_side = "B" if p_pattern_big >= 0.5 else "S"
+            final_conf = max(p_pattern_big, 1 - p_pattern_big)
+            source_name = "🧩 Strong Size Pattern"
+            
+        # Priority C: Number Pattern (Old Logic)
+        if not final_side:
+            final_side = "B" if p_num_big >= 0.5 else "S"
+            final_conf = max(p_num_big, 1 - p_num_big)
+            source_name = "🎯 Number Pattern"
+            
+        # Fallback if everything is 50-50
+        if final_conf < 0.52:
+            final_side = seq_str[-1]
+            final_conf = 0.51
+            source_name = "🛡️ Streak Fallback"
+
+        # 5. Map to BIG/SMALL and select best digit
+        pred_side = "BIG" if final_side == "B" else "SMALL"
+        
+        last_num = nums[-1]
+        cluster = self.digit_matrix.get(last_num, [7, 8, 2, 3])
+        
+        if pred_side == "BIG":
+            valid_nums = [n for n in cluster if n >= 5]
+            if not valid_nums: valid_nums = [n for n in range(5, 10) if num_dist[n] == max(num_dist[5:])]
+            best_num = max(valid_nums, key=lambda x: num_dist[x])
         else:
-            # Fallback to Number Engine
-            p_cal = p_num_big
-            source = "🎯 Number Pattern"
-            
-        # Final fallback if completely confused (50% flat)
-        if max(p_cal, 1 - p_cal) < 0.52:
-            p_cal = 0.5 + (float(seq[-1]) - 0.5) * 0.3
-            source = "🛡️ Streak Fallback"
-            
-        p_cal = clip(p_cal, 0.05, 0.95)
-        pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
-        
-        valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
-        best_num = max(valid_nums, key=lambda x: num_dist[x])
-        
+            valid_nums = [n for n in cluster if n < 5]
+            if not valid_nums: valid_nums = [n for n in range(0, 5) if num_dist[n] == max(num_dist[:5])]
+            best_num = max(valid_nums, key=lambda x: num_dist[x])
+
         return {
             "issue": issue, 
-            "p": p_cal, 
+            "p": final_conf if pred_side == "BIG" else 1.0 - final_conf,
             "side": pred_side,
             "num": best_num, 
             "pattern_big_prob": p_pattern_big,
             "number_big_prob": p_num_big,
-            "source": source,
-            "shift_alert": shift_alert,
-            "pattern_str": pat_str, 
+            "source": source_name,
+            "pattern_str": pat_str,
             "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
         }
 
 # ─────────────────────────────────────────────────────────────
-# FORMATTER (Clean UI with Overruled and High VIP)
+# FORMATTER (Clean UI with Overruled & High VIP)
 # ─────────────────────────────────────────────────────────────
 def format_prediction(p):
     conf = max(p["p"], 1 - p["p"]) * 100
@@ -422,11 +463,9 @@ def format_prediction(p):
     side = "BIG" if p["side"] == "BIG" else "SMALL"
     color = "🔴" if side == "BIG" else "🔵"
     
-    # ✅ HIGH VIP Tag back
     quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
     stake = "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
     
-    # ✅ Overruled Tag back
     pat_text = ""
     if p.get("pattern_str") and p.get("pattern_str") != "None":
         pat_str = p.get('pattern_str', 'None')
@@ -436,10 +475,6 @@ def format_prediction(p):
 
     source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
     
-    alert_text = ""
-    if p.get("shift_alert"):
-        alert_text += f"\n⚠️ <b>{p['shift_alert']}</b>"
-
     pat_big = p.get("pattern_big_prob", 0.5)
     pat_side = "BIG" if pat_big >= 0.5 else "SMALL"
     pat_prob = pat_big if pat_big >= 0.5 else 1.0 - pat_big
@@ -458,7 +493,7 @@ def format_prediction(p):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
         f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
-        f"{source_text}{alert_text}{breakdown_text}{pat_text}\n"
+        f"{source_text}{breakdown_text}{pat_text}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -606,7 +641,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Strict Logic + High VIP)")
+            LOG.info("HYPER V16 Predictor Started (GOKU + Old Logic)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
