@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - GOKU + Old Logic)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - Clean & Strict Pattern)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -38,11 +38,11 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     
-    # ✅ SIZE PATTERN RANGE (5 to 16) - Old Logic
+    # ✅ SIZE PATTERN RANGE (5 to 16)
     min_pattern_length: int = 5
     max_pattern: int = 16 
     
-    # ✅ NUMBER PATTERN RANGE (2 to 10) - Old Logic
+    # ✅ NUMBER PATTERN RANGE (2 to 10)
     min_number_length: int = 2
     max_number_length: int = 10
     
@@ -103,14 +103,6 @@ def weighted_probability(observations):
     effective_n = sw * sw / sw2 if sw2 else 0.0
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
-
-def run_length(seq):
-    if not seq: return 0
-    n = 0
-    for x in reversed(seq):
-        if x != seq[-1]: break
-        n += 1
-    return n
 
 # ─────────────────────────────────────────────────────────────
 # DATABASE
@@ -176,7 +168,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# BASE ENGINE (Old Logic - Patterns & Settlement)
+# BASE ENGINE (Patterns & Settlement)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -284,24 +276,11 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (GOKU MODES Triggers + Old Size/Number Logic)
+# UPGRADED ENGINE (Clean Logic: Strong Pattern > Number)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
     def __init__(self, db):
         super().__init__(db)
-        # GOKU MODES Special Triggers
-        self.sureshot_ngrams = {
-            'BBBSBBSSBSBBBBS': 'SMALL', 'BBBBBBBB': 'SMALL', 'SSSSSSSS': 'BIG',
-            'SBSBSBSB': 'SMALL', 'BSBSBSBS': 'BIG', 'BBSSBBSS': 'BIG',
-            'SSBBSSBB': 'SMALL', 'BBBSSSB': 'BIG', 'SSSBBBS': 'SMALL',
-            'BSBBSB': 'BIG', 'SBSBBS': 'SMALL', 'BBBBSB': 'BIG', 'SSSSBS': 'SMALL'
-        }
-        self.digit_matrix = {
-            0: [5, 2, 8, 4, 1], 1: [6, 3, 7, 9, 2], 2: [7, 4, 8, 0, 3],
-            3: [8, 5, 9, 1, 4], 4: [9, 6, 0, 2, 5], 5: [0, 7, 3, 5, 8],
-            6: [1, 8, 4, 6, 9], 7: [2, 9, 5, 1, 0], 8: [3, 0, 6, 2, 7],
-            9: [4, 1, 7, 3, 8]
-        }
 
     def get_number_distribution(self, nums):
         ngram_db = self.db.get("num_ngrams", {})
@@ -318,43 +297,11 @@ class UpgradedEngine(Engine):
         total = sum(dist)
         return [d / total for d in dist]
 
-    def detect_special_trigger(self, nums):
-        if len(nums) < 2: return None
-        n1, n2 = nums[-1], nums[-2]
-        
-        if n1 == 5 and n2 == 5: return {"side": "BIG", "conf": 0.986, "name": "DOUBLE 5 VIOLET BRIDGE"}
-        if n1 == 4 and n2 == 4: return {"side": "SMALL", "conf": 0.984, "name": "DOUBLE 4 RED PIVOT"}
-        if n1 == 0 and n2 in (0, 5): return {"side": "BIG", "conf": 0.982, "name": "ZERO VIOLET GATE"}
-        if n1 == 9 and n2 == 9: return {"side": "SMALL", "conf": 0.985, "name": "9-9 CEILING BOUNCE"}
-        return None
-
-    def detect_dragon_streak(self, seq_str):
-        streak = run_length([1 if c == "B" else 0 for c in seq_str])
-        current = seq_str[-1]
-        flip = "S" if current == "B" else "B"
-        
-        if streak >= 10: return {"side": flip, "conf": 0.985, "name": f"TITAN STREAK ({streak}x)"}
-        if streak >= 8: return {"side": flip, "conf": 0.950, "name": f"SUPER DRAGON ({streak}x)"}
-        if streak >= 6: return {"side": flip, "conf": 0.750, "name": f"MEGA DRAGON ({streak}x)"}
-        if streak >= 3: return {"side": current, "conf": 0.650, "name": f"MOMENTUM DRAGON ({streak}x)"}
-        return None
-
-    def detect_zigzag(self, seq_str):
-        if len(seq_str) < 6: return None
-        zig = 1
-        for i in range(len(seq_str)-1, 0, -1):
-            if seq_str[i] != seq_str[i-1]: zig += 1
-            else: break
-        if zig >= 7:
-            return {"side": seq_str[-1], "conf": 0.968, "name": f"ZIGZAG EXHAUSTION ({zig}x)"}
-        return None
-
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
-        seq_str = "".join("B" if s == 1 else "S" for s in seq)
         
-        # 1. Old Logic: Size Patterns (5-16)
+        # 1. Size Patterns (5-16)
         patterns = self.mine_patterns(seq)
         p_pattern_big = 0.5
         pat_str = "None"
@@ -373,73 +320,53 @@ class UpgradedEngine(Engine):
             weight_factor = support / (support + 5.0) 
             p_pattern_big = 0.5 + (raw_p - 0.5) * weight_factor
 
-        # 2. Old Logic: Number Distribution (2-10)
+        # 2. Number Distribution (2-10)
         num_dist = self.get_number_distribution(nums)
         p_num_big = sum(num_dist[5:])
         
-        # 3. GOKU MODES Triggers
-        goku_triggers = []
-        
-        special = self.detect_special_trigger(nums)
-        if special: goku_triggers.append(special)
-        
-        for pattern, pred in self.sureshot_ngrams.items():
-            if seq_str.endswith(pattern):
-                goku_triggers.append({"side": "B" if pred == "BIG" else "S", "conf": 0.98, "name": f"N-GRAM {pattern}"})
-                break
-                
-        dragon = self.detect_dragon_streak(seq_str)
-        if dragon: goku_triggers.append(dragon)
-            
-        zigzag = self.detect_zigzag(seq_str)
-        if zigzag: goku_triggers.append(zigzag)
-        
-        # 4. Final Arbitration (Strict Priority)
+        # 3. Strict Arbitration (No Overruling Strong Patterns)
         final_side = None
         final_conf = 0.0
         source_name = "⚖️ Neutral"
         
-        # Priority A: GOKU Triggers (If very strong)
-        if goku_triggers:
-            goku_triggers.sort(key=lambda x: x["conf"], reverse=True)
-            if goku_triggers[0]["conf"] >= 0.75: # Only take if strong
-                best = goku_triggers[0]
-                final_side = best["side"]
-                final_conf = best["conf"]
-                source_name = f"🎯 {best['name']}"
-                
-        # Priority B: Size Pattern (Old Logic)
-        if not final_side and pat_str != "None" and abs(p_pattern_big - 0.5) >= 0.08:
+        # Check if Size Pattern is strong (>= 58% confidence)
+        is_strong_pattern = False
+        if pat_str != "None" and abs(p_pattern_big - 0.5) >= 0.08:
+            is_strong_pattern = True
+
+        if is_strong_pattern:
+            # Size Pattern decides
             final_side = "B" if p_pattern_big >= 0.5 else "S"
             final_conf = max(p_pattern_big, 1 - p_pattern_big)
             source_name = "🧩 Strong Size Pattern"
             
-        # Priority C: Number Pattern (Old Logic)
-        if not final_side:
-            final_side = "B" if p_num_big >= 0.5 else "S"
-            final_conf = max(p_num_big, 1 - p_num_big)
-            source_name = "🎯 Number Pattern"
-            
-        # Fallback if everything is 50-50
+        else:
+            # Size pattern weak, Number decides
+            if abs(p_num_big - 0.5) >= 0.05: # At least 55% number confidence
+                final_side = "B" if p_num_big >= 0.5 else "S"
+                final_conf = max(p_num_big, 1 - p_num_big)
+                source_name = "🎯 Number Pattern"
+            else:
+                # Both weak, follow Size pattern if exists, else Number
+                if pat_str != "None":
+                    final_side = "B" if p_pattern_big >= 0.5 else "S"
+                    final_conf = max(p_pattern_big, 1 - p_pattern_big)
+                    source_name = "🧩 Weak Size Pattern"
+                else:
+                    final_side = "B" if p_num_big >= 0.5 else "S"
+                    final_conf = max(p_num_big, 1 - p_num_big)
+                    source_name = "🎯 Weak Number Pattern"
+
+        # 4. Ensure no fake confidence
         if final_conf < 0.52:
-            final_side = seq_str[-1]
-            final_conf = 0.51
-            source_name = "🛡️ Streak Fallback"
+            final_conf = 0.505 # Show as low conf
+            source_name = "⚠️ Low Confidence"
 
         # 5. Map to BIG/SMALL and select best digit
         pred_side = "BIG" if final_side == "B" else "SMALL"
         
-        last_num = nums[-1]
-        cluster = self.digit_matrix.get(last_num, [7, 8, 2, 3])
-        
-        if pred_side == "BIG":
-            valid_nums = [n for n in cluster if n >= 5]
-            if not valid_nums: valid_nums = [n for n in range(5, 10) if num_dist[n] == max(num_dist[5:])]
-            best_num = max(valid_nums, key=lambda x: num_dist[x])
-        else:
-            valid_nums = [n for n in cluster if n < 5]
-            if not valid_nums: valid_nums = [n for n in range(0, 5) if num_dist[n] == max(num_dist[:5])]
-            best_num = max(valid_nums, key=lambda x: num_dist[x])
+        valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
+        best_num = max(valid_nums, key=lambda x: num_dist[x])
 
         return {
             "issue": issue, 
@@ -454,7 +381,7 @@ class UpgradedEngine(Engine):
         }
 
 # ─────────────────────────────────────────────────────────────
-# FORMATTER (Clean UI with Overruled & High VIP)
+# FORMATTER (Clean UI, No Noise)
 # ─────────────────────────────────────────────────────────────
 def format_prediction(p):
     conf = max(p["p"], 1 - p["p"]) * 100
@@ -641,7 +568,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (GOKU + Old Logic)")
+            LOG.info("HYPER V16 Predictor Started (Clean Strict Logic)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
