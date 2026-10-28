@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - Upgraded Engine)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - Upgraded Engine + Old Format)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -269,7 +269,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Cross-Engine Arbitration) - Existing Base Engine
+# ENGINE (Cross-Engine Arbitration) - Base Engine (100% Preserved)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -378,6 +378,133 @@ class Engine:
 
         return experts, patterns, features, current_regime
 
+    def _predict_number(self, seq_nums):
+        ngram_db = self.db.get("num_ngrams", {})
+        
+        best_num = None
+        best_prob = 0.0
+        
+        for length in range(min(10, len(seq_nums)), 1, -1):
+            seq_key = ",".join(str(x) for x in seq_nums[-length:])
+            if seq_key in ngram_db:
+                trans = ngram_db[seq_key]
+                total_occurrences = sum(trans.values())
+                if total_occurrences > 0:
+                    max_num = max(trans, key=trans.get)
+                    max_prob = trans[max_num] / total_occurrences
+                    
+                    if max_prob > best_prob:
+                        best_prob = max_prob
+                        best_num = int(max_num)
+                        
+                    if best_prob >= 0.70:
+                        break
+                        
+        if best_num is not None:
+            return best_num, best_prob
+            
+        freq = self.db.get("num_freq", {})
+        if freq:
+            total_freq = sum(freq.values())
+            max_num = max(freq, key=freq.get)
+            return int(max_num), freq[max_num] / total_freq
+            
+        return random.randint(0, 9), 0.10
+
+    def predict(self, history, issue):
+        seq = [r["size"] for r in history]
+        nums = [r["num"] for r in history]
+        
+        experts, patterns, features, current_regime = self.mine_experts(seq)
+        current_streak = run_length(seq)
+
+        adjusted = []
+        for name, p in experts.items():
+            corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
+            
+            if name == "patterns": weight *= 2.5
+            if current_streak >= 4 and name in ("momentum", "run"): weight *= 3.0
+            if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
+            adjusted.append((corrected, weight))
+
+        total_w = sum(w for _, w in adjusted)
+        p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
+        
+        consensus = max(sum(1 for p,_ in adjusted if p>=0.5), sum(1 for p,_ in adjusted if p<0.5)) / len(adjusted)
+        if consensus > 0.85: p_avg = 0.5 + (p_avg - 0.5) * 0.7
+
+        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
+        mw = self.db.get("meta_weights")
+        if not isinstance(mw, list) or len(mw) != len(m_feats): mw = [0.0] * len(m_feats)
+        p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
+        
+        alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
+        p_raw = alpha * p_meta + (1 - alpha) * p_avg
+
+        if current_streak >= 4:
+            trend_val = float(seq[-1])
+            p_raw = 0.90 * trend_val + 0.10 * p_raw
+
+        bucket = min(19, int(p_raw * 20))
+        n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
+        p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
+
+        pat_str = "None"
+        if patterns:
+            top_p = patterns[0]
+            p_pat = top_p[1]
+            p_type = top_p[4].split(":")[0]
+            bits = top_p[4].split(":")[-1]
+            arrow = "⬆️" if p_pat >= 0.5 else "⬇️"
+            
+            if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
+            else: pat_str = f"<code>{bits}</code> {arrow}"
+
+            if p_pat >= 0.55:
+                p_cal = max(p_cal, 0.60) 
+            elif p_pat <= 0.45:
+                p_cal = min(p_cal, 0.40) 
+
+        num_pred, num_conf = self._predict_number(nums)
+        size_conf = max(p_cal, 1 - p_cal)
+        
+        source = "📊 Size Engine"
+        
+        if num_conf > size_conf + 0.05:
+            source = "🎯 Number Engine"
+            if num_pred >= 5: 
+                p_cal = max(p_cal, num_conf)
+            else: 
+                p_cal = min(p_cal, 1 - num_conf)
+                
+            pred_side = "BIG" if num_pred >= 5 else "SMALL"
+        else:
+            pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+            valid = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
+            if num_pred not in valid:
+                ngram_db = self.db.get("num_ngrams", {})
+                for length in range(min(10, len(nums)), 1, -1):
+                    seq_key = ",".join(str(x) for x in nums[-length:])
+                    if seq_key in ngram_db:
+                        trans = ngram_db[seq_key]
+                        valid_trans = {int(k): v for k, v in trans.items() if int(k) in valid}
+                        if valid_trans:
+                            num_pred = max(valid_trans, key=valid_trans.get)
+                            break
+                else:
+                    num_pred = random.choice(valid)
+
+        prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
+        trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
+
+        return {
+            "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
+            "num": num_pred, "regime": current_regime, "source": source,
+            "trend_shift": trend_shift, "pattern_str": pat_str,
+            "experts": experts, "features": features, "meta_feats": m_feats,
+            "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
+        }
+
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
         
@@ -476,7 +603,6 @@ class UpgradedEngine(Engine):
         recent = seq[-10:]
         switches = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1]) / 9.0
         
-        # Combine imbalance and switch rate
         score = (imbalance * 0.6) + (switches * 0.4)
         return clip(score, 0.0, 1.0)
 
@@ -506,13 +632,8 @@ class UpgradedEngine(Engine):
                     if seq[i] == seq[i-1]: cont_wins += 1
             if cont_total > 10:
                 hist_cont_prob = cont_wins / cont_total
-                # Blend historical continuation with current size prob
-                target_val = 1.0 if seq[-1] == 1 else 0.0
                 blend = 0.5
-                
-                # probability of BIG based on continuation logic
                 p_cont_big = hist_cont_prob if seq[-1] == 1 else (1.0 - hist_cont_prob)
-                
                 p_cal = (p_cal * (1 - blend)) + (p_cont_big * blend)
                 pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
 
@@ -524,10 +645,21 @@ class UpgradedEngine(Engine):
         best_num = max(valid_nums, key=lambda x: num_dist[x])
         num_prob = num_dist[best_num]
         
+        # 7. Pattern String (For old format)
+        pat_str = "None"
+        if patterns:
+            top_p = patterns[0]
+            p_pat = top_p[1]
+            p_type = top_p[4].split(":")[0]
+            bits = top_p[4].split(":")[-1]
+            arrow = "⬆️" if p_pat >= 0.5 else "⬇️"
+            
+            if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
+            else: pat_str = f"<code>{bits}</code> {arrow}"
+        
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
-        # Keep exact old keys for settlement mechanism to work
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
 
         return {
@@ -542,7 +674,7 @@ class UpgradedEngine(Engine):
             "display_regime": current_regime,
             "source": "🎯 Evidence Engine",
             "trend_shift": trend_shift, 
-            "pattern_str": None, 
+            "pattern_str": pat_str, 
             "experts": experts, 
             "features": features, 
             "meta_feats": m_feats,
@@ -550,45 +682,32 @@ class UpgradedEngine(Engine):
         }
 
 # ─────────────────────────────────────────────────────────────
-# FORMATTER
+# FORMATTER (Purana Wala Premium Format)
 # ─────────────────────────────────────────────────────────────
 def format_prediction(p):
-    size_probability = max(p["p"], 1.0 - p["p"])
-    number_probability = p.get("num_probability")
-    change_score = p.get("change_score", 0.0)
-
-    if change_score >= 0.55:
-        condition = "CHANGE WARNING"
-    elif size_probability < 0.55:
-        condition = "LOW SEPARATION"
-    else:
-        condition = "UNVALIDATED SIGNAL"
-
-    number_line = ""
-    if number_probability is not None:
-        number_line = (
-            f"\nNumber estimate: <b>{100 * number_probability:.1f}%</b>"
-        )
-
-    shift_line = ""
-    if p.get("trend_shift"):
-        shift_line = f"\nObserved shift: {escape(p['trend_shift'])}"
-
-    regime = p.get("display_regime", p.get("regime", "UNKNOWN"))
+    conf = max(p["p"], 1 - p["p"]) * 100
+    filled = int(conf // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    side = "BIG" if p["side"] == "BIG" else "SMALL"
+    color = "🔴" if side == "BIG" else "🔵"
+    
+    quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
+    stake = "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
+    
+    shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
+    pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
+    source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
 
     return (
-        f"<b>{escape(CFG.name)}</b>\n"
-        f"Period: <code>{escape(p['issue'])}</code>\n"
-        f"Side: <b>{escape(p['side'])}</b>\n"
-        f"Number within side: <code>{p['num']}</code>\n"
-        f"Size estimate: <b>{100 * size_probability:.1f}%</b>"
-        f"{number_line}\n"
-        f"Condition: <b>{condition}</b>\n"
-        f"Observed regime: {escape(regime)}\n"
-        f"Change score: {change_score:.2f}/1"
-        f"{shift_line}\n"
-        f"<i>Experimental estimates, not guaranteed accuracy. "
-        f"Change score is not a reversal probability.</i>"
+        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>TARGET:</b> {color} <b>{side}</b> → <code>{p['num']}</code>\n"
+        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
+        f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
+        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{source_text}{shift_text}{pat_text}\n"
+        f"━━━━━━━━━━━━━━━━━━"
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -597,7 +716,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = UpgradedEngine(db) # ✅ Updated to new engine
+        self.engine = UpgradedEngine(db) # ✅ Uses new Engine
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
         self.error = None
@@ -633,7 +752,6 @@ class Runtime:
                 self.error = None
                 failures = 0
 
-                # This uses Engine.settle mechanism since UpgradedEngine inherits from Engine
                 self.engine.settle(history)
 
                 latest = int(history[-1]["issue"])
@@ -736,7 +854,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Evidence-Based Upgraded Engine)")
+            LOG.info("HYPER V16 Predictor Started (Upgraded Engine + Old Format)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
