@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V18 - Mind Reader)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - Upgraded Engine)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -30,19 +30,19 @@ class Config:
     chat: str = "-1004485961768"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v18.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v16.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
-    learning_rate: float = 0.04
-    meta_lr: float = 0.035
+    learning_rate: float = 0.035
+    meta_lr: float = 0.03
     decay: float = 0.985
     max_pattern: int = 15 
     delivery_ttl: float = 40.0
-    name: str = "FTW VIP PREDICTOR (HYPER V18)"
+    name: str = "FTW VIP PREDICTOR (HYPER)"
     
     # ✅ Tumhare Stickers
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
@@ -82,30 +82,13 @@ def run_length(seq):
         n += 1
     return n
 
-def entropy(seq):
-    if not seq: return 0.0
-    counts = Counter(seq[-24:])
-    total = sum(counts.values())
-    ent = 0.0
-    for count in counts.values():
-        p = count / total
-        if p > 0: ent -= p * math.log2(p)
-    return ent # 0.0 (Pure Trend) to 1.0 (Pure Random)
-
 def get_regime(seq):
     tail = seq[-24:]
     if len(tail) < 8: return "COLD"
-    
     flips = sum(a != b for a, b in zip(tail, tail[1:]))
     rate = flips / (len(tail) - 1)
-    
-    # 🧠 V18 UPGRADE: Detect Zig-Zag specifically
-    is_zigzag = all(tail[i] != tail[i-1] for i in range(-4, 0)) if len(tail) >= 4 else False
-    
-    if is_zigzag: return "ZIGZAG"
     if run_length(tail) >= 4: return "RUN"
     if rate >= 0.70: return "ALT"
-    if entropy(seq) > 0.95: return "RANDOM"
     if abs(sum(tail) / len(tail) - 0.5) > 0.20: return "IMBAL"
     return "MIXED"
 
@@ -141,7 +124,7 @@ def weighted_probability(observations):
     return probability, effective_n
 
 def trend_features(seq):
-    if not seq: return [0.0] * 37
+    if not seq: return [0.0] * 32
     def mean(k):
         arr = seq[-k:]
         return sum(arr) / len(arr) if arr else 0.5
@@ -172,7 +155,6 @@ def trend_features(seq):
     signed_run = (2 * seq[-1] - 1) * min(run_length(seq), 10) / 10.0
     rsi_n = (rsi(14) / 100.0) * 2.0 - 1.0
     macd = (ema(12) - ema(26)) * 2.0
-    
     autocorr = 0.0
     if len(seq) >= 25 and std(24) > 0:
         m24 = mean(24)
@@ -191,11 +173,6 @@ def trend_features(seq):
         (2*mean(10)-1)/(std(10)+0.1), (2*mean(24)-1)/(std(24)+0.1), (sum(seq[-10:])/10.0)-0.5,
         (sum(seq[-5:])/5.0)-0.5, (2*mean(5)-1)*(2*mean(24)-1), math.tanh((mean(10)-0.5)*6),
         math.tanh((mean(48)-0.5)*6), (2*mean(3)-1)*(2*mean(96)-1),
-        # New V18 Trend/Regime Features
-        math.tanh(run_length(seq) * 0.5),
-        1.0 if run_length(seq) >= 4 else 0.0,
-        1.0 if all(seq[i] != seq[i-1] for i in range(-3, 0)) else 0.0, # Zigzag flag
-        entropy(seq) # Randomness level
     ]
 
 EXPERT_NAMES = ["patterns", "markov1", "markov2", "markov3", "markov4", "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic"]
@@ -261,7 +238,7 @@ class Database:
         failures = m["failures"] + 1 if wrong else 0
         self.c.execute("INSERT INTO models VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET n=excluded.n,loss=excluded.loss,inverse_loss=excluded.inverse_loss,failures=excluded.failures", (key, n, loss, inv, failures))
 
-    def adapt(self, key, probability, current_regime):
+    def adapt(self, key, probability):
         m = self.memory(key)
         n = m["n"]
         if n < 1: return probability, 0.65, False
@@ -269,10 +246,8 @@ class Database:
         brier = m["loss"] / n
         inverse_brier = m["inverse_loss"] / n
         
-        # V18: Strict protection against flipping in strong structured regimes
-        safe_regimes = ("RUN", "ZIGZAG")
-        flip_due_to_failures = (m["failures"] >= 2) and (current_regime not in safe_regimes)
-        flip_due_to_loss = (n >= 25 and inverse_brier + 0.04 < brier and inverse_brier < 0.245) and (current_regime not in safe_regimes)
+        flip_due_to_failures = (m["failures"] >= 2)
+        flip_due_to_loss = (n >= 25 and inverse_brier + 0.04 < brier and inverse_brier < 0.245)
         
         flipped = flip_due_to_failures or flip_due_to_loss
         effective_loss = inverse_brier if flipped else brier
@@ -294,7 +269,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Regime Awareness & Arbitration)
+# ENGINE (Cross-Engine Arbitration) - Existing Base Engine
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -314,37 +289,10 @@ class Engine:
         runs.append((curr, length))
         return runs
 
-    def predict_next_regime(self, seq):
-        """Predicts the probability of the NEXT regime based on historical transitions."""
-        if len(seq) < 30: return {}
-        current_regime = get_regime(seq)
-        
-        transitions = self.db.get("regime_matrix", {})
-        
-        # Learn phase
-        if current_regime not in transitions:
-            transitions[current_regime] = Counter()
-            
-        # In live prediction, we look at what usually follows 'current_regime'
-        counts = transitions.get(current_regime, {})
-        total = sum(counts.values()) + 1 # Smoothing
-        
-        probs = {k: v / total for k, v in counts.items()}
-        return probs, current_regime
-
     def mine_family_patterns(self, seq):
         if not seq: return []
         runs = self.get_runs(seq)
         if len(runs) < 2: return []
-
-        # V18 UPGRADE: Detect Run Acceleration (e.g. B1 -> S2 -> B3)
-        recent_runs = runs[-4:]
-        if len(recent_runs) >= 3:
-            lengths = [r[1] for r in recent_runs]
-            if lengths[-1] > lengths[-2] > lengths[-3]:
-                # Trend is expanding, next run will likely be even longer
-                next_side = not recent_runs[-1][0]
-                return [(99.0, 0.85 if next_side else 0.15, 10, 10.0, "family:ACCEL")]
 
         for k in range(min(6, len(runs)), 1, -1):
             target = runs[-k:]
@@ -397,7 +345,7 @@ class Engine:
         if patterns:
             num = den = 0.0
             for _, p, _, eff_n, key in patterns:
-                adjusted, w, _ = self.db.adapt(key, p, get_regime(seq))
+                adjusted, w, _ = self.db.adapt(key, p)
                 num += adjusted * (w * math.sqrt(eff_n))
                 den += (w * math.sqrt(eff_n))
             if den > 0: experts["patterns"] = num / den
@@ -407,8 +355,8 @@ class Engine:
             obs = [(seq[i], weight(i)) for i in range(order, n - order) if tuple(seq[i - order:i]) == suffix]
             if len(obs) >= CFG.min_support: experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        current_run = min(run_length(seq), 10)
-        run_obs = [(seq[i], weight(i)) for i in range(24, n) if seq[max(0, i-96):i] and seq[max(0, i-96):i][-1] == seq[-1] and min(run_length(seq[max(0, i-96):i]), 10) == current_run]
+        current_run = min(run_length(seq), 8)
+        run_obs = [(seq[i], weight(i)) for i in range(24, n) if seq[max(0, i-96):i] and seq[max(0, i-96):i][-1] == seq[-1] and min(run_length(seq[max(0, i-96):i]), 8) == current_run]
         if len(run_obs) >= CFG.min_support: experts["run"] = weighted_probability(run_obs)[0]
 
         current_regime = get_regime(seq)
@@ -425,169 +373,10 @@ class Engine:
         if not isinstance(tw, list) or len(tw) != len(features): tw = [0.0] * len(features)
         experts["trend"] = logistic(tw, features)
 
-        momentum = (sum(seq[-3:]) / 3.0) if seq else 0.5
-        experts["momentum"] = 0.15 + (momentum * 0.7)
+        momentum = sum(seq[-5:]) / 5.0 if seq else 0.5
+        experts["momentum"] = 0.2 + (momentum * 0.6)
 
         return experts, patterns, features, current_regime
-
-    def _predict_number(self, seq_nums):
-        ngram_db = self.db.get("num_ngrams", {})
-        freq = self.db.get("num_freq", {})
-        scores = {i: 0.0 for i in range(10)}
-        
-        for length in range(min(10, len(seq_nums)), 1, -1):
-            seq_key = ",".join(str(x) for x in seq_nums[-length:])
-            if seq_key in ngram_db:
-                trans = ngram_db[seq_key]
-                total = sum(trans.values())
-                if total > 0:
-                    for num_str, count in trans.items():
-                        scores[int(num_str)] += (count / total) * (length * 2.0)
-                    break 
-
-        if freq:
-            total_freq = sum(freq.values())
-            for num_str, count in freq.items():
-                scores[int(num_str)] += (count / total_freq) * 1.5
-                
-        if len(seq_nums) >= 2:
-            diff = seq_nums[-1] - seq_nums[-2]
-            expected = (seq_nums[-1] + diff) % 10
-            if 0 <= expected <= 9: scores[expected] += 3.0 
-            
-        if len(seq_nums) >= 5:
-            evens = sum(1 for x in seq_nums[-5:] if x % 2 == 0)
-            if evens >= 4:
-                for odd_num in [1, 3, 5, 7, 9]: scores[odd_num] += 1.0
-            elif evens <= 1:
-                for even_num in [0, 2, 4, 6, 8]: scores[even_num] += 1.0
-
-        best_num = max(scores, key=scores.get)
-        max_score = scores[best_num]
-        total_possible_score = sum(scores.values()) + 0.001
-        confidence = min(0.95, max_score / total_possible_score)
-        
-        if max_score == 0.0: return random.randint(0, 9), 0.10
-        return best_num, confidence
-
-    def predict(self, history, issue):
-        seq = [r["size"] for r in history]
-        nums = [r["num"] for r in history]
-        
-        experts, patterns, features, current_regime = self.mine_experts(seq)
-        current_streak = run_length(seq)
-        
-        # 🧠 V18: Predict the NEXT Regime
-        regime_probs, current_regime = self.predict_next_regime(seq)
-
-        adjusted = []
-        for name, p in experts.items():
-            corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p, current_regime)
-            
-            if name == "patterns": weight *= 2.5
-            if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.5
-            
-            # If the system predicts a ZIGZAG or RUN, boost the experts that align with it
-            if current_regime == "ZIGZAG" and name == "markov1": weight *= 3.0
-            if current_regime == "RUN" and name in ("momentum", "run"): weight *= 4.0
-            
-            adjusted.append((corrected, weight))
-
-        total_w = sum(w for _, w in adjusted)
-        p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
-        
-        consensus = max(sum(1 for p,_ in adjusted if p>=0.5), sum(1 for p,_ in adjusted if p<0.5)) / len(adjusted)
-        if consensus > 0.85: p_avg = 0.5 + (p_avg - 0.5) * 0.7
-
-        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
-        mw = self.db.get("meta_weights")
-        if not isinstance(mw, list) or len(mw) != len(m_feats): mw = [0.0] * len(m_feats)
-        p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
-        
-        alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
-        p_raw = alpha * p_meta + (1 - alpha) * p_avg
-
-        # 🔥 EARLY TREND DOMINATOR 🔥
-        # If in RUN regime, or if regime probs predict a RUN > 60%
-        if current_regime == "RUN" or (regime_probs.get("RUN", 0) > 0.60 and current_streak >= 2):
-            trend_val = float(seq[-1])
-            p_raw = 0.92 * trend_val + 0.08 * p_raw 
-            
-        # 🔄 ZIG ZAG OVERRIDE 🔄
-        if current_regime == "ZIGZAG":
-            # Since it's B-S-B-S, the next is simply the opposite of the last
-            p_raw = 0.95 if seq[-1] == 0 else 0.05 
-
-        bucket = min(19, int(p_raw * 20))
-        n_g, s_g = self.db.get(f"cal20:{current_regime}:{bucket}", [0.0, 0.0])
-        p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
-
-        pat_str = "None"
-        if patterns:
-            top_p = patterns[0]
-            p_pat = top_p[1]
-            p_type = top_p[4].split(":")[0]
-            bits = top_p[4].split(":")[-1]
-            arrow = "⬆️" if p_pat >= 0.5 else "⬇️"
-            
-            if p_type == "family" and "ACCEL" in bits: 
-                pat_str = "🚀 <code>Run Acceleration</code>"
-            elif p_type == "family": 
-                pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
-            else: 
-                pat_str = f"<code>{bits}</code> {arrow}"
-
-            if current_streak < 4 and current_regime != "ZIGZAG":
-                if p_pat >= 0.55: p_cal = max(p_cal, 0.60) 
-                elif p_pat <= 0.45: p_cal = min(p_cal, 0.40) 
-
-        # 🧠 ARBITRATION LOGIC (Number vs Size) 🧠
-        num_pred, num_conf = self._predict_number(nums)
-        size_conf = max(p_cal, 1 - p_cal)
-        
-        source = "📊 Size Engine"
-        
-        # V18 Arbitration: If Random regime, lower confidence
-        if current_regime == "RANDOM":
-            p_cal = 0.5 + (p_cal - 0.5) * 0.5 # Shrink towards 0.5
-            source = "🎲 Random Engine (Low Stake)"
-            num_conf = 0.0 # Don't let number engine override in random
-
-        if num_conf > 0.90 and size_conf < 0.75:
-            source = "🎯 Number Engine (High Conf)"
-            if num_pred >= 5: p_cal = max(p_cal, num_conf)
-            else: p_cal = min(p_cal, 1 - num_conf)
-                
-            pred_side = "BIG" if num_pred >= 5 else "SMALL"
-        else:
-            pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
-            valid = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
-            
-            if num_pred not in valid:
-                ngram_db = self.db.get("num_ngrams", {})
-                found = False
-                for length in range(min(10, len(nums)), 1, -1):
-                    seq_key = ",".join(str(x) for x in nums[-length:])
-                    if seq_key in ngram_db:
-                        trans = ngram_db[seq_key]
-                        valid_trans = {int(k): v for k, v in trans.items() if int(k) in valid}
-                        if valid_trans:
-                            num_pred = max(valid_trans, key=valid_trans.get)
-                            found = True
-                            break
-                if not found:
-                    num_pred = random.choice(valid)
-
-        prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
-        trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
-
-        return {
-            "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
-            "num": num_pred, "regime": current_regime, "source": source,
-            "trend_shift": trend_shift, "pattern_str": pat_str,
-            "experts": experts, "features": features, "meta_feats": m_feats,
-            "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
-        }
 
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
@@ -607,18 +396,6 @@ class Engine:
                     
         self.db.set("num_ngrams", num_ngrams)
         self.db.set("num_freq", num_freq)
-
-        # 🧠 V18: Update Regime Transition Matrix
-        regime_matrix = self.db.get("regime_matrix", {})
-        seq = [r["size"] for r in history]
-        if len(seq) > 30:
-            for i in range(len(seq) - 30, len(seq) - 1):
-                r1 = get_regime(seq[:i])
-                r2 = get_regime(seq[:i+1])
-                if r1 != r2:
-                    if r1 not in regime_matrix: regime_matrix[r1] = {}
-                    regime_matrix[r1][r2] = regime_matrix[r1].get(r2, 0) + 1
-            self.db.set("regime_matrix", regime_matrix)
 
         pending = self.db.c.execute("SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)").fetchall()
         for row in pending:
@@ -648,12 +425,8 @@ class Engine:
                     self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
 
                 bucket = min(19, int(p.get("p_raw", p["p"]) * 20))
-                regime = p.get("regime", "MIXED")
-                n, s = self.db.get(f"cal20:{regime}:{bucket}", [0.0, 0.0])
-                self.db.set(f"cal20:{regime}:{bucket}", [0.995 * n + 1, 0.995 * s + y])
-                
-                n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
-                self.db.set(f"cal20:global:{bucket}", [0.995 * n_g + 1, 0.995 * s_g + y])
+                n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
+                self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
 
                 if won_side and won_num: sticker = CFG.jack_sticker
                 elif won_side: sticker = CFG.win_sticker
@@ -662,33 +435,160 @@ class Engine:
                 self.db.queue("sticker", row["issue"], sticker)
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
 
+
+# ─────────────────────────────────────────────────────────────
+# UPGRADED ENGINE (Evidence-Based)
+# ─────────────────────────────────────────────────────────────
+class UpgradedEngine(Engine):
+    """Evidence-based forecasting"""
+    
+    @staticmethod
+    def normalize(values):
+        total = sum(values)
+        if total <= 0: return [1.0 / len(values)] * len(values)
+        return [v / total for v in values]
+
+    def get_number_distribution(self, nums):
+        """Creates a 0-9 probability distribution based on historical n-grams"""
+        ngram_db = self.db.get("num_ngrams", {})
+        dist = [1.0] * 10 # Base uniform smoothing
+        
+        for length in range(min(10, len(nums)), 1, -1):
+            seq_key = ",".join(str(x) for x in nums[-length:])
+            if seq_key in ngram_db:
+                trans = ngram_db[seq_key]
+                total = sum(trans.values())
+                if total >= 5: # Min support
+                    for k, v in trans.items():
+                        dist[int(k)] += (v / total) * length # Longer matches carry more weight
+                    break
+        
+        return self.normalize(dist)
+
+    def calculate_change_score(self, seq):
+        """Fast/slow imbalance + switching rate"""
+        if len(seq) < 20: return 0.0
+        
+        fast = sum(seq[-5:]) / 5.0
+        slow = sum(seq[-20:]) / 20.0
+        imbalance = abs(fast - slow) * 2.0 # 0.0 to 1.0
+        
+        recent = seq[-10:]
+        switches = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1]) / 9.0
+        
+        # Combine imbalance and switch rate
+        score = (imbalance * 0.6) + (switches * 0.4)
+        return clip(score, 0.0, 1.0)
+
+    def predict(self, history, issue):
+        seq = [r["size"] for r in history]
+        nums = [r["num"] for r in history]
+        
+        # 1. Get base experts from old engine
+        experts, patterns, features, current_regime = self.mine_experts(seq)
+        
+        # 2. Number Engine (0-9 Distribution)
+        num_dist = self.get_number_distribution(nums)
+        big_prob = sum(num_dist[5:])
+        p_cal = big_prob
+        
+        # 3. Size determination based on Number Distribution
+        pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+        
+        # 4. Long-run handling (Historical Continuation/Break)
+        current_streak = run_length(seq)
+        if current_streak >= 4:
+            cont_wins = 0
+            cont_total = 0
+            for i in range(4, len(seq)):
+                if run_length(seq[:i]) >= 4:
+                    cont_total += 1
+                    if seq[i] == seq[i-1]: cont_wins += 1
+            if cont_total > 10:
+                hist_cont_prob = cont_wins / cont_total
+                # Blend historical continuation with current size prob
+                target_val = 1.0 if seq[-1] == 1 else 0.0
+                blend = 0.5
+                
+                # probability of BIG based on continuation logic
+                p_cont_big = hist_cont_prob if seq[-1] == 1 else (1.0 - hist_cont_prob)
+                
+                p_cal = (p_cal * (1 - blend)) + (p_cont_big * blend)
+                pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+
+        # 5. Change Score
+        change_score = self.calculate_change_score(seq)
+        
+        # 6. Pick best number for the predicted side
+        valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
+        best_num = max(valid_nums, key=lambda x: num_dist[x])
+        num_prob = num_dist[best_num]
+        
+        prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
+        trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
+
+        # Keep exact old keys for settlement mechanism to work
+        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
+
+        return {
+            "issue": issue, 
+            "p": p_cal, 
+            "p_raw": p_cal, 
+            "side": pred_side,
+            "num": best_num, 
+            "num_probability": num_prob,
+            "change_score": change_score,
+            "regime": current_regime, 
+            "display_regime": current_regime,
+            "source": "🎯 Evidence Engine",
+            "trend_shift": trend_shift, 
+            "pattern_str": None, 
+            "experts": experts, 
+            "features": features, 
+            "meta_feats": m_feats,
+            "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
+        }
+
 # ─────────────────────────────────────────────────────────────
 # FORMATTER
 # ─────────────────────────────────────────────────────────────
 def format_prediction(p):
-    conf = max(p["p"], 1 - p["p"]) * 100
-    filled = int(conf // 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    side = "BIG" if p["side"] == "BIG" else "SMALL"
-    color = "🔴" if side == "BIG" else "🔵"
-    
-    quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
-    stake = "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
-    
-    shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
-    pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") else ""
-    source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
+    size_probability = max(p["p"], 1.0 - p["p"])
+    number_probability = p.get("num_probability")
+    change_score = p.get("change_score", 0.0)
+
+    if change_score >= 0.55:
+        condition = "CHANGE WARNING"
+    elif size_probability < 0.55:
+        condition = "LOW SEPARATION"
+    else:
+        condition = "UNVALIDATED SIGNAL"
+
+    number_line = ""
+    if number_probability is not None:
+        number_line = (
+            f"\nNumber estimate: <b>{100 * number_probability:.1f}%</b>"
+        )
+
+    shift_line = ""
+    if p.get("trend_shift"):
+        shift_line = f"\nObserved shift: {escape(p['trend_shift'])}"
+
+    regime = p.get("display_regime", p.get("regime", "UNKNOWN"))
 
     return (
-        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>TARGET:</b> {color} <b>{side}</b> → <code>{p['num']}</code>\n"
-        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
-        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{source_text}{shift_text}{pat_text}\n"
-        f"━━━━━━━━━━━━━━━━━━"
+        f"<b>{escape(CFG.name)}</b>\n"
+        f"Period: <code>{escape(p['issue'])}</code>\n"
+        f"Side: <b>{escape(p['side'])}</b>\n"
+        f"Number within side: <code>{p['num']}</code>\n"
+        f"Size estimate: <b>{100 * size_probability:.1f}%</b>"
+        f"{number_line}\n"
+        f"Condition: <b>{condition}</b>\n"
+        f"Observed regime: {escape(regime)}\n"
+        f"Change score: {change_score:.2f}/1"
+        f"{shift_line}\n"
+        f"<i>Experimental estimates, not guaranteed accuracy. "
+        f"Change score is not a reversal probability.</i>"
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -697,7 +597,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = Engine(db)
+        self.engine = UpgradedEngine(db) # ✅ Updated to new engine
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
         self.error = None
@@ -733,6 +633,7 @@ class Runtime:
                 self.error = None
                 failures = 0
 
+                # This uses Engine.settle mechanism since UpgradedEngine inherits from Engine
                 self.engine.settle(history)
 
                 latest = int(history[-1]["issue"])
@@ -835,7 +736,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V18 Predictor Started (Mind Reader)")
+            LOG.info("HYPER V16 Predictor Started (Evidence-Based Upgraded Engine)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
