@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V15 - Deep N-Gram Number Tracker)
+# bot.py — FTW VIP PREDICTOR (HYPER V17 - Anti-Overfitting)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -30,7 +30,7 @@ class Config:
     chat: str = "-1004485961768"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v15.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v17.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -269,7 +269,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Trend Rider, Deep N-Gram Number Tracker)
+# ENGINE
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -378,29 +378,45 @@ class Engine:
 
         return experts, patterns, features, current_regime
 
-    def _predict_number(self, seq_nums, pred_side):
-        valid = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
-        if not seq_nums: return random.choice(valid)
-
+    def _predict_number(self, seq_nums):
         ngram_db = self.db.get("num_ngrams", {})
+        
+        best_num = None
+        best_prob = 0.0
         
         # Track from Longest (10) down to Shortest (2)
         for length in range(min(10, len(seq_nums)), 1, -1):
             seq_key = ",".join(str(x) for x in seq_nums[-length:])
             if seq_key in ngram_db:
                 trans = ngram_db[seq_key]
-                # Filter next numbers that match the target side (BIG/SMALL)
-                valid_trans = {int(k): v for k, v in trans.items() if int(k) in valid}
-                if valid_trans:
-                    return max(valid_trans, key=valid_trans.get)
+                total_occurrences = sum(trans.values())
+                
+                # 🛡️ ANTI-OVERFITTING RULE: Must have appeared at least 5 times
+                if total_occurrences < 5:
+                    continue
                     
-        # Fallback to overall frequency
-        freq = self.db.get("num_freq", {})
-        valid_freq = {int(k): v for k, v in freq.items() if int(k) in valid}
-        if valid_freq:
-            return max(valid_freq, key=valid_freq.get)
+                max_num = max(trans, key=trans.get)
+                max_prob = trans[max_num] / total_occurrences
+                
+                if max_prob > best_prob:
+                    best_prob = max_prob
+                    best_num = int(max_num)
+                    
+                # If we find a very strong match (>70%), stop looking deeper
+                if best_prob >= 0.70:
+                    break
+                    
+        if best_num is not None:
+            return best_num, best_prob
             
-        return random.choice(valid)
+        # Fallback to overall frequency if no strong N-Gram works
+        freq = self.db.get("num_freq", {})
+        if freq:
+            total_freq = sum(freq.values())
+            max_num = max(freq, key=freq.get)
+            return int(max_num), freq[max_num] / total_freq
+            
+        return random.randint(0, 9), 0.10
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
@@ -414,10 +430,7 @@ class Engine:
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
             
             if name == "patterns": weight *= 2.5
-            
-            if current_streak >= 4:
-                if name in ("momentum", "run"): weight *= 3.0
-            
+            if current_streak >= 4 and name in ("momentum", "run"): weight *= 3.0
             if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
             adjusted.append((corrected, weight))
 
@@ -459,16 +472,44 @@ class Engine:
             elif p_pat <= 0.45:
                 p_cal = min(p_cal, 0.40) 
 
-        pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+        # 🧠 ARBITRATION LOGIC 🧠
+        num_pred, num_conf = self._predict_number(nums)
+        size_conf = max(p_cal, 1 - p_cal)
         
-        pred_num = self._predict_number(nums, pred_side)
+        source = "📊 Size Engine"
+        
+        if num_conf > size_conf + 0.05:
+            source = "🎯 Number Engine"
+            if num_pred >= 5:
+                p_cal = max(p_cal, num_conf)
+            else:
+                p_cal = min(p_cal, 1 - num_conf)
+                
+            pred_side = "BIG" if num_pred >= 5 else "SMALL"
+        else:
+            pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+            valid = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
+            if num_pred not in valid:
+                ngram_db = self.db.get("num_ngrams", {})
+                for length in range(min(10, len(nums)), 1, -1):
+                    seq_key = ",".join(str(x) for x in nums[-length:])
+                    if seq_key in ngram_db:
+                        trans = ngram_db[seq_key]
+                        # 🛡️ Check for 5 occurrences here too
+                        if sum(trans.values()) >= 5:
+                            valid_trans = {int(k): v for k, v in trans.items() if int(k) in valid}
+                            if valid_trans:
+                                num_pred = max(valid_trans, key=valid_trans.get)
+                                break
+                else:
+                    num_pred = random.choice(valid)
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
         return {
             "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
-            "num": pred_num, "regime": current_regime,
+            "num": num_pred, "regime": current_regime, "source": source,
             "trend_shift": trend_shift, "pattern_str": pat_str,
             "experts": experts, "features": features, "meta_feats": m_feats,
             "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
@@ -477,7 +518,6 @@ class Engine:
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
         
-        # Build Deep N-Gram Number Tracker (Length 2 to 10)
         num_ngrams = {}
         num_freq = {}
         for i in range(1, len(history)):
@@ -491,7 +531,6 @@ class Engine:
                         num_ngrams[seq_key] = {}
                     num_ngrams[seq_key][str(curr_num)] = num_ngrams[seq_key].get(str(curr_num), 0) + 1
                     
-        # Prune ngrams to avoid DB bloat (keep only if appeared at least 1 time)
         self.db.set("num_ngrams", num_ngrams)
         self.db.set("num_freq", num_freq)
 
@@ -548,6 +587,7 @@ def format_prediction(p):
     
     shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") else ""
+    source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
 
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
@@ -557,7 +597,7 @@ def format_prediction(p):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
         f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
-        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{shift_text}{pat_text}\n"
+        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{source_text}{shift_text}{pat_text}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -705,7 +745,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V15 Predictor Started (Deep N-Gram)")
+            LOG.info("HYPER V17 Predictor Started (Anti-Overfitting)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
