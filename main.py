@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - Deep Context Lookback)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - Pattern Priority)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -38,11 +38,9 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     
-    # ✅ SIZE PATTERN RANGE (5 to 16)
     min_pattern_length: int = 5
     max_pattern: int = 16 
     
-    # ✅ NUMBER PATTERN RANGE (2 to 10)
     min_number_length: int = 2
     max_number_length: int = 10
     
@@ -52,7 +50,6 @@ class Config:
     delivery_ttl: float = 40.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
     
-    # ✅ Tumhare Stickers
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -556,10 +553,10 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (Contextual Trend Pattern - 1 to 5 Lookback)
+# UPGRADED ENGINE (Pattern Priority + Trend Override disabled)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
-    """Evidence-based forecasting with contextual trend analysis (1-5 lookback)"""
+    """Evidence-based forecasting with strong Pattern priority"""
     
     @staticmethod
     def normalize(values):
@@ -592,7 +589,6 @@ class UpgradedEngine(Engine):
         return clip(score, 0.0, 1.0)
 
     def get_contextual_trend_prob(self, seq):
-        """Checks history for exact preceding pattern (1 to 5 lookback) + streak to see if it continued or broke"""
         if len(seq) < 30: return 0.5, 0, "None"
         
         current_run = run_length(seq)
@@ -600,7 +596,6 @@ class UpgradedEngine(Engine):
         
         current_side = seq[-1]
         
-        # Loop from 5 periods before, down to 1 period before
         for lookback in range(5, 0, -1):
             ctx_len = current_run + lookback
             if len(seq) < ctx_len + 1: continue
@@ -609,17 +604,15 @@ class UpgradedEngine(Engine):
             cont_wins = 0
             total = 0
             
-            # Search entire history for this exact context
             for i in range(ctx_len, len(seq) - 1):
                 if tuple(seq[i-ctx_len:i]) == target_seq:
                     total += 1
                     if seq[i] == current_side: cont_wins += 1
                     
-            if total >= 3: # Minimum 3 historical matches for reliability
+            if total >= 3: 
                 match_desc = f"Ctx -{lookback}"
                 return cont_wins / total, total, match_desc
                 
-        # Fallback: Just streak length if no deep context is found
         cont_wins = 0
         total = 0
         for i in range(current_run, len(seq) - 1):
@@ -641,7 +634,18 @@ class UpgradedEngine(Engine):
         num_dist = self.get_number_distribution(nums)
         p_num_engine = sum(num_dist[5:]) 
         
+        # 1. Blend Size and Num Engines
         p_cal = (p_size_engine * 0.6) + (p_num_engine * 0.4)
+        
+        # 2. Check if a strong pattern exists (Fix for Period 426)
+        is_strong_pattern = False
+        patterns = base_pred["patterns"]
+        if patterns:
+            top_p = patterns[0]["p"]
+            support = patterns[0]["support"]
+            if support >= 3 and abs(top_p - 0.5) >= 0.10: # Strong pattern (60%+ confidence)
+                is_strong_pattern = True
+                p_pattern = top_p
         
         current_streak = run_length(seq)
         p_cont, samples, match_type = self.get_contextual_trend_prob(seq)
@@ -649,14 +653,19 @@ class UpgradedEngine(Engine):
         is_trend_follow = False
         is_trend_fade = False
         
-        if current_streak >= 3 and samples >= 3:
+        # 3. Apply Trend Logic ONLY if Pattern is not strong
+        if not is_strong_pattern and current_streak >= 3 and samples >= 3:
             current_side = seq[-1]
             p_trend_big = p_cont if current_side == 1 else (1.0 - p_cont)
             
-            p_cal = (p_trend_big * 0.65) + (p_cal * 0.35)
+            # Trend ka weight ab sirf 20% hai, Size/Num ka 80%
+            p_cal = (p_cal * 0.80) + (p_trend_big * 0.20)
             
-            if p_cont >= 0.60: is_trend_follow = True
-            elif p_cont <= 0.40: is_trend_fade = True
+            if p_cont >= 0.65: is_trend_follow = True
+            elif p_cont <= 0.35: is_trend_fade = True
+        elif is_strong_pattern:
+            # Agar Pattern strong hai, toh usko 50% weight do
+            p_cal = (p_cal * 0.50) + (p_pattern * 0.50)
             
         p_cal = clip(p_cal, 0.05, 0.95)
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
@@ -671,7 +680,9 @@ class UpgradedEngine(Engine):
         num_says_big = p_num_engine >= 0.5
         
         source = "⚖️ Combined"
-        if is_trend_follow:
+        if is_strong_pattern:
+            source = f"🧩 Strong Pattern"
+        elif is_trend_follow:
             source = f"📈 Trend Follow ({int(p_cont*100)}% | {match_type})"
         elif is_trend_fade:
             source = f"🔄 Trend Fade ({int(100-p_cont*100)}% | {match_type})"
@@ -683,7 +694,6 @@ class UpgradedEngine(Engine):
             source = "🎯 Number Engine"
             
         pat_str = "None"
-        patterns = base_pred["patterns"]
         if patterns:
             top_p = patterns[0]
             p_pat = top_p["p"]
@@ -733,12 +743,28 @@ def format_prediction(p):
     stake = "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
     
     shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
-    pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
+    
+    pat_text = ""
+    if p.get("pattern_str") and p.get("pattern_str") != "None":
+        pat_str = p.get('pattern_str', 'None')
+        if "⬆️" in pat_str and side == "SMALL": pat_str += " ❌ (Overruled)"
+        elif "⬇️" in pat_str and side == "BIG": pat_str += " ❌ (Overruled)"
+        pat_text = f"\n🧩 <b>PATTERN:</b> {pat_str}"
+
     source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
     
-    size_str = "BIG" if p.get("size_probability", 0.5) >= 0.5 else "SMALL"
-    num_str = "BIG" if p.get("number_big_prob", 0.5) >= 0.5 else "SMALL"
-    breakdown_text = f"\n📊 <b>BREAKDOWN:</b> Size ({size_str} {p.get('size_probability', 0.5)*100:.0f}%) | Num ({num_str} {p.get('number_big_prob', 0.5)*100:.0f}%)"
+    size_big = p.get("size_probability", 0.5)
+    size_side = "BIG" if size_big >= 0.5 else "SMALL"
+    size_prob = size_big if size_big >= 0.5 else 1.0 - size_big
+    
+    num_big = p.get("number_big_prob", 0.5)
+    num_side = "BIG" if num_big >= 0.5 else "SMALL"
+    num_prob = num_big if num_big >= 0.5 else 1.0 - num_big
+    
+    breakdown_text = f"\n📊 <b>BREAKDOWN:</b> Size ({size_side} {size_prob*100:.0f}%) | Num ({num_side} {num_prob*100:.0f}%)"
+    
+    if "Trend" in p.get("source", ""):
+        breakdown_text += f"\n⚖️ <b>TREND OVERRIDE:</b> {side} ({conf:.0f}%)"
 
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
@@ -896,7 +922,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Deep 1-5 Lookback)")
+            LOG.info("HYPER V16 Predictor Started (Pattern Priority)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
