@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V17 - Anti-Overfitting)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - High Accuracy Arbitrator)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -30,7 +30,7 @@ class Config:
     chat: str = "-1004485961768"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v17.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v16.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -269,7 +269,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE
+# ENGINE (Cross-Engine Arbitration)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -390,26 +390,22 @@ class Engine:
             if seq_key in ngram_db:
                 trans = ngram_db[seq_key]
                 total_occurrences = sum(trans.values())
-                
-                # 🛡️ ANTI-OVERFITTING RULE: Must have appeared at least 5 times
-                if total_occurrences < 5:
-                    continue
+                if total_occurrences > 0:
+                    max_num = max(trans, key=trans.get)
+                    max_prob = trans[max_num] / total_occurrences
                     
-                max_num = max(trans, key=trans.get)
-                max_prob = trans[max_num] / total_occurrences
-                
-                if max_prob > best_prob:
-                    best_prob = max_prob
-                    best_num = int(max_num)
-                    
-                # If we find a very strong match (>70%), stop looking deeper
-                if best_prob >= 0.70:
-                    break
-                    
+                    if max_prob > best_prob:
+                        best_prob = max_prob
+                        best_num = int(max_num)
+                        
+                    # If we find a very strong match (e.g., >70% accuracy), we stop here
+                    if best_prob >= 0.70:
+                        break
+                        
         if best_num is not None:
             return best_num, best_prob
             
-        # Fallback to overall frequency if no strong N-Gram works
+        # Fallback to overall frequency if no N-Gram works
         freq = self.db.get("num_freq", {})
         if freq:
             total_freq = sum(freq.values())
@@ -472,35 +468,37 @@ class Engine:
             elif p_pat <= 0.45:
                 p_cal = min(p_cal, 0.40) 
 
-        # 🧠 ARBITRATION LOGIC 🧠
+        # 🧠 ARBITRATION LOGIC (Number vs Size) 🧠
         num_pred, num_conf = self._predict_number(nums)
         size_conf = max(p_cal, 1 - p_cal)
         
         source = "📊 Size Engine"
         
+        # If Number Tracker is more confident than Size Experts
         if num_conf > size_conf + 0.05:
             source = "🎯 Number Engine"
-            if num_pred >= 5:
+            # Force p_cal to match the number's side
+            if num_pred >= 5: # Number is BIG
                 p_cal = max(p_cal, num_conf)
-            else:
+            else: # Number is SMALL
                 p_cal = min(p_cal, 1 - num_conf)
                 
             pred_side = "BIG" if num_pred >= 5 else "SMALL"
         else:
             pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+            # Filter the best number for the given side
             valid = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
             if num_pred not in valid:
+                # If number doesn't match size, pick next best number in that size
                 ngram_db = self.db.get("num_ngrams", {})
                 for length in range(min(10, len(nums)), 1, -1):
                     seq_key = ",".join(str(x) for x in nums[-length:])
                     if seq_key in ngram_db:
                         trans = ngram_db[seq_key]
-                        # 🛡️ Check for 5 occurrences here too
-                        if sum(trans.values()) >= 5:
-                            valid_trans = {int(k): v for k, v in trans.items() if int(k) in valid}
-                            if valid_trans:
-                                num_pred = max(valid_trans, key=valid_trans.get)
-                                break
+                        valid_trans = {int(k): v for k, v in trans.items() if int(k) in valid}
+                        if valid_trans:
+                            num_pred = max(valid_trans, key=valid_trans.get)
+                            break
                 else:
                     num_pred = random.choice(valid)
 
@@ -745,7 +743,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V17 Predictor Started (Anti-Overfitting)")
+            LOG.info("HYPER V16 Predictor Started (High Accuracy Arbitrator)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
