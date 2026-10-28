@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - Pattern Priority)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - Weak Signal Pattern Priority)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -553,7 +553,7 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (Pattern Priority + Trend Override disabled)
+# UPGRADED ENGINE (Weak Signal Pattern Priority)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
     """Evidence-based forecasting with strong Pattern priority"""
@@ -634,18 +634,24 @@ class UpgradedEngine(Engine):
         num_dist = self.get_number_distribution(nums)
         p_num_engine = sum(num_dist[5:]) 
         
-        # 1. Blend Size and Num Engines
+        # 1. Initial Blend (Size + Number)
         p_cal = (p_size_engine * 0.6) + (p_num_engine * 0.4)
         
-        # 2. Check if a strong pattern exists (Fix for Period 426)
+        # 2. Check for Pattern
         is_strong_pattern = False
         patterns = base_pred["patterns"]
+        
         if patterns:
             top_p = patterns[0]["p"]
             support = patterns[0]["support"]
-            if support >= 3 and abs(top_p - 0.5) >= 0.10: # Strong pattern (60%+ confidence)
+            
+            # ✅ FIX: Agar Size aur Num dono confused hain (45% se 55% ke beech), toh Pattern ko power do
+            if 0.45 <= p_cal <= 0.55:
+                p_cal = top_p # Pattern ki probability directly apply karo
                 is_strong_pattern = True
-                p_pattern = top_p
+            elif support >= 3 and abs(top_p - 0.5) >= 0.10:
+                is_strong_pattern = True
+                p_cal = (p_cal * 0.50) + (top_p * 0.50)
         
         current_streak = run_length(seq)
         p_cont, samples, match_type = self.get_contextual_trend_prob(seq)
@@ -658,14 +664,11 @@ class UpgradedEngine(Engine):
             current_side = seq[-1]
             p_trend_big = p_cont if current_side == 1 else (1.0 - p_cont)
             
-            # Trend ka weight ab sirf 20% hai, Size/Num ka 80%
+            # Trend ka weight kam (20%)
             p_cal = (p_cal * 0.80) + (p_trend_big * 0.20)
             
             if p_cont >= 0.65: is_trend_follow = True
             elif p_cont <= 0.35: is_trend_fade = True
-        elif is_strong_pattern:
-            # Agar Pattern strong hai, toh usko 50% weight do
-            p_cal = (p_cal * 0.50) + (p_pattern * 0.50)
             
         p_cal = clip(p_cal, 0.05, 0.95)
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
@@ -681,7 +684,7 @@ class UpgradedEngine(Engine):
         
         source = "⚖️ Combined"
         if is_strong_pattern:
-            source = f"🧩 Strong Pattern"
+            source = f"🧩 Pattern Priority"
         elif is_trend_follow:
             source = f"📈 Trend Follow ({int(p_cont*100)}% | {match_type})"
         elif is_trend_fade:
@@ -922,7 +925,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Pattern Priority)")
+            LOG.info("HYPER V16 Predictor Started (Pattern Priority Fix)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
