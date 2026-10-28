@@ -26,12 +26,12 @@ import signal
 import socket
 import sqlite3
 import time
-from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 import aiohttp
 from aiohttp import web
+
 
 # ============================================================
 # CONFIG
@@ -73,6 +73,7 @@ CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("predictor")
 
+
 # ============================================================
 # UTILITIES
 # ============================================================
@@ -80,14 +81,14 @@ def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
 
-def logit(p, eps=0.02):
-    p = max(eps, min(1 - eps, float(p)))
-    return math.log(p / (1 - p))
-
-
 def sigmoid(z):
     z = max(-20.0, min(20.0, float(z)))
     return 1.0 / (1.0 + math.exp(-z))
+
+
+def logit(p, eps=0.02):
+    p = max(eps, min(1 - eps, float(p)))
+    return math.log(p / (1 - p))
 
 
 def escape(x):
@@ -218,7 +219,7 @@ def logistic(weights, features):
 
 
 # ============================================================
-# TREND & REGIME DETECTOR
+# TREND / REGIME
 # ============================================================
 def detect_trend(seq):
     if len(seq) < 12:
@@ -580,7 +581,7 @@ class Engine:
         experts, patterns, features, regime, size_patterns = self.mine_experts(seq)
         trend = detect_trend(seq)
 
-        # number distribution
+        # 1) Number distribution
         ngram_db = self.db.get("num_ngrams", {})
         dist = [1.0] * 10
         for length in range(min(10, len(nums)), 2, -1):
@@ -597,50 +598,52 @@ class Engine:
         probs = [x / total_d for x in dist]
         base_big = sum(probs[5:])
 
-        # regime-aware side
+        # 2) soft side probability = never fixed BIG by default
         recent_big = sum(seq[-12:]) / 12.0 if len(seq) >= 12 else sum(seq) / len(seq)
-        p_big = base_big
+        p_big = 0.5 + 0.10 * (base_big - 0.5)
 
         if regime in ("RANGE", "ALT", "MIXED"):
-            if abs(recent_big - 0.5) < 0.08:
+            if abs(recent_big - 0.5) < 0.06:
                 p_big = 0.5
             else:
-                p_big = 0.55 if recent_big >= 0.5 else 0.45
+                p_big = 0.5 + 0.07 * (recent_big - 0.5)
         elif regime == "RUN":
             if trend["direction"] > 0:
-                p_big = clip(0.60 + 0.10 * trend["strength"], 0.02, 0.98)
+                p_big = 0.5 + 0.08 * trend["strength"]
             elif trend["direction"] < 0:
-                p_big = clip(0.40 - 0.10 * trend["strength"], 0.02, 0.98)
+                p_big = 0.5 - 0.08 * trend["strength"]
             else:
-                p_big = base_big
-        else:
-            p_big = base_big
+                p_big = 0.5
+        elif regime == "IMBAL":
+            p_big = 0.5 + 0.09 * (recent_big - 0.5)
 
-        # stronger anti-opposite gate
+        # 3) tiny trend gate, not huge
         if trend["label"] == "UPTREND":
-            p_big = clip(p_big + 0.12 * trend["strength"], 0.02, 0.98)
+            p_big = clip(p_big + 0.04 * trend["strength"], 0.02, 0.98)
         elif trend["label"] == "DOWNTREND":
-            p_big = clip(p_big - 0.12 * trend["strength"], 0.02, 0.98)
+            p_big = clip(p_big - 0.04 * trend["strength"], 0.02, 0.98)
 
-        # size pattern influence
+        # 4) soft size pattern gate
         if size_patterns:
             p_total = sum((p * math.sqrt(eff_n)) for _, p, _, eff_n, _ in size_patterns)
             w_total = sum(math.sqrt(eff_n) for _, _, _, eff_n, _ in size_patterns)
             if w_total > 0:
                 pat_bias = p_total / w_total
-                if pat_bias >= 0.55:
-                    p_big = max(p_big, 0.55 + 0.10 * trend["strength"])
-                elif pat_bias <= 0.45:
-                    p_big = min(p_big, 0.45 - 0.10 * trend["strength"])
+                if pat_bias >= 0.60:
+                    p_big = clip(p_big + 0.03, 0.02, 0.98)
+                elif pat_bias <= 0.40:
+                    p_big = clip(p_big - 0.03, 0.02, 0.98)
 
+        p_big = clip(p_big, 0.02, 0.98)
         pred_side = "BIG" if p_big >= 0.5 else "SMALL"
 
+        # 5) choose valid number for side
         valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
-        num_pred, num_conf = self._predict_number(nums)
+        best_num = max(valid_nums, key=lambda x: probs[x]) if valid_nums else random.choice(list(range(10)))
+        if not valid_nums:
+            best_num = random.randint(0, 9)
 
-        if num_pred not in valid_nums:
-            num_pred = max(valid_nums, key=lambda x: probs[x]) if valid_nums else random.choice(list(range(10)))
-
+        # 6) pattern string
         pat_str = "None"
         if patterns:
             top_p = patterns[0]
@@ -655,10 +658,10 @@ class Engine:
 
         return {
             "issue": issue,
-            "p": clip(p_big, 0.02, 0.98),
+            "p": p_big,
             "p_raw": p_big,
             "side": pred_side,
-            "num": num_pred,
+            "num": best_num,
             "regime": regime,
             "trend": trend,
             "trend_shift": trend_shift,
@@ -719,13 +722,6 @@ class Engine:
                     tw = self.db.get("trend_weights") or [0.0] * len(p["features"])
                     self.db.set("trend_weights", [clip(w + CFG.learning_rate * (err * x - 0.01 * w), -4, 4) for w, x in zip(tw, p["features"])])
 
-                if p.get("meta_feats"):
-                    mw = self.db.get("meta_weights") or [0.0] * len(p["meta_feats"])
-                    mp = sigmoid(sum(w * f for w, f in zip(mw, p["meta_feats"])))
-                    grad = 2.0 * (y - mp) * mp * (1.0 - mp)
-                    self.db.set("meta_weights", [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4) for w, f in zip(mw, p["meta_feats"])])
-                    self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
-
                 bucket = min(19, int(p.get("p_raw", p["p"]) * 20))
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
                 self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
@@ -742,7 +738,7 @@ class Engine:
 
 
 # ============================================================
-# EVIDENCE ENGINE
+# EVIDENCE ENGINE (robust)
 # ============================================================
 class UpgradedEngine(Engine):
     @staticmethod
@@ -755,7 +751,6 @@ class UpgradedEngine(Engine):
     def get_number_distribution(self, nums):
         ngram_db = self.db.get("num_ngrams", {})
         dist = [1.0] * 10
-
         for length in range(min(10, len(nums)), 2, -1):
             seq_key = ",".join(str(x) for x in nums[-length:])
             if seq_key in ngram_db:
@@ -765,7 +760,6 @@ class UpgradedEngine(Engine):
                     for k, v in trans.items():
                         dist[int(k)] += (v / total) * length
                     break
-
         return self.normalize(dist)
 
     def predict(self, history, issue):
@@ -775,53 +769,45 @@ class UpgradedEngine(Engine):
         experts, patterns, features, regime, size_patterns = self.mine_experts(seq)
         trend = detect_trend(seq)
         num_dist = self.get_number_distribution(nums)
-
         p_big = sum(num_dist[5:])
 
-        # trend gating
-        if trend["label"] == "UPTREND":
-            p_big = clip(p_big + 0.12 * trend["strength"], 0.02, 0.98)
-        elif trend["label"] == "DOWNTREND":
-            p_big = clip(p_big - 0.12 * trend["strength"], 0.02, 0.98)
+        recent_big = sum(seq[-12:]) / 12.0 if len(seq) >= 12 else sum(seq) / len(seq)
 
         if regime in ("RANGE", "ALT", "MIXED"):
-            recent_big = sum(seq[-12:]) / 12.0 if len(seq) >= 12 else sum(seq) / len(seq)
-            if abs(recent_big - 0.5) < 0.08:
+            if abs(recent_big - 0.5) < 0.06:
                 p_big = 0.5
             else:
-                p_big = 0.55 if recent_big >= 0.5 else 0.45
+                p_big = 0.5 + 0.07 * (recent_big - 0.5)
         elif regime == "RUN":
             if trend["direction"] > 0:
-                p_big = clip(0.60 + 0.10 * trend["strength"], 0.02, 0.98)
+                p_big = 0.5 + 0.08 * trend["strength"]
             elif trend["direction"] < 0:
-                p_big = clip(0.40 - 0.10 * trend["strength"], 0.02, 0.98)
+                p_big = 0.5 - 0.08 * trend["strength"]
+            else:
+                p_big = 0.5
+        elif regime == "IMBAL":
+            p_big = 0.5 + 0.09 * (recent_big - 0.5)
 
-        # size pattern correction
+        if trend["label"] == "UPTREND":
+            p_big = clip(p_big + 0.04 * trend["strength"], 0.02, 0.98)
+        elif trend["label"] == "DOWNTREND":
+            p_big = clip(p_big - 0.04 * trend["strength"], 0.02, 0.98)
+
         if size_patterns:
             p_total = sum((p * math.sqrt(eff_n)) for _, p, _, eff_n, _ in size_patterns)
             w_total = sum(math.sqrt(eff_n) for _, _, _, eff_n, _ in size_patterns)
             if w_total > 0:
                 pat_bias = p_total / w_total
-                if pat_bias >= 0.55:
-                    p_big = max(p_big, 0.55 + 0.10 * trend["strength"])
-                elif pat_bias <= 0.45:
-                    p_big = min(p_big, 0.45 - 0.10 * trend["strength"])
+                if pat_bias >= 0.60:
+                    p_big = clip(p_big + 0.03, 0.02, 0.98)
+                elif pat_bias <= 0.40:
+                    p_big = clip(p_big - 0.03, 0.02, 0.98)
 
+        p_big = clip(p_big, 0.02, 0.98)
         pred_side = "BIG" if p_big >= 0.5 else "SMALL"
 
         valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
-        best_score = -1
-        best_num = None
-
-        # strong valid-side number selection
-        for n in valid_nums:
-            score = num_dist[n]
-            if score > best_score:
-                best_score = score
-                best_num = n
-
-        if best_num is None:
-            best_num = random.choice(valid_nums)
+        best_num = max(valid_nums, key=lambda x: num_dist[x]) if valid_nums else random.choice(list(range(10)))
 
         pat_str = "None"
         if patterns:
@@ -839,7 +825,7 @@ class UpgradedEngine(Engine):
 
         return {
             "issue": issue,
-            "p": clip(p_big, 0.02, 0.98),
+            "p": p_big,
             "p_raw": p_big,
             "side": pred_side,
             "num": best_num,
@@ -1050,7 +1036,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Trend-Aware + Pattern-Driven)")
+            LOG.info("HYPER V16 Predictor Started (Fixed Trend-Aware + Pattern-Gated)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
