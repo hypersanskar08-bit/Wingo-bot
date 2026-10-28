@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - Pattern vs Number Clash)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - Noise Filter + Strongest Trend)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -174,7 +174,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# BASE ENGINE (Only Pattern & Settlement needed)
+# BASE ENGINE (Pattern & Settlement)
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -265,6 +265,7 @@ class Engine:
             actual = lookup.get(row["issue"])
             if actual is None: continue
             p = json.loads(row["payload"])
+            
             y = actual["size"]
             won_side = int(p["p"] >= 0.5) == y
             won_num = p.get("num") == actual["num"]
@@ -282,10 +283,9 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (Pattern + Number Only with Clash Logic)
+# UPGRADED ENGINE (Supreme Trend + Noise Filter + Num/Pattern)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
-    """Uses Pattern Engine and Number Engine with Strength-Based Arbitration"""
     
     @staticmethod
     def normalize(values):
@@ -307,24 +307,69 @@ class UpgradedEngine(Engine):
                     break
         return self.normalize(dist)
 
+    def detect_trend_shift(self, seq):
+        if len(seq) < 30: return 0.5, "None", 0
+        
+        current_run = run_length(seq)
+        if current_run < 3: return 0.5, "None", 0
+        
+        current_side = seq[-1]
+        
+        for lookback in range(5, 0, -1):
+            ctx_len = current_run + lookback
+            if len(seq) < ctx_len + 1: continue
+            
+            target_seq = tuple(seq[-ctx_len:])
+            cont_wins = 0
+            total = 0
+            
+            for i in range(ctx_len, len(seq) - 1):
+                if tuple(seq[i-ctx_len:i]) == target_seq:
+                    total += 1
+                    if seq[i] == current_side: cont_wins += 1
+                    
+            if total >= 3: 
+                return cont_wins / total, f"Ctx -{lookback}", total
+                
+        cont_wins = 0
+        total = 0
+        for i in range(current_run, len(seq) - 1):
+            if run_length(seq[:i]) == current_run:
+                total += 1
+                if seq[i] == current_side: cont_wins += 1
+        if total >= 5:
+            return cont_wins / total, "Streak Only", total
+            
+        return 0.5, "None", 0
+
+    def detect_noise(self, seq):
+        """Detects if the current sequence is just chaotic random noise"""
+        if len(seq) < 15: return False
+        
+        # Check last 15 periods
+        tail = seq[-15:]
+        flips = sum(1 for i in range(1, len(tail)) if tail[i] != tail[i-1])
+        
+        # Agar 15 period mein 10 se zyada flips hain (alt-palt), toh full noise hai
+        if flips >= 10: return True
+        return False
+
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
         
-        # 1. Number Engine
+        # 1. Base Engines
         num_dist = self.get_number_distribution(nums)
         p_num_big = sum(num_dist[5:]) 
         
-        # 2. Pattern Engine
         patterns = self.mine_patterns(seq)
         p_pattern_big = 0.5
         pat_str = "None"
-        pat_support = 0
         
         if patterns:
             top_p = patterns[0]
             raw_p = top_p[1]
-            pat_support = top_p[2]
+            support = top_p[2]
             p_type = top_p[4].split(":")[0]
             bits = top_p[4].split(":")[-1]
             arrow = "⬆️" if raw_p >= 0.5 else "⬇️"
@@ -332,44 +377,68 @@ class UpgradedEngine(Engine):
             if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
             else: pat_str = f"<code>{bits}</code> {arrow}"
             
-            # Pattern smoothing (Agar support kam hai toh confidence 50% ke qareeb le aao)
-            weight_factor = pat_support / (pat_support + 5.0) 
+            weight_factor = support / (support + 5.0) 
             p_pattern_big = 0.5 + (raw_p - 0.5) * weight_factor
 
-        pat_says_big = p_pattern_big >= 0.5
-        num_says_big = p_num_big >= 0.5
+        # 2. Check for Noise (Random Chaos)
+        is_noise = self.detect_noise(seq)
+        noise_alert = "🌪️ NOISE ZONE DETECTED" if is_noise else ""
         
-        source = "🎯 Number Engine"
-        p_cal = p_num_big
+        p_cont, ctx_desc, samples = self.detect_trend_shift(seq)
         
-        if pat_str != "None":
-            if pat_says_big == num_says_big:
-                # ✅ Dono same bol rahe hain -> Dono ko mila kar Confidence badhao
+        p_cal = 0.5
+        source = "⚖️ Neutral"
+        shift_alert = ""
+        
+        # 3. Arbitration Logic
+        if is_noise:
+            # 🚨 NOISE MODE: Pattern is useless here. Rely purely on Number Engine & Streak
+            source = "🌪️ Noise Filter (Num Priority)"
+            p_cal = p_num_big
+            
+            # Agar Number bhi 50-50 hai, toh last result ko follow karo
+            if abs(p_cal - 0.5) < 0.02:
+                p_cal = 0.5 + (float(seq[-1]) - 0.5) * 0.3 
+                
+        elif samples >= 3:
+            current_side = seq[-1]
+            p_trend_big = p_cont if current_side == 1 else (1.0 - p_cont)
+            
+            if p_cont >= 0.65:
+                p_cal = (p_trend_big * 0.7) + (p_pattern_big * 0.15) + (p_num_big * 0.15)
+                source = f"📈 Trend Continue ({ctx_desc})"
+                shift_alert = "🟢 STRONG CONTINUATION"
+            elif p_cont <= 0.35:
+                p_cal = (p_trend_big * 0.7) + (p_pattern_big * 0.15) + (p_num_big * 0.15)
+                source = f"🔄 Trend Shift Detected ({ctx_desc})"
+                shift_alert = "🔴 STRONG SHIFT"
+            else:
+                if p_pattern_big >= 0.5 == (p_num_big >= 0.5):
+                    p_cal = (p_pattern_big + p_num_big) / 2.0
+                    source = "🔥 Both Agree"
+                else:
+                    p_cal = p_pattern_big if abs(p_pattern_big-0.5) > abs(p_num_big-0.5) else p_num_big
+                    source = "⚖️ Pattern/Num Decides"
+        else:
+            if p_pattern_big >= 0.5 == (p_num_big >= 0.5):
                 p_cal = (p_pattern_big + p_num_big) / 2.0
-                p_cal = 0.5 + (p_cal - 0.5) * 1.2 # 20% Boost
                 source = "🔥 Both Agree"
             else:
-                # ⚠️ CLASH: Pattern BIG, Number SMALL (ya vice versa)
-                pat_strength = abs(p_pattern_big - 0.5)
-                num_strength = abs(p_num_big - 0.5)
+                p_cal = p_pattern_big if abs(p_pattern_big-0.5) > abs(p_num_big-0.5) else p_num_big
+                source = "⚖️ Pattern/Num Decides"
+
+        # 4. Fallback if still weak
+        if not is_noise and max(p_cal, 1 - p_cal) < 0.54:
+            current_streak = run_length(seq)
+            if current_streak >= 2:
+                trend_val = float(seq[-1])
+                p_cal = (trend_val * 0.65) + (p_cal * 0.35)
+                source = "🛡️ Streak Fallback"
                 
-                if pat_strength > num_strength + 0.05:
-                    # Pattern clearly stronger
-                    p_cal = p_pattern_big
-                    source = "🧩 Pattern Overrides"
-                elif num_strength > pat_strength + 0.05:
-                    # Number clearly stronger
-                    p_cal = p_num_big
-                    source = "🎯 Number Overrides"
-                else:
-                    # Dono barabar hain (Deadlock) -> Low Confidence
-                    p_cal = 0.5 + (p_pattern_big - 0.5) * 0.4
-                    source = "⚠️ Clash (Low Conf)"
-                    
         p_cal = clip(p_cal, 0.05, 0.95)
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         
-        # Best number nikalne ke liye
+        # ✅ Exact Number Selection (Sabse zyada chance wala number)
         valid_nums = list(range(5, 10)) if pred_side == "BIG" else list(range(0, 5))
         best_num = max(valid_nums, key=lambda x: num_dist[x])
         
@@ -381,6 +450,8 @@ class UpgradedEngine(Engine):
             "pattern_big_prob": p_pattern_big,
             "number_big_prob": p_num_big,
             "source": source,
+            "shift_alert": shift_alert,
+            "noise_alert": noise_alert,
             "pattern_str": pat_str, 
             "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
         }
@@ -407,6 +478,12 @@ def format_prediction(p):
 
     source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
     
+    alert_text = ""
+    if p.get("noise_alert"):
+        alert_text += f"\n⚠️ <b>{p['noise_alert']}</b>"
+    if p.get("shift_alert"):
+        alert_text += f"\n⚠️ <b>{p['shift_alert']}</b>"
+
     pat_big = p.get("pattern_big_prob", 0.5)
     pat_side = "BIG" if pat_big >= 0.5 else "SMALL"
     pat_prob = pat_big if pat_big >= 0.5 else 1.0 - pat_big
@@ -425,7 +502,7 @@ def format_prediction(p):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
         f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
-        f"{source_text}{breakdown_text}{pat_text}\n"
+        f"{source_text}{alert_text}{breakdown_text}{pat_text}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -573,7 +650,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Pattern vs Number Arbitration)")
+            LOG.info("HYPER V16 Predictor Started (Supreme Trend + Noise Filter)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
