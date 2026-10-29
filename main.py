@@ -269,7 +269,7 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 # ─────────────────────────────────────────────────────────────
-# ENGINE (Cross-Engine Arbitration) - Base Engine (100% Preserved)
+# ENGINE (Cross-Engine Arbitration) - Base Engine
 # ─────────────────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
@@ -355,9 +355,20 @@ class Engine:
             obs = [(seq[i], weight(i)) for i in range(order, n - order) if tuple(seq[i - order:i]) == suffix]
             if len(obs) >= CFG.min_support: experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        current_run = min(run_length(seq), 8)
-        run_obs = [(seq[i], weight(i)) for i in range(24, n) if seq[max(0, i-96):i] and seq[max(0, i-96):i][-1] == seq[-1] and min(run_length(seq[max(0, i-96):i]), 8) == current_run]
-        if len(run_obs) >= CFG.min_support: experts["run"] = weighted_probability(run_obs)[0]
+        # ✅ Patch 3: O(N) run_at precompute, semantically identical
+        if n:
+            run_at = [1] * n
+            for i in range(1, n):
+                run_at[i] = run_at[i - 1] + 1 if seq[i] == seq[i - 1] else 1
+            current_run = min(run_at[-1], 8)
+            last_val = seq[-1]
+            run_obs = [
+                (seq[i], weight(i))
+                for i in range(24, n)
+                if seq[i - 1] == last_val and min(run_at[i - 1], 8) == current_run
+            ]
+            if len(run_obs) >= CFG.min_support:
+                experts["run"] = weighted_probability(run_obs)[0]
 
         current_regime = get_regime(seq)
         regime_obs = [(seq[i], weight(i)) for i in range(24, n) if get_regime(seq[max(0, i-96):i]) == current_regime]
@@ -508,21 +519,24 @@ class Engine:
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
         
-        num_ngrams = {}
-        num_freq = {}
-        for i in range(1, len(history)):
-            curr_num = history[i]["num"]
-            num_freq[str(curr_num)] = num_freq.get(str(curr_num), 0) + 1
-            
-            for length in range(2, 11):
-                if i >= length:
-                    seq_key = ",".join(str(history[j]["num"]) for j in range(i-length, i))
-                    if seq_key not in num_ngrams:
-                        num_ngrams[seq_key] = {}
-                    num_ngrams[seq_key][str(curr_num)] = num_ngrams[seq_key].get(str(curr_num), 0) + 1
-                    
-        self.db.set("num_ngrams", num_ngrams)
-        self.db.set("num_freq", num_freq)
+        # ✅ Patch 4: cache n-gram rebuild on history signature
+        if history:
+            sig = f"{history[0]['issue']}-{history[-1]['issue']}-{len(history)}"
+            if self.db.get("ngram_sig") != sig:
+                num_ngrams = {}
+                num_freq = {}
+                for i in range(1, len(history)):
+                    curr_num = history[i]["num"]
+                    num_freq[str(curr_num)] = num_freq.get(str(curr_num), 0) + 1
+                    for length in range(2, 11):
+                        if i >= length:
+                            seq_key = ",".join(str(history[j]["num"]) for j in range(i - length, i))
+                            if seq_key not in num_ngrams:
+                                num_ngrams[seq_key] = {}
+                            num_ngrams[seq_key][str(curr_num)] = num_ngrams[seq_key].get(str(curr_num), 0) + 1
+                self.db.set("num_ngrams", num_ngrams)
+                self.db.set("num_freq", num_freq)
+                self.db.set("ngram_sig", sig)
 
         pending = self.db.c.execute("SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)").fetchall()
         for row in pending:
@@ -544,12 +558,29 @@ class Engine:
                     tw = self.db.get("trend_weights") or [0.0]*len(p["features"])
                     self.db.set("trend_weights", [clip(w + CFG.learning_rate * (err * x - 0.01 * w), -4, 4) for w, x in zip(tw, p["features"])])
                 
+                # ✅ Patch 2: meta_feats migration (13 -> 14) + safe schema
                 if p.get("meta_feats"):
-                    mw = self.db.get("meta_weights") or [0.0]*len(p["meta_feats"])
-                    mp = sigmoid(sum(w * f for w, f in zip(mw, p["meta_feats"])))
-                    grad = 2.0 * (y - mp) * mp * (1.0 - mp)
-                    self.db.set("meta_weights", [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4) for w, f in zip(mw, p["meta_feats"])])
-                    self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
+                    target_len = len(EXPERT_NAMES) + 2  # experts + ngram_num + bias
+                    mw = self.db.get("meta_weights")
+                    if not isinstance(mw, list) or len(mw) != target_len:
+                        if isinstance(mw, list) and len(mw) == target_len - 1:
+                            mw = mw[:-1] + [0.0, mw[-1]]
+                        else:
+                            mw = [0.0] * target_len
+
+                    feats = p["meta_feats"]
+                    if len(feats) == target_len - 1:
+                        feats = feats[:-1] + [0.0, feats[-1]]
+                    elif len(feats) != target_len:
+                        feats = None
+
+                    if feats is not None:
+                        mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
+                        grad = 2.0 * (y - mp) * mp * (1.0 - mp)
+                        self.db.set("meta_weights",
+                                    [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4)
+                                     for w, f in zip(mw, feats)])
+                        self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
 
                 bucket = min(19, int(p.get("p_raw", p["p"]) * 20))
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
@@ -564,88 +595,129 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (Evidence-Based)
+# UPGRADED ENGINE (Evidence-Based, with full learning pipeline)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
-    """Evidence-based forecasting"""
-    
+    """Evidence-based forecasting with learning pipeline fully restored."""
+
     @staticmethod
     def normalize(values):
         total = sum(values)
-        if total <= 0: return [1.0 / len(values)] * len(values)
+        if total <= 0:
+            return [1.0 / len(values)] * len(values)
         return [v / total for v in values]
 
     def get_number_distribution(self, nums):
-        """Creates a 0-9 probability distribution based on historical n-grams"""
         ngram_db = self.db.get("num_ngrams", {})
-        dist = [1.0] * 10 # Base uniform smoothing
-        
+        dist = [1.0] * 10
         for length in range(min(10, len(nums)), 1, -1):
             seq_key = ",".join(str(x) for x in nums[-length:])
             if seq_key in ngram_db:
                 trans = ngram_db[seq_key]
                 total = sum(trans.values())
-                if total >= 5: # Min support
+                if total >= 5:
                     for k, v in trans.items():
-                        dist[int(k)] += (v / total) * length # Longer matches carry more weight
+                        dist[int(k)] += (v / total) * length
                     break
-        
         return self.normalize(dist)
 
     def calculate_change_score(self, seq):
-        """Fast/slow imbalance + switching rate"""
-        if len(seq) < 20: return 0.0
-        
+        if len(seq) < 20:
+            return 0.0
         fast = sum(seq[-5:]) / 5.0
         slow = sum(seq[-20:]) / 20.0
-        imbalance = abs(fast - slow) * 2.0 # 0.0 to 1.0
-        
+        imbalance = abs(fast - slow) * 2.0
         recent = seq[-10:]
-        switches = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1]) / 9.0
-        
-        score = (imbalance * 0.6) + (switches * 0.4)
-        return clip(score, 0.0, 1.0)
+        switches = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i - 1]) / 9.0
+        return clip((imbalance * 0.6) + (switches * 0.4), 0.0, 1.0)
+
+    @staticmethod
+    def _expected_meta_len():
+        # 12 experts + ngram_num + bias
+        return len(EXPERT_NAMES) + 2
+
+    def _load_meta_weights(self):
+        """Load meta weights with safe schema migration (13 -> 14)."""
+        target = self._expected_meta_len()
+        mw = self.db.get("meta_weights")
+        if isinstance(mw, list) and len(mw) == target:
+            return mw
+        if isinstance(mw, list) and len(mw) == target - 1:
+            # Old schema had no ngram slot — insert 0 before bias, keep trained weights
+            return mw[:-1] + [0.0, mw[-1]]
+        return [0.0] * target
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
-        
-        # 1. Get base experts from old engine
+        current_streak = run_length(seq)
+
+        # 1. Base experts (parent pipeline: adapted inside mine_experts)
         experts, patterns, features, current_regime = self.mine_experts(seq)
-        
-        # 2. Number Engine (0-9 Distribution)
+
+        # 2. N-gram number evidence injected as a 13th expert
         num_dist = self.get_number_distribution(nums)
         big_prob = sum(num_dist[5:])
-        p_cal = big_prob
-        
-        # 3. Size determination based on Number Distribution
-        pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
-        
-        # 4. Long-run handling (Historical Continuation/Break)
-        current_streak = run_length(seq)
-        if current_streak >= 4:
-            cont_wins = 0
-            cont_total = 0
-            for i in range(4, len(seq)):
-                if run_length(seq[:i]) >= 4:
-                    cont_total += 1
-                    if seq[i] == seq[i-1]: cont_wins += 1
-            if cont_total > 10:
-                hist_cont_prob = cont_wins / cont_total
-                blend = 0.5
-                p_cont_big = hist_cont_prob if seq[-1] == 1 else (1.0 - hist_cont_prob)
-                p_cal = (p_cal * (1 - blend)) + (p_cont_big * blend)
-                pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+        experts["ngram_num"] = big_prob
 
-        # 5. Change Score
-        change_score = self.calculate_change_score(seq)
-        
-        # 6. Pick best number for the predicted side
-        valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
-        best_num = max(valid_nums, key=lambda x: num_dist[x])
-        num_prob = num_dist[best_num]
-        
-        # 7. Pattern String (For old format)
+        # 3. Adapt every expert through its regime memory, apply weight multipliers
+        adjusted = []
+        for name, p in experts.items():
+            corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
+            if name == "patterns": weight *= 2.5
+            if name == "ngram_num": weight *= 2.0
+            if current_streak >= 4 and name in ("momentum", "run"): weight *= 3.0
+            if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
+            adjusted.append((corrected, weight))
+
+        total_w = sum(w for _, w in adjusted)
+        p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
+
+        consensus = max(
+            sum(1 for p, _ in adjusted if p >= 0.5),
+            sum(1 for p, _ in adjusted if p < 0.5)
+        ) / len(adjusted)
+        if consensus > 0.85:
+            p_avg = 0.5 + (p_avg - 0.5) * 0.7
+
+        # 4. Meta learner — 12 experts + ngram + bias
+        m_feats = (
+            [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES]
+            + [logit(clip(big_prob, 0.05, 0.95)), 1.0]
+        )
+        mw = self._load_meta_weights()
+        p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
+
+        alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
+        p_raw = alpha * p_meta + (1 - alpha) * p_avg
+
+        # 5. Streak handling: historical continuation (blended), fallback to override
+        if current_streak >= 4:
+            run_at = [1] * len(seq)
+            for i in range(1, len(seq)):
+                run_at[i] = run_at[i - 1] + 1 if seq[i] == seq[i - 1] else 1
+
+            cont_wins = cont_total = 0
+            for i in range(4, len(seq)):
+                if run_at[i - 1] >= 4:
+                    cont_total += 1
+                    if seq[i] == seq[i - 1]:
+                        cont_wins += 1
+
+            if cont_total > 10:
+                hist_cont = cont_wins / cont_total
+                p_cont_big = hist_cont if seq[-1] == 1 else (1.0 - hist_cont)
+                p_raw = 0.5 * p_cont_big + 0.5 * p_raw
+            else:
+                # Not enough run-history yet — old aggressive continuation fallback
+                p_raw = 0.90 * float(seq[-1]) + 0.10 * p_raw
+
+        # 6. Bucket calibration (learned in settle)
+        bucket = min(19, int(p_raw * 20))
+        n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
+        p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
+
+        # 7. Pattern pressure
         pat_str = "None"
         if patterns:
             top_p = patterns[0]
@@ -653,30 +725,39 @@ class UpgradedEngine(Engine):
             p_type = top_p[4].split(":")[0]
             bits = top_p[4].split(":")[-1]
             arrow = "⬆️" if p_pat >= 0.5 else "⬇️"
-            
-            if p_type == "family": pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
-            else: pat_str = f"<code>{bits}</code> {arrow}"
-        
+            if p_type == "family":
+                pat_str = f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}"
+            else:
+                pat_str = f"<code>{bits}</code> {arrow}"
+            if p_pat >= 0.55:
+                p_cal = max(p_cal, 0.60)
+            elif p_pat <= 0.45:
+                p_cal = min(p_cal, 0.40)
+
+        # 8. Pick number on the winning side from n-gram distribution
+        pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
+        valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
+        best_num = max(valid_nums, key=lambda x: num_dist[x])
+        num_prob = num_dist[best_num]
+        change_score = self.calculate_change_score(seq)
+
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
-        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
-
         return {
-            "issue": issue, 
-            "p": p_cal, 
-            "p_raw": p_cal, 
+            "issue": issue,
+            "p": p_cal,
+            "p_raw": p_raw,
             "side": pred_side,
-            "num": best_num, 
+            "num": best_num,
             "num_probability": num_prob,
             "change_score": change_score,
-            "regime": current_regime, 
-            "display_regime": current_regime,
-            "source": "🎯 Evidence Engine",
-            "trend_shift": trend_shift, 
-            "pattern_str": pat_str, 
-            "experts": experts, 
-            "features": features, 
+            "regime": current_regime,
+            "source": "🎯 Meta+Evidence",
+            "trend_shift": trend_shift,
+            "pattern_str": pat_str,
+            "experts": experts,
+            "features": features,
             "meta_feats": m_feats,
             "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
         }
@@ -716,7 +797,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = UpgradedEngine(db) # ✅ Uses new Engine
+        self.engine = UpgradedEngine(db) # ✅ Uses upgraded engine
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
         self.error = None
@@ -755,7 +836,7 @@ class Runtime:
                 self.engine.settle(history)
 
                 latest = int(history[-1]["issue"])
-                seen = self.db.get("latest_seen")
+                # ✅ Patch 5: removed dead `seen = self.db.get("latest_seen")` line
                 self.db.set("latest_seen", latest)
 
                 if len(history) >= CFG.min_history:
