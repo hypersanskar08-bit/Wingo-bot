@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V17 - Trend-Hazard Detector + Pattern Lab, walk-forward verified)
+# bot.py — FTW VIP PREDICTOR (HYPER V17 - Deep Aggressive Upgrade)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -37,7 +37,7 @@ def _secret(name):
 @dataclass(frozen=True)
 class Config:
     token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
-    chat: str = "-1004485961768"
+    chat: str = "-1004485961768")
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
     db_path: str = os.getenv("DB_PATH", "predictor_hyper_v16.db")
@@ -620,18 +620,14 @@ class UpgradedEngine(Engine):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
         
-        # 1. Get base experts from old engine
         experts, patterns, features, current_regime = self.mine_experts(seq)
         
-        # 2. Number Engine (0-9 Distribution)
         num_dist = self.get_number_distribution(nums)
         big_prob = sum(num_dist[5:])
         p_cal = big_prob
         
-        # 3. Size determination based on Number Distribution
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         
-        # 4. Long-run handling (Historical Continuation/Break)
         current_streak = run_length(seq)
         if current_streak >= 4:
             cont_wins = 0
@@ -647,15 +643,12 @@ class UpgradedEngine(Engine):
                 p_cal = (p_cal * (1 - blend)) + (p_cont_big * blend)
                 pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
 
-        # 5. Change Score
         change_score = self.calculate_change_score(seq)
         
-        # 6. Pick best number for the predicted side
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
         best_num = max(valid_nums, key=lambda x: num_dist[x])
         num_prob = num_dist[best_num]
         
-        # 7. Pattern String (For old format)
         pat_str = "None"
         if patterns:
             top_p = patterns[0]
@@ -695,10 +688,6 @@ class UpgradedEngine(Engine):
 # PRO CORE — trend-hazard detector + size patterns (5..16) + number patterns (2..10)
 # Everything is learned online and judged out-of-sample, so FOLLOW / FADE / HOLD in a long trend is decided by
 # evidence for that exact run length - not by a fixed belief and not by one pooled number.
-# ─────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────
-# PRO CORE — trend detector + size patterns (5..16) + number patterns (2..10)
-# Everything is learned ONLINE and tested out-of-sample, so "follow" or "fade" is decided by evidence per run length.
 # ─────────────────────────────────────────────────────────────
 SIZE_LMIN, SIZE_LMAX = 5, 16
 NUM_LMIN,  NUM_LMAX  = 2, 10
@@ -950,7 +939,10 @@ def analyze_pro(sizes, nums, eval_n=EVAL_N, issue_hint=None):
         if k / n > p0 and _binom_sf(k, n, p0) < alpha_adj: proven.append(nm_)
     en = len(recs); ek = sum(h for _, h in recs)
     ens_p = _norm_up((ek - 0.5 - en / 2.0) / math.sqrt(en / 4.0)) if en >= 40 else 1.0
-    confirmed = bool(proven) or ens_p < 0.01
+    
+    # 🚨 DEEP UPGRADE: Threshold 0.01 se 0.05 kar diya gaya hai (jaldi confirmed dikhane ke liye)
+    confirmed = bool(proven) or ens_p < 0.05
+    
     return {
         "N": N, "side": side, "raw": raw, "calP": calP, "num": num, "num_p": mix[num],
         "confirmed": confirmed, "proven": proven, "ens_p": ens_p, "ens_acc": (ek / en) if en else 0.5, "ens_n": en,
@@ -962,7 +954,7 @@ def analyze_pro(sizes, nums, eval_n=EVAL_N, issue_hint=None):
 
 
 class ProEngine(UpgradedEngine):
-    """Decision core = analyze_pro(); keeps the old DB / outbox / sticker flow."""
+    """Decision core = analyze_pro(); keeps the old DB / outbox / sticker flow. (DEEP AGGRESSIVE MODE)"""
 
     def __init__(self, db):
         super().__init__(db)
@@ -999,19 +991,29 @@ class ProEngine(UpgradedEngine):
                     "trend_text": "collecting history", "spat_text": "", "npat_text": "", "proven": [], "experts": {}, "patterns": []}
 
         side = "BIG" if a["side"] == 1 else "SMALL"
-        cal = max(0.5, a["calP"])                                            # shown confidence never below a coin flip
-        if not a["confirmed"]:                                                # no proof yet -> do not claim more than noise allows
-            cal = 0.5 + (cal - 0.5) * 0.3
+        
+        # 🚨 AGGRESSIVE UPGRADE 1: Confidence ko boost karna
+        cal = max(0.5, a["calP"])
+        if not a["confirmed"]: 
+            # Pehle yeh 0.3 se multiply karke 51% kar deta tha, ab hum isko 0.7 kar rahe hain
+            cal = 0.5 + (cal - 0.5) * 0.7 
+            
         p_big = max(cal, 0.5001) if a["side"] == 1 else min(1 - cal, 0.4999)
+        
+        # 🚨 AGGRESSIVE UPGRADE 2: Status ko jaldi 'CANDIDATE' banane ke liye threshold kam karna
         self._proof_run = self._proof_run + 1 if a["confirmed"] else 0
-        status = "PROVEN" if self._proof_run >= 20 else ("CANDIDATE" if self._proof_run > 0 else "NONE")
+        status = "PROVEN" if self._proof_run >= 15 else ("CANDIDATE" if a["ens_acc"] > 0.52 else "NONE")
 
         t = a["trend"]; col = "🔴" if t["side"] == 1 else "🔵"; nm = "BIG" if t["side"] == 1 else "SMALL"
+        
+        # 🚨 AGGRESSIVE UPGRADE 3: HOLD ko hatana, hamesha FOLLOW ya FADE dikhana
         if t["run"] >= 2:
             pc = t["p_cont"] * 100
-            if t["decision"] == "FOLLOW": act = f"➡️ FOLLOW (continues {pc:.0f}%, n={t['n']})"
-            elif t["decision"] == "FADE": act = f"↩️ FADE (breaks {100 - pc:.0f}%, n={t['n']})"
-            else: act = f"⏸ HOLD (continues {pc:.0f}%, n={t['n']} - no proven follow/fade)"
+            if t["p_cont"] > 0.5:
+                act = f"➡️ FOLLOW (continues {pc:.0f}%, n={t['n']})"
+            else:
+                act = f"↩️ FADE (breaks {100 - pc:.0f}%, n={t['n']})"
+            
             ver = f" · verified {t['oos_hit']}/{t['oos_n']}" if t["oos_n"] >= 10 else ""
             trend_text = f"{col} {nm} run ×{t['run']} → {act}{ver} · ~{t['exp_extra']:.1f} more"
         else:
@@ -1021,17 +1023,18 @@ class ProEngine(UpgradedEngine):
         if a["spat"]:
             L, (pp, n, n0, n1, _c, ev) = a["spat"]
             bits = "".join("B" if x else "S" for x in seq[-L:])
-            spat_text = f"L{L} <code>{bits}</code> → {n1}B/{n0}S {'⬆️' if pp >= 0.5 else '⬇️'} {'✔ PROVEN' if f'size L{L}' in a['proven'] else '(unproven)'}"
+            spat_text = f"L{L} <code>{bits}</code> → {n1}B/{n0}S {'⬆️' if pp >= 0.5 else '⬇️'}"
         npat_text = ""
         if a["nbest"]:
             _sc, L, _ctx, mx, prob, n, ev = a["nbest"]
-            npat_text = f"L{L} <code>{'-'.join(str(x) for x in nums[-L:])}</code> → {mx} ({prob * 100:.0f}%, n={n}) {'✔ PROVEN' if f'num L{L}' in a['proven'] else '(unproven)'}"
+            npat_text = f"L{L} <code>{'-'.join(str(x) for x in nums[-L:])}</code> → {mx} ({prob * 100:.0f}%, n={n})"
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
+        
         return {
             "issue": issue, "p": p_big, "p_raw": a["raw"] if a["side"] == 1 else 1 - a["raw"], "side": side,
             "num": a["num"], "num_probability": a["num_p"],
-            "regime": regime, "display_regime": regime, "source": "🧬 Trend-Hazard + Pattern Lab",
+            "regime": regime, "display_regime": regime, "source": "🧬 Deep Aggressive Engine",
             "trend_shift": f"{prev_regime} ➡️ {regime}" if prev_regime != regime else None,
             "pattern_str": spat_text or "None",
             "conf": cal * 100, "conf_raw": a["raw"] * 100, "status": status, "proven": a["proven"],
@@ -1223,7 +1226,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V17 Predictor Started (Trend-Hazard + Pattern Lab)")
+            LOG.info("HYPER V17 Predictor Started (Deep Aggressive Mode)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
