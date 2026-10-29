@@ -37,7 +37,7 @@ def _secret(name):
 @dataclass(frozen=True)
 class Config:
     token: str = "8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"
-    chat: str = "-1004485961768")
+    chat: str = "-1004485961768"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
     
     db_path: str = os.getenv("DB_PATH", "predictor_hyper_v16.db")
