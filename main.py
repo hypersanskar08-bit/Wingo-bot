@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V16 - Upgraded Engine + Old Format)
+# bot.py — FTW VIP PREDICTOR (HYPER V16 - PPM + Per-Regime Calibration)
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -123,6 +123,55 @@ def weighted_probability(observations):
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
 
+# ─────────────────────────────────────────────────────────────
+# PPM (Prediction by Partial Matching) — Method C with escape
+# ─────────────────────────────────────────────────────────────
+def build_ppm_counts(seq, max_order=8):
+    counts = [{} for _ in range(max_order + 1)]
+    n = len(seq)
+    for order in range(max_order + 1):
+        d = counts[order]
+        for i in range(order, n):
+            ctx = tuple(seq[i - order:i]) if order > 0 else ()
+            c = d.get(ctx)
+            if c is None:
+                c = [0, 0]
+                d[ctx] = c
+            c[seq[i]] += 1
+    return counts
+
+def ppm_predict_big(counts, seq, max_order=8):
+    n = len(seq)
+    p = [0.0, 0.0]
+    prob_mass = 1.0
+    for order in range(min(max_order, n), -1, -1):
+        ctx = tuple(seq[-order:]) if order > 0 else ()
+        c = counts[order].get(ctx)
+        if c is None:
+            continue
+        total = c[0] + c[1]
+        if total == 0:
+            continue
+        distinct = (1 if c[0] > 0 else 0) + (1 if c[1] > 0 else 0)
+        escape = distinct / (total + distinct)
+        for sym in (0, 1):
+            if c[sym] > 0:
+                p[sym] += prob_mass * (1.0 - escape) * (c[sym] / total)
+        prob_mass *= escape
+        if prob_mass < 1e-6:
+            break
+    p[0] += prob_mass * 0.5
+    p[1] += prob_mass * 0.5
+    total_p = p[0] + p[1]
+    return p[1] / total_p if total_p > 0 else 0.5
+
+def get_regime_strength(seq):
+    """How much do 12/24/48/96 windows agree on the regime?"""
+    if len(seq) < 96:
+        return 0.5
+    regimes = [get_regime(seq[-w:]) for w in (12, 24, 48, 96)]
+    return Counter(regimes).most_common(1)[0][1] / len(regimes)
+
 def trend_features(seq):
     if not seq: return [0.0] * 32
     def mean(k):
@@ -176,6 +225,21 @@ def trend_features(seq):
     ]
 
 EXPERT_NAMES = ["patterns", "markov1", "markov2", "markov3", "markov4", "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic"]
+META_EXTRA = ["ngram_num", "ppm"]
+META_LEN = len(EXPERT_NAMES) + len(META_EXTRA) + 1  # 15
+
+def migrate_meta_vector(vec, target):
+    """Safe migration: 13→15, 14→15, 15→passthrough, else zeros."""
+    if not isinstance(vec, list):
+        return [0.0] * target
+    if len(vec) == target:
+        return vec
+    if len(vec) == target - 2:      # 13 (12 experts + bias) → +ngram +ppm
+        return vec[:-1] + [0.0, 0.0, vec[-1]]
+    if len(vec) == target - 1:      # 14 (12 experts + ngram + bias) → +ppm
+        return vec[:-1] + [0.0, vec[-1]]
+    return [0.0] * target
+
 def logistic(weights, features): return sigmoid(sum(w * x for w, x in zip(weights, features)))
 
 # ─────────────────────────────────────────────────────────────
@@ -355,7 +419,7 @@ class Engine:
             obs = [(seq[i], weight(i)) for i in range(order, n - order) if tuple(seq[i - order:i]) == suffix]
             if len(obs) >= CFG.min_support: experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        # ✅ Patch 3: O(N) run_at precompute, semantically identical
+        # O(N) run_at precompute
         if n:
             run_at = [1] * n
             for i in range(1, n):
@@ -369,6 +433,11 @@ class Engine:
             ]
             if len(run_obs) >= CFG.min_support:
                 experts["run"] = weighted_probability(run_obs)[0]
+
+        # PPM expert — proper variable-order Markov with escape
+        if n >= 10:
+            ppm_counts = build_ppm_counts(seq, max_order=8)
+            experts["ppm"] = ppm_predict_big(ppm_counts, seq, max_order=8)
 
         current_regime = get_regime(seq)
         regime_obs = [(seq[i], weight(i)) for i in range(24, n) if get_regime(seq[max(0, i-96):i]) == current_regime]
@@ -519,7 +588,7 @@ class Engine:
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
         
-        # ✅ Patch 4: cache n-gram rebuild on history signature
+        # Signature cache for n-gram rebuild
         if history:
             sig = f"{history[0]['issue']}-{history[-1]['issue']}-{len(history)}"
             if self.db.get("ngram_sig") != sig:
@@ -558,33 +627,25 @@ class Engine:
                     tw = self.db.get("trend_weights") or [0.0]*len(p["features"])
                     self.db.set("trend_weights", [clip(w + CFG.learning_rate * (err * x - 0.01 * w), -4, 4) for w, x in zip(tw, p["features"])])
                 
-                # ✅ Patch 2: meta_feats migration (13 -> 14) + safe schema
+                # Meta learner — 15-dim, safe 13→15 / 14→15 migration
                 if p.get("meta_feats"):
-                    target_len = len(EXPERT_NAMES) + 2  # experts + ngram_num + bias
-                    mw = self.db.get("meta_weights")
-                    if not isinstance(mw, list) or len(mw) != target_len:
-                        if isinstance(mw, list) and len(mw) == target_len - 1:
-                            mw = mw[:-1] + [0.0, mw[-1]]
-                        else:
-                            mw = [0.0] * target_len
+                    mw = migrate_meta_vector(self.db.get("meta_weights"), META_LEN)
+                    feats = migrate_meta_vector(p["meta_feats"], META_LEN)
+                    mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
+                    grad = 2.0 * (y - mp) * mp * (1.0 - mp)
+                    self.db.set("meta_weights",
+                                [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4)
+                                 for w, f in zip(mw, feats)])
+                    self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
 
-                    feats = p["meta_feats"]
-                    if len(feats) == target_len - 1:
-                        feats = feats[:-1] + [0.0, feats[-1]]
-                    elif len(feats) != target_len:
-                        feats = None
-
-                    if feats is not None:
-                        mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
-                        grad = 2.0 * (y - mp) * mp * (1.0 - mp)
-                        self.db.set("meta_weights",
-                                    [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4)
-                                     for w, f in zip(mw, feats)])
-                        self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
-
+                # Calibration — global + per-regime
                 bucket = min(19, int(p.get("p_raw", p["p"]) * 20))
-                n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
-                self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
+                regime = p.get("regime", "MIXED")
+                n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
+                self.db.set(f"cal20:global:{bucket}", [0.995 * n_g + 1, 0.995 * s_g + y])
+                key = f"cal20:{regime}:{bucket}"
+                n_r, s_r = self.db.get(key, [0.0, 0.0])
+                self.db.set(key, [0.995 * n_r + 1, 0.995 * s_r + y])
 
                 if won_side and won_num: sticker = CFG.jack_sticker
                 elif won_side: sticker = CFG.win_sticker
@@ -595,10 +656,10 @@ class Engine:
 
 
 # ─────────────────────────────────────────────────────────────
-# UPGRADED ENGINE (Evidence-Based, with full learning pipeline)
+# UPGRADED ENGINE (PPM + Per-Regime Calibration + Regime Damping)
 # ─────────────────────────────────────────────────────────────
 class UpgradedEngine(Engine):
-    """Evidence-based forecasting with learning pipeline fully restored."""
+    """Evidence-based forecasting with full learning pipeline + PPM."""
 
     @staticmethod
     def normalize(values):
@@ -633,39 +694,31 @@ class UpgradedEngine(Engine):
 
     @staticmethod
     def _expected_meta_len():
-        # 12 experts + ngram_num + bias
-        return len(EXPERT_NAMES) + 2
+        return META_LEN
 
     def _load_meta_weights(self):
-        """Load meta weights with safe schema migration (13 -> 14)."""
-        target = self._expected_meta_len()
-        mw = self.db.get("meta_weights")
-        if isinstance(mw, list) and len(mw) == target:
-            return mw
-        if isinstance(mw, list) and len(mw) == target - 1:
-            # Old schema had no ngram slot — insert 0 before bias, keep trained weights
-            return mw[:-1] + [0.0, mw[-1]]
-        return [0.0] * target
+        return migrate_meta_vector(self.db.get("meta_weights"), META_LEN)
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
         current_streak = run_length(seq)
 
-        # 1. Base experts (parent pipeline: adapted inside mine_experts)
+        # 1. Base experts (includes ppm)
         experts, patterns, features, current_regime = self.mine_experts(seq)
 
-        # 2. N-gram number evidence injected as a 13th expert
+        # 2. N-gram number evidence as extra expert
         num_dist = self.get_number_distribution(nums)
         big_prob = sum(num_dist[5:])
         experts["ngram_num"] = big_prob
 
-        # 3. Adapt every expert through its regime memory, apply weight multipliers
+        # 3. Adapt experts through regime memory
         adjusted = []
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
             if name == "patterns": weight *= 2.5
             if name == "ngram_num": weight *= 2.0
+            if name == "ppm": weight *= 2.0
             if current_streak >= 4 and name in ("momentum", "run"): weight *= 3.0
             if name == "trend" and current_regime in ("RUN", "IMBAL"): weight *= 1.4
             adjusted.append((corrected, weight))
@@ -680,10 +733,11 @@ class UpgradedEngine(Engine):
         if consensus > 0.85:
             p_avg = 0.5 + (p_avg - 0.5) * 0.7
 
-        # 4. Meta learner — 12 experts + ngram + bias
+        # 4. Meta — 15 dims: 12 experts + ngram_num + ppm + bias
         m_feats = (
             [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES]
-            + [logit(clip(big_prob, 0.05, 0.95)), 1.0]
+            + [logit(clip(experts.get(e, 0.5), 0.05, 0.95)) for e in META_EXTRA]
+            + [1.0]
         )
         mw = self._load_meta_weights()
         p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
@@ -691,33 +745,38 @@ class UpgradedEngine(Engine):
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        # 5. Streak handling: historical continuation (blended), fallback to override
+        # 5. Streak continuation (historical, data-driven)
         if current_streak >= 4:
             run_at = [1] * len(seq)
             for i in range(1, len(seq)):
                 run_at[i] = run_at[i - 1] + 1 if seq[i] == seq[i - 1] else 1
-
             cont_wins = cont_total = 0
             for i in range(4, len(seq)):
                 if run_at[i - 1] >= 4:
                     cont_total += 1
                     if seq[i] == seq[i - 1]:
                         cont_wins += 1
-
             if cont_total > 10:
                 hist_cont = cont_wins / cont_total
                 p_cont_big = hist_cont if seq[-1] == 1 else (1.0 - hist_cont)
                 p_raw = 0.5 * p_cont_big + 0.5 * p_raw
-            else:
-                # Not enough run-history yet — old aggressive continuation fallback
-                p_raw = 0.90 * float(seq[-1]) + 0.10 * p_raw
 
-        # 6. Bucket calibration (learned in settle)
+        # 6. Calibration — global + per-regime blend
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
-        p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
+        n_r, s_r = self.db.get(f"cal20:{current_regime}:{bucket}", [0.0, 0.0])
+        alpha_regime = min(n_r / 50.0, 1.0)
+        n_eff = n_g + alpha_regime * n_r
+        s_eff = s_g + alpha_regime * s_r
+        p_cal = clip((30 * p_raw + s_eff) / (30 + n_eff))
 
-        # 7. Pattern pressure
+        # 7. Regime-strength damping (post-calibration shrink toward 0.5)
+        strength = get_regime_strength(seq)
+        if strength < 0.75:
+            damp = min((0.75 - strength) / 0.5, 1.0)
+            p_cal = 0.5 + (p_cal - 0.5) * (1.0 - 0.4 * damp)
+
+        # 8. Pattern pressure
         pat_str = "None"
         if patterns:
             top_p = patterns[0]
@@ -734,7 +793,7 @@ class UpgradedEngine(Engine):
             elif p_pat <= 0.45:
                 p_cal = min(p_cal, 0.40)
 
-        # 8. Pick number on the winning side from n-gram distribution
+        # 9. Number + side
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
         best_num = max(valid_nums, key=lambda x: num_dist[x])
@@ -745,20 +804,13 @@ class UpgradedEngine(Engine):
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
         return {
-            "issue": issue,
-            "p": p_cal,
-            "p_raw": p_raw,
-            "side": pred_side,
-            "num": best_num,
-            "num_probability": num_prob,
+            "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
+            "num": best_num, "num_probability": num_prob,
             "change_score": change_score,
-            "regime": current_regime,
-            "source": "🎯 Meta+Evidence",
-            "trend_shift": trend_shift,
-            "pattern_str": pat_str,
-            "experts": experts,
-            "features": features,
-            "meta_feats": m_feats,
+            "regime": current_regime, "regime_strength": strength,
+            "source": "🎯 PPM+Meta",
+            "trend_shift": trend_shift, "pattern_str": pat_str,
+            "experts": experts, "features": features, "meta_feats": m_feats,
             "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
         }
 
@@ -797,7 +849,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = UpgradedEngine(db) # ✅ Uses upgraded engine
+        self.engine = UpgradedEngine(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
         self.error = None
@@ -836,7 +888,6 @@ class Runtime:
                 self.engine.settle(history)
 
                 latest = int(history[-1]["issue"])
-                # ✅ Patch 5: removed dead `seen = self.db.get("latest_seen")` line
                 self.db.set("latest_seen", latest)
 
                 if len(history) >= CFG.min_history:
@@ -935,7 +986,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("HYPER V16 Predictor Started (Upgraded Engine + Old Format)")
+            LOG.info("HYPER V16 Predictor Started (PPM + Per-Regime Calibration)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
