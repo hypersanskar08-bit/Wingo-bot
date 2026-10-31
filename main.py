@@ -47,7 +47,7 @@ def _secret(name):
 
 @dataclass(frozen=True)
 class Config:
-    token: str = field(default_factory=lambda: _secret("8611789455:AAFZH0iCkY5fceXQ77R18aptFZLPLKDRhbo"))
+    token: str = field(default_factory=lambda: _secret("8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c"))
     chat: str = field(default_factory=lambda: _secret("-1004485961768"))
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
 
